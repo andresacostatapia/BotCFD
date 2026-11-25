@@ -1,0 +1,9 @@
+# Dependencias del MT5 Bot (Windows 10/11, Python 3.10+)
+# tkinter forma parte de la libreria estandar de Python: no se lista.
+MetaTrader5>=5.0.45
+pandas>=2.0
+numpy>=1.24
+# Motor genetico principal (PyPI, MIT)
+strategy-genome>=0.1.0
+# Motor genetico alternativo (fallback automatico si strategy-genome falla)
+deap>=1.4

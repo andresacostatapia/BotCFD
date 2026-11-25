@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Datos locales del bot
+risk_config.json
+risk_config.json.tmp
+evolved_params.json
+logs/*
+!logs/.gitkeep
