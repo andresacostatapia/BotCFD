@@ -28,9 +28,16 @@ def test_describe_params() -> None:
 def test_fields_cover_known_config_keys() -> None:
     from bot_common import DEFAULT_CONFIG
 
+    from bot_common import PROFILE_KEYS
+
     keys = {f.key for f in bot_gui.ALL_FIELDS}
     assert keys <= set(DEFAULT_CONFIG)
-    assert {"symbol", "timeframe", "risk_percent", "evolve_sl_tp", "history_bars"} <= keys
+    assert not keys & set(PROFILE_KEYS)  # lo propio de cada símbolo no está en la general
+    assert {"risk_percent", "evolve_sl_tp", "history_bars", "trading_hours", "exit_management",
+            "validation_windows", "auto_disable_pf", "telegram_token"} <= keys
+    # todo lo de la configuración general es editable desde la ventana
+    shared = set(DEFAULT_CONFIG) - set(PROFILE_KEYS)
+    assert shared - keys <= {"pf_cap"}
 
 
 def test_line_tags() -> None:
