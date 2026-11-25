@@ -138,7 +138,8 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | Clave | Defecto | Descripción |
 |---|---|---|
 | `risk_percent` | 1.0 | % del equity arriesgado por operación |
-| `max_daily_loss_percent` | 3.0 | % de pérdida diaria (sobre el balance de inicio del día, usando equity) que detiene el trading hasta el día siguiente |
+| `max_daily_loss_percent` | 3.0 | % de pérdida diaria (sobre el balance de inicio del día) que detiene el trading hasta el día siguiente |
+| `daily_loss_scope` | bots | Qué mide la pérdida diaria. **`bots`**: solo el resultado de hoy de las operaciones de los bots (cerradas + abiertas, por magic number); sus operaciones manuales no los bloquean. **`cuenta`**: equity de toda la cuenta, incluidas las operaciones manuales (más conservador) |
 | `max_lot` / `min_lot` | 1.0 / 0.01 | Límites de lote (además de los del bróker) |
 | `max_spread` | 0.00020 | Spread máximo en unidades de precio (ask − bid). **Depende del activo:** ~0.0002 en EURUSD, ~1.0 en US500. "Probar conexión MT5" muestra el spread actual |
 | `magic` | 20250101 | Identifica las órdenes del bot |
@@ -187,16 +188,26 @@ Cada **perfil** es un archivo `risk_config_<nombre>.json` (el principal es
 (`evolved_params_<nombre>.json`) y su propio proceso del bot. Varios perfiles
 pueden funcionar **simultáneamente**.
 
-* **Varios símbolos…**: escriba por ejemplo `GBPUSD, USDJPY, US500`. Se crea un
-  perfil por símbolo copiando la configuración actual, con magic único; si MT5
-  está conectado, comprueba que cada símbolo exista (corrige `us500` → `US500`) y
-  ajusta su **spread máximo** a ~2,5× el spread actual de ese símbolo.
+* **Buscar símbolos…**: abre un buscador con **todos los símbolos del bróker**
+  (nombre, descripción, categoría, spread actual y lote mínimo). Búsqueda en vivo
+  en inglés o español (`eur`, `jpy`, `oro`, `nasdaq`, `dax`, `bitcoin`…) y filtro
+  por categoría. Seleccione varios (Ctrl/Mayús + clic), elija timeframe y
+  estrategia, y se crea un perfil por símbolo copiando la configuración actual,
+  con magic único y **spread máximo** ajustado a ~2,5× el spread actual de cada uno.
+* **Buscar…** (junto al campo Símbolo, en Configuración): elige el símbolo del
+  perfil actual desde la misma lista y ofrece ajustar su spread máximo.
+* **Escribir símbolos…** (pestaña Todos los símbolos): alternativa escribiendo
+  `GBPUSD, USDJPY, US500`; comprueba en MT5 que existan (corrige `us500` → `US500`).
 * **Nuevo perfil…**: copia del perfil actual, por ejemplo para otro timeframe.
 * **Riesgo combinado:** cada perfil arriesga su `% por operación`. Dos límites se
-  aplican a **toda la cuenta**: `Pérdida diaria máxima` (todos se detienen juntos)
-  y `Máx. posiciones (todos)` = `max_open_positions_total` (por defecto 3): un bot
-  no abre si ya hay ese número de posiciones abiertas entre todos los perfiles.
-  Recuerde que pares como EURUSD y GBPUSD suelen moverse juntos.
+  aplican a **todos los perfiles juntos**: `Pérdida diaria máxima` (por defecto
+  sobre el resultado de todos los bots; si uno la alcanza, todos se detienen hasta
+  el día siguiente) y `Máx. posiciones (todos)` = `max_open_positions_total` (por
+  defecto 3): un bot no abre si ya hay ese número de posiciones abiertas entre
+  todos los perfiles. Recuerde que pares como EURUSD y GBPUSD suelen moverse juntos.
+* **Inicio del día guardado:** el balance de inicio del día se guarda en
+  `logs/day_state.json` (por cuenta). Reiniciar un bot o la ventana no pone a
+  cero el contador de pérdida diaria.
 * **Detener:** la ventana crea `logs/stop_<perfil>.flag` y el bot termina de forma
   ordenada en ~1 s (las posiciones abiertas se mantienen con su SL/TP). Al cerrar
   la ventana se detienen todos los bots que lanzó.
@@ -294,9 +305,10 @@ no DEMO · `3` conexión MT5 · `4` validación walk-forward no superada.
 6. **La pérdida diaria sólo detiene nuevas entradas**; no cierra las posiciones
    abiertas al alcanzar el límite. → Opción `close_on_daily_limit`.
 7. **Sin trailing stop ni break-even**, y sin gestión de noticias/horario de sesión.
-8. **Persistencia mínima:** el estado (balance de inicio del día) se recalcula al
-   reiniciar, por lo que reiniciar el bot a mitad del día reinicia el contador de
-   pérdida diaria. → Guardar estado diario en disco.
+8. **Con `daily_loss_scope = bots` el riesgo de sus operaciones manuales no lo
+   controla el bot**: es responsabilidad suya (use `cuenta` si quiere que también
+   cuenten). El inicio del día se guarda en disco, pero el "día" empieza a las 00:00
+   de su PC, no del servidor del bróker.
 9. **El Centro de control se ha probado en Linux con un MT5 simulado** (arranque,
    log en vivo, parada, varios perfiles a la vez); en Windows con MT5 real falta
    la prueba del usuario. Los lanzadores `.bat`/`.ps1` sólo se han revisado de forma estática (no hay

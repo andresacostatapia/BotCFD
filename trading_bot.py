@@ -70,6 +70,58 @@ class StatusFile:
 
 
 
+class DayState:
+    """
+    Inicio del día de trading guardado en disco (``logs/day_state.json``), por cuenta.
+
+    Lo comparten todos los perfiles de la carpeta: el primer bot del día fija el
+    balance inicial y los demás (y los reinicios) lo reutilizan, así reiniciar no
+    pone el contador de pérdida diaria a cero. Si un bot se detiene por pérdida
+    diaria, queda anotado y los demás bots con el mismo criterio lo respetan.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _load(self) -> dict[str, Any]:
+        data = read_json(self.path)
+        return data if isinstance(data, dict) else {}
+
+    def get_or_create(self, login: int | str, today: str, balance: float,
+                      server_time: int | None) -> tuple[dict[str, Any], bool]:
+        """Devuelve (registro del día, True si se restauró uno existente)."""
+        data = self._load()
+        rec = data.get(str(login))
+        if isinstance(rec, dict) and rec.get("date") == today and rec.get("start_balance"):
+            return rec, True
+        rec = {
+            "date": today,
+            "start_balance": float(balance),
+            "start_server_time": int(server_time) if server_time else int(time.time()),
+            "created": now_iso(),
+            "halted": {},
+        }
+        data[str(login)] = rec
+        write_json_atomic(self.path, data)
+        return rec, False
+
+    def halted_reason(self, login: int | str, today: str, scope: str) -> str:
+        """Motivo si algún bot ya detuvo el trading hoy con este criterio ('' si no)."""
+        rec = self._load().get(str(login)) or {}
+        if rec.get("date") != today:
+            return ""
+        return str((rec.get("halted") or {}).get(scope, ""))
+
+    def mark_halted(self, login: int | str, today: str, scope: str, reason: str) -> None:
+        """Anota que el trading quedó detenido hoy con este criterio."""
+        data = self._load()
+        rec = data.get(str(login))
+        if not isinstance(rec, dict) or rec.get("date") != today:
+            return
+        rec.setdefault("halted", {})[scope] = reason
+        write_json_atomic(self.path, data)
+
+
 class TradingBot:
     """Bot de trading: mantiene estado, parámetros evolucionados y el bucle principal."""
 
@@ -107,6 +159,10 @@ class TradingBot:
         self.last_tick: Any = None
         self._deals: list[dict[str, Any]] = []
         self._deals_time = 0.0
+        self.day_state = DayState(config_path.parent / "logs" / "day_state.json")
+        self.login: int | None = None
+        self.day_start_server_time: int | None = None
+        self.bots_pnl: tuple[float, float] | None = None  # (cerrado hoy, flotante) si scope=bots
 
     # ---------------------------------------------------------------- evolución
     def evolve(self) -> bool:
@@ -213,13 +269,77 @@ class TradingBot:
                 logger.error("La nueva configuración no superó la validación: trading en pausa.")
 
     # ------------------------------------------------------------------- bucle
+    @property
+    def loss_scope(self) -> str:
+        """'cuenta' (equity de toda la cuenta) o 'bots' (solo operaciones de los bots)."""
+        return "bots" if self.config.get("daily_loss_scope") == "bots" else "cuenta"
+
+    def start_day(self) -> bool:
+        """
+        Fija el inicio del día: restaura el guardado en disco (si es de hoy) o lo crea
+        con el balance actual. Devuelve False si no se pudo leer la cuenta.
+        """
+        account = self.risk.provider.get_account() if self.risk.provider else None
+        if account is None:
+            logger.error("No se pudo leer el balance de la cuenta para iniciar el día.")
+            return False
+        today = datetime.now().date()
+        if self.login is None:
+            self.login = mt5c.get_account_login() or 0
+        rec, restored = self.day_state.get_or_create(
+            self.login, today.isoformat(), account.balance, mt5c.get_server_time(self.config["symbol"])
+        )
+        self.risk.reset_daily(balance=float(rec["start_balance"]), today=today)
+        self.day_start_server_time = int(rec["start_server_time"])
+        self.halt_logged = False
+        if restored:
+            logger.info("Inicio del día restaurado (guardado %s): balance inicial %.2f.",
+                        str(rec.get("created", "")).replace("T", " "), rec["start_balance"])
+        logger.info("Límite de pérdida diaria: %.2f%% medido sobre %s.",
+                    self.risk.max_daily_loss_percent,
+                    "SOLO las operaciones de los bots" if self.loss_scope == "bots"
+                    else "toda la cuenta (incluye operaciones manuales)")
+        return True
+
     def check_new_day(self) -> None:
-        """Llama a reset_daily() al cambiar de día (00:00 hora local)."""
+        """Inicia un nuevo día de trading al cambiar la fecha (00:00 hora local)."""
         today = datetime.now().date()
         if self.risk.day_start_date != today:
             logger.info("Nuevo día de trading: %s", today.isoformat())
-            self.risk.reset_daily(today=today)
-            self.halt_logged = False
+            self.start_day()
+
+    def check_daily_loss(self) -> bool:
+        """
+        Aplica el límite de pérdida diaria según ``daily_loss_scope`` y lo comparte con
+        los demás bots de la cuenta. Devuelve True si se puede seguir operando.
+        """
+        scope = self.loss_scope
+        today = self.risk.day_start_date.isoformat() if self.risk.day_start_date else ""
+        if self.login is not None and not self.risk.trading_halted:
+            other = self.day_state.halted_reason(self.login, today, scope)
+            if other:
+                self.risk.trading_halted = True
+                self.risk.halt_reason = f"detenido por otro bot de la cuenta: {other}"
+
+        if scope == "bots":
+            try:
+                realized, floating = mt5c.get_bots_pnl_since(
+                    self.portfolio_magics(), int(self.day_start_server_time or 0))
+            except Exception:  # noqa: BLE001
+                logger.exception("No se pudo calcular el resultado de los bots")
+                return not self.risk.trading_halted
+            self.bots_pnl = (realized, floating)
+            equity = float(self.risk.day_start_balance or 0.0) + realized + floating
+            ok = self.risk.check_daily_loss(equity=equity)
+        else:
+            self.bots_pnl = None
+            ok = self.risk.check_daily_loss()
+
+        if not ok and self.login is not None and self.risk.halt_reason and \
+                not self.risk.halt_reason.startswith("detenido por otro bot"):
+            self.day_state.mark_halted(self.login, today, scope,
+                                       f"[{self.config['symbol']}] {self.risk.halt_reason}")
+        return ok
 
     def ensure_connection(self) -> bool:
         """Reconecta si el terminal se cerró o perdió conexión."""
@@ -248,7 +368,8 @@ class TradingBot:
         """Resultado del día en % frente al límite de pérdida diaria."""
         st = self.risk.status()
         pnl = -(st["daily_loss_percent"] or 0.0) + 0.0  # + 0.0 evita mostrar "-0.00"
-        return f"día {pnl:+.2f}% (límite -{st['max_daily_loss_percent']:g}%)"
+        scope = "bots" if self.loss_scope == "bots" else "cuenta"
+        return f"día ({scope}) {pnl:+.2f}% (límite -{st['max_daily_loss_percent']:g}%)"
 
     def _next_bar_text(self, bar_time: Any, tick: Any) -> str:
         """Hora de cierre de la vela en curso y minutos que faltan (hora del servidor)."""
@@ -297,7 +418,7 @@ class TradingBot:
         cfg = self.config
         symbol, magic = cfg["symbol"], int(cfg["magic"])
 
-        if not self.risk.check_daily_loss():
+        if not self.check_daily_loss():
             if not self.halt_logged:
                 logger.error("Trading detenido hasta el próximo día: %s",
                              self.risk.halt_reason or self.risk.last_rejection)
@@ -496,6 +617,9 @@ class TradingBot:
                 params=self.params,
                 day_pnl_percent=-(st["daily_loss_percent"] or 0.0) + 0.0,
                 max_daily_loss_percent=st["max_daily_loss_percent"],
+                daily_loss_scope=self.loss_scope,
+                bots_pnl=({"realized": self.bots_pnl[0], "floating": self.bots_pnl[1]}
+                          if self.bots_pnl else None),
                 halt_reason=st["halt_reason"],
                 price={"bid": tick.bid, "ask": tick.ask} if tick is not None else None,
                 spread=st["last_spread"],
@@ -576,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # 3) RiskManager + reset diario
         bot = TradingBot(config, args.config, dry_run=args.dry_run, status=status)
-        if not bot.risk.reset_daily():
+        if not bot.start_day():
             exit_code, final_message = EXIT_CONNECTION, "no se pudo leer el balance de la cuenta"
             return exit_code
 

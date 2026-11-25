@@ -165,6 +165,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "deviation": 20,                  # desviación máxima en puntos
     "close_positions_on_error": False,
     "max_open_positions_total": 3,    # máx. posiciones abiertas entre TODOS los perfiles (0 = sin límite)
+    "daily_loss_scope": "bots",       # "bots" = solo operaciones de los bots | "cuenta" = equity de toda la cuenta
     "terminal_path": "",              # ruta a terminal64.exe (opcional)
 }
 
@@ -237,6 +238,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     folds = config.get("fitness_folds")
     if isinstance(folds, bool) or not isinstance(folds, int) or not 1 <= folds <= 10:
         errors.append("'fitness_folds' debe ser un entero entre 1 y 10")
+
+    if config.get("daily_loss_scope") not in ("cuenta", "bots"):
+        errors.append("'daily_loss_scope' debe ser 'cuenta' o 'bots'")
 
     mot = config.get("max_open_positions_total")
     if isinstance(mot, bool) or not isinstance(mot, int) or mot < 0:

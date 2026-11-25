@@ -65,8 +65,19 @@ class FakeMT5:
     # --- símbolos
     symbols: tuple[str, ...] = ("EURUSD", "GBPUSD", "US500", "US30", "USDJPY")
 
+    symbol_meta: dict[str, tuple[str, str]] = {
+        "EURUSD": ("Euro vs US Dollar", "Forex\\Majors"),
+        "GBPUSD": ("Great Britain Pound vs US Dollar", "Forex\\Majors"),
+        "USDJPY": ("US Dollar vs Japanese Yen", "Forex\\Majors"),
+        "US500": ("US 500 Index", "Indices\\US"),
+        "US30": ("Wall Street 30 Index", "Indices\\US"),
+    }
+
     def symbols_get(self) -> tuple[SimpleNamespace, ...]:
-        return tuple(SimpleNamespace(name=n) for n in self.symbols)
+        return tuple(SimpleNamespace(
+            name=n, description=self.symbol_meta.get(n, ("", ""))[0],
+            path=self.symbol_meta.get(n, ("", "Otros"))[1], spread=10, point=0.00001, digits=5,
+            volume_min=0.01, visible=n == "EURUSD", trade_mode=4) for n in self.symbols)
 
     def symbol_info(self, symbol: str) -> SimpleNamespace | None:
         if symbol not in self.symbols:

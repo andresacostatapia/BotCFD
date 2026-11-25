@@ -138,6 +138,11 @@ FIELD_GROUPS: list[tuple[str, list[Field]]] = [
     ("Riesgo", [
         Field("risk_percent", "Riesgo por operación (%)", "float", "% del equity que se arriesga en cada operación"),
         Field("max_daily_loss_percent", "Pérdida diaria máxima (%)", "float", "Al alcanzarla no abre más operaciones hasta el día siguiente"),
+        Field("daily_loss_scope", "Pérdida diaria cuenta", "choice",
+              "bots (por defecto): mide solo el resultado de hoy de las operaciones de los bots "
+              "(cerradas + abiertas); sus operaciones manuales no los bloquean. "
+              "cuenta: mide el equity de TODA la cuenta, incluidas las operaciones manuales",
+              ("bots", "cuenta")),
         Field("min_lot", "Lote mínimo", "float", "Límite inferior de lote (además del del bróker)"),
         Field("max_lot", "Lote máximo", "float", "Límite superior de lote"),
         Field("max_spread", "Spread máximo (precio)", "float", "ask − bid máximo. ~0.0002 en EURUSD, ~1.0 en US500"),
@@ -335,6 +340,54 @@ def inspect_symbols(symbols: list[str], require_demo: bool, terminal_path: str |
     return out
 
 
+def load_symbols(require_demo: bool, terminal_path: str | None) -> dict[str, Any]:
+    """Carga (en un hilo aparte) la lista de símbolos del bróker para el buscador."""
+    out: dict[str, Any] = {"ok": False, "symbols": []}
+    try:
+        import mt5_connector as mt5c
+
+        if not mt5c.connect_mt5_with_retry(max_retries=2, wait_seconds=1,
+                                           require_demo=require_demo,
+                                           terminal_path=terminal_path or None):
+            out["error"] = "No se pudo conectar con MetaTrader 5. ¿Está abierto y con sesión iniciada?"
+            return out
+        out.update(ok=True, symbols=mt5c.list_symbols())
+    except SystemExit as exc:
+        out["error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error cargando símbolos")
+        out["error"] = f"Error: {exc}"
+    finally:
+        try:
+            import mt5_connector as mt5c
+
+            mt5c.safe_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+#: Términos en español -> cómo suelen aparecer en los nombres/descripciones del bróker.
+SEARCH_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "oro": ("gold", "xau"), "plata": ("silver", "xag"), "petroleo": ("oil", "wti", "brent"),
+    "petróleo": ("oil", "wti", "brent"), "crudo": ("oil", "wti", "brent"), "gas": ("natgas", "ngas"),
+    "sp500": ("us500", "spx"), "s&p": ("us500", "spx"), "nasdaq": ("nas", "ustec", "us100"),
+    "dow": ("us30", "wall"), "dax": ("ger", "de40", "de30"), "bitcoin": ("btc",),
+    "ethereum": ("eth",), "euro": ("eur",), "dolar": ("usd",), "dólar": ("usd",),
+    "libra": ("gbp",), "yen": ("jpy",), "franco": ("chf",), "cobre": ("copper",),
+}
+
+
+def symbol_matches(item: dict[str, Any], query: str) -> bool:
+    """True si TODAS las palabras de la búsqueda aparecen en el nombre o la descripción."""
+    text = f"{item.get('name', '')} {item.get('description', '')} {item.get('path', '')}".lower()
+    for word in query.lower().split():
+        options = (word,) + SEARCH_SYNONYMS.get(word, ())
+        if not any(opt in text for opt in options):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Widgets auxiliares
 # ---------------------------------------------------------------------------
@@ -448,6 +501,147 @@ class MultiSymbolDialog(tk.Toplevel):
         self.destroy()
 
 
+class SymbolBrowser(tk.Toplevel):
+    """
+    Buscador de símbolos del bróker.
+
+    * ``multi=True``: selección múltiple para crear un perfil por símbolo
+      (con timeframe, estrategia y ajuste de spread).
+    * ``multi=False``: elegir un único símbolo para el perfil actual.
+    """
+
+    def __init__(self, master: tk.Tk, symbols: list[dict[str, Any]], multi: bool,
+                 existing: set[str], timeframe: str = "M15", strategy: str = "cruce_medias") -> None:
+        super().__init__(master)
+        self.title("Buscador de símbolos" + (" — crear perfiles" if multi else ""))
+        self.configure(bg=C_BG, padx=14, pady=12)
+        self.geometry("900x600")
+        self.minsize(760, 480)
+        self.transient(master)
+        self.symbols = symbols
+        self.by_name = {d["name"]: d for d in symbols}
+        self.multi = multi
+        self.existing = existing
+        self.result: dict[str, Any] | None = None
+        self._after_id: str | None = None
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Label(top, text="Buscar:", font=F_BOLD).pack(side="left")
+        self.query = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=self.query, width=30)
+        entry.pack(side="left", padx=(6, 14))
+        entry.focus_set()
+        ttk.Label(top, text="Categoría:").pack(side="left")
+        cats = sorted({d["category"] for d in symbols}, key=str.lower)
+        self.category = tk.StringVar(value="Todas")
+        ttk.Combobox(top, textvariable=self.category, values=["Todas"] + cats, state="readonly",
+                     width=18).pack(side="left", padx=6)
+        self.only_tradable = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Solo operables", variable=self.only_tradable).pack(side="left", padx=8)
+        ttk.Label(self, text="Escriba parte del nombre o la descripción, en inglés o español: "
+                             "eur, jpy, oro, nasdaq, dax, bitcoin…"
+                  + ("  ·  Ctrl/Mayús + clic para elegir varios." if multi else
+                     "  ·  Doble clic para elegir."),
+                  style="Muted.TLabel").pack(fill="x", pady=(6, 6))
+
+        self.tree = make_tree(self, [
+            ("name", "Símbolo", 120, "w"), ("desc", "Descripción", 330, "w"),
+            ("cat", "Categoría", 120, "w"), ("spread", "Spread actual", 100, "e"),
+            ("lot", "Lote mín.", 70, "e"), ("note", "", 120, "w")], height=14)
+        self.tree.configure(selectmode="extended" if multi else "browse")
+        self.tree.frame.pack(fill="both", expand=True)
+        self.tree.tag_configure("existing", foreground=C_GREY)
+        self.tree.tag_configure("visible", foreground=C_BLUE)
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_count())
+        self.tree.bind("<Double-1>", lambda _e: self._ok())
+
+        self.count = ttk.Label(self, text="", style="Muted.TLabel")
+        self.count.pack(fill="x", pady=(6, 0))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", pady=(10, 0))
+        if multi:
+            ttk.Label(bottom, text="Timeframe:").pack(side="left")
+            self.tf = tk.StringVar(value=timeframe)
+            ttk.Combobox(bottom, textvariable=self.tf, values=list(VALID_TIMEFRAMES),
+                         state="readonly", width=6).pack(side="left", padx=(4, 12))
+            ttk.Label(bottom, text="Estrategia:").pack(side="left")
+            self.strategy = tk.StringVar(value=strategy)
+            ttk.Combobox(bottom, textvariable=self.strategy, values=list(VALID_STRATEGIES),
+                         state="readonly", width=16).pack(side="left", padx=(4, 12))
+            self.auto_spread = tk.BooleanVar(value=True)
+            ttk.Checkbutton(bottom, text="Ajustar spread máximo de cada uno",
+                            variable=self.auto_spread).pack(side="left")
+        ttk.Button(bottom, text="Cancelar", command=self.destroy).pack(side="right")
+        self.ok_button = ttk.Button(bottom, style="Accent.TButton", command=self._ok,
+                                    text="Crear perfiles" if multi else "Usar este símbolo")
+        self.ok_button.pack(side="right", padx=8)
+
+        for var in (self.query, self.category, self.only_tradable):
+            var.trace_add("write", lambda *_a: self._schedule_filter())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self._ok())
+        self._apply_filter()
+        self.update_idletasks()
+        x = master.winfo_rootx() + max(0, (master.winfo_width() - self.winfo_width()) // 2)
+        y = master.winfo_rooty() + 60
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+
+    def _schedule_filter(self) -> None:
+        if self._after_id:
+            self.after_cancel(self._after_id)
+        self._after_id = self.after(150, self._apply_filter)
+
+    def _apply_filter(self) -> None:
+        self._after_id = None
+        query = self.query.get().strip()
+        cat = self.category.get()
+        selected = set(self.tree.selection())
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for d in self.symbols:
+            if cat != "Todas" and d["category"] != cat:
+                continue
+            if self.only_tradable.get() and not d.get("tradable", True):
+                continue
+            if query and not symbol_matches(d, query):
+                continue
+            has_profile = d["name"] in self.existing
+            note = "ya tiene perfil" if has_profile else ("en Observación" if d.get("visible") else "")
+            tag = "existing" if has_profile else ("visible" if d.get("visible") else "")
+            self.tree.insert("", "end", iid=d["name"], tags=(tag,) if tag else (), values=(
+                d["name"], d["description"], d["category"],
+                fmt(d.get("spread"), "{:.6g}", "sin cotización"),
+                fmt(d.get("volume_min"), "{:g}"), note))
+            shown += 1
+        keep = [i for i in selected if self.tree.exists(i)]
+        if keep:
+            self.tree.selection_set(keep)
+        self._shown = shown
+        self._update_count()
+
+    def _update_count(self) -> None:
+        n_sel = len(self.tree.selection())
+        self.count.configure(text=f"{getattr(self, '_shown', 0)} de {len(self.symbols)} símbolos"
+                                  + (f" · {n_sel} seleccionado(s)" if n_sel else ""))
+        if self.multi:
+            self.ok_button.configure(text=f"Crear perfiles ({n_sel})" if n_sel else "Crear perfiles")
+
+    def _ok(self) -> None:
+        chosen = [self.by_name[i] for i in self.tree.selection() if i in self.by_name]
+        if not chosen:
+            messagebox.showinfo("Buscador de símbolos", "Seleccione al menos un símbolo.", parent=self)
+            return
+        if self.multi:
+            self.result = {"symbols": chosen, "timeframe": self.tf.get(),
+                           "strategy": self.strategy.get(), "auto_spread": bool(self.auto_spread.get())}
+        else:
+            self.result = {"symbols": chosen[:1]}
+        self.destroy()
+
+
 def make_tree(master: tk.Widget, columns: list[tuple[str, str, int, str]], height: int = 8) -> ttk.Treeview:
     """Crea un Treeview con scroll. columns = [(id, título, ancho, alineación)]."""
     frame = ttk.Frame(master)
@@ -551,6 +745,8 @@ class ControlCenter(tk.Tk):
         self._closing = False
         self._results_stamp: tuple[float, float] | None = None
         self._symbols_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._symbol_list: list[dict[str, Any]] | None = None   # caché del buscador
+        self._load_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
         self._build_header()
         self._build_profile_bar()
@@ -607,7 +803,8 @@ class ControlCenter(tk.Tk):
         ttk.Button(bar, text="Nuevo perfil…", command=self.new_profile).pack(side="left", padx=2)
         ttk.Button(bar, text="Eliminar", command=self.delete_profile).pack(side="left", padx=2)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Varios símbolos…", command=self.add_symbols).pack(side="left", padx=2)
+        ttk.Button(bar, text="Buscar símbolos…", command=lambda: self.browse_symbols(multi=True)).pack(
+            side="left", padx=2)
         ttk.Button(bar, text="Iniciar todos", command=self.start_all).pack(side="left", padx=2)
         ttk.Button(bar, text="Detener todos", command=self.stop_all).pack(side="left", padx=2)
         self.running_label = ttk.Label(bar, text="", style="Muted.TLabel")
@@ -683,10 +880,12 @@ class ControlCenter(tk.Tk):
         ttk.Button(top, text="Detener todos", command=self.stop_all).pack(side="right")
         ttk.Button(top, text="Iniciar todos", style="Accent.TButton",
                    command=self.start_all).pack(side="right", padx=8)
-        ttk.Button(top, text="Varios símbolos…", command=self.add_symbols).pack(side="right")
+        ttk.Button(top, text="Escribir símbolos…", command=self.add_symbols).pack(side="right")
+        ttk.Button(top, text="Buscar símbolos…", command=lambda: self.browse_symbols(multi=True)).pack(
+            side="right", padx=8)
         self.overview_tree = make_tree(tab, [
             ("profile", "Perfil", 110, "w"), ("symbol", "Símbolo", 90, "w"), ("tf", "TF", 50, "w"),
-            ("state", "Estado", 190, "w"), ("day", "Hoy (cuenta)", 90, "e"),
+            ("state", "Estado", 190, "w"), ("day", "Hoy", 70, "e"),
             ("position", "Posición abierta", 230, "w"), ("pnl", "Resultado", 80, "e"),
             ("evo", "Estrategia (PF valid.)", 190, "w"), ("magic", "Magic", 80, "e")], height=14)
         self.overview_tree.frame.pack(fill="both", expand=True)
@@ -837,6 +1036,11 @@ class ControlCenter(tk.Tk):
                 widget = ttk.Entry(box, textvariable=var, width=18)
             widget.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=3)
             Tooltip(widget, fld.help)
+            if fld.key == "symbol":
+                btn = ttk.Button(box, text="Buscar…", width=8,
+                                 command=lambda: self.browse_symbols(multi=False))
+                btn.grid(row=row, column=2, padx=(6, 0), pady=3)
+                Tooltip(btn, "Elegir el símbolo de una lista con todos los del bróker")
         var.trace_add("write", self._mark_dirty)
         self.vars[fld.key] = var
 
@@ -1269,6 +1473,88 @@ class ControlCenter(tk.Tk):
                                   "(las posiciones abiertas se mantienen con su SL/TP)")
         self._update_buttons()
 
+    def browse_symbols(self, multi: bool, reload: bool = False) -> None:
+        """Abre el buscador de símbolos (carga la lista del bróker la primera vez)."""
+        if self._symbol_list is not None and not reload:
+            self._open_browser(multi)
+            return
+        self.configure(cursor="watch")
+        self._set_cfg_status("Cargando la lista de símbolos del bróker…", C_BLUE)
+        args = (bool(self.vars["require_demo"].get()),
+                str(self.vars["terminal_path"].get()).strip() or None)
+        threading.Thread(target=lambda: self._load_queue.put(load_symbols(*args)), daemon=True).start()
+        self.after(200, lambda: self._wait_symbol_list(multi))
+
+    def _wait_symbol_list(self, multi: bool) -> None:
+        try:
+            res = self._load_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, lambda: self._wait_symbol_list(multi))
+            return
+        self.configure(cursor="")
+        if not res.get("ok") or not res.get("symbols"):
+            self._set_cfg_status(res.get("error", "El bróker no devolvió símbolos."), C_RED)
+            if multi and messagebox.askyesno(
+                    "Buscador no disponible",
+                    f"{res.get('error', 'No se pudo cargar la lista de símbolos.')}\n\n"
+                    "¿Escribir los símbolos a mano?", parent=self):
+                self.add_symbols()
+            elif not multi:
+                messagebox.showerror("Buscador no disponible",
+                                     res.get("error", "No se pudo cargar la lista de símbolos."),
+                                     parent=self)
+            return
+        self._symbol_list = res["symbols"]
+        self._set_cfg_status(f"{len(self._symbol_list)} símbolos cargados del bróker.", C_MUTED)
+        self._open_browser(multi)
+
+    def _open_browser(self, multi: bool) -> None:
+        existing = {str((read_json(config_path_for(n)) or {}).get("symbol", "")) for n in list_profiles()}
+        try:
+            base = self.collect_form()
+        except ValueError:
+            base = dict(DEFAULT_CONFIG)
+        dialog = SymbolBrowser(self, self._symbol_list or [], multi, existing,
+                               str(base.get("timeframe", "M15")), str(base.get("strategy", "cruce_medias")))
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        chosen = dialog.result["symbols"]
+        if not multi:
+            item = chosen[0]
+            self.vars["symbol"].set(item["name"])
+            spread = item.get("spread")
+            msg = f"Símbolo '{item['name']}' elegido ({item['description']})."
+            try:
+                current_max = float(self.vars["max_spread"].get())
+            except ValueError:
+                current_max = 0.0
+            if spread and spread > current_max:
+                new_max = round_sig(spread * 2.5, 2)
+                if messagebox.askyesno(
+                        "Ajustar spread máximo",
+                        f"El spread actual de {item['name']} es {spread:g}, mayor que el máximo "
+                        f"configurado ({current_max:g}). Con ese valor el bot nunca operaría.\n\n"
+                        f"¿Cambiar el spread máximo a {new_max:g}?", parent=self):
+                    self.vars["max_spread"].set(f"{new_max:g}")
+                    msg += f" Spread máximo ajustado a {new_max:g}."
+            self.notebook.select(self.tab_config)
+            self._set_cfg_status(msg + " Pulse 'Guardar configuración'.", C_ORANGE)
+            return
+        try:
+            base = self.collect_form()
+        except ValueError as exc:
+            messagebox.showerror("Configuración inválida",
+                                 f"Corrija primero el perfil actual (se usa como plantilla):\n{exc}",
+                                 parent=self)
+            return
+        base["timeframe"] = dialog.result["timeframe"]
+        base["strategy"] = dialog.result["strategy"]
+        names = [d["name"] for d in chosen]
+        info = ({d["name"]: {"name": d["name"], "spread": d.get("spread"), "suggestions": []}
+                 for d in chosen} if dialog.result["auto_spread"] else None)
+        self._create_symbol_profiles(base, names, info)
+
     def add_symbols(self) -> None:
         """Asistente: crea un perfil por símbolo a partir del perfil actual."""
         try:
@@ -1542,10 +1828,15 @@ class ControlCenter(tk.Tk):
         if acc:
             pnl = st.get("day_pnl_percent") or 0.0
             pnl_color = C_GREEN if pnl > 0 else (C_RED if pnl < 0 else C_MUTED)
+            scope = "solo bots" if st.get("daily_loss_scope") == "bots" else "cuenta"
+            bots = st.get("bots_pnl") or {}
+            detail = (f"Bots hoy: cerrado {fmt(bots.get('realized'), '{:+.2f}')} · abierto "
+                      f"{fmt(bots.get('floating'), '{:+.2f}')}") if bots else ""
             self.card_account.set(
                 f"{acc.get('equity', 0):,.2f}", C_TEXT,
                 f"Equity · balance {acc.get('balance', 0):,.2f}",
-                (f"Hoy {pnl:+.2f}% (límite −{fmt(st.get('max_daily_loss_percent'), '{:g}')}%)", pnl_color))
+                (f"Hoy ({scope}) {pnl:+.2f}% (límite −{fmt(st.get('max_daily_loss_percent'), '{:g}')}%)",
+                 pnl_color), detail)
         else:
             self.card_account.set("—", C_MUTED, "Sin datos: inicie el bot o pulse", "'Probar conexión' en Configuración")
 

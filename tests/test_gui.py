@@ -77,3 +77,15 @@ def test_profile_name_for_symbol() -> None:
     assert bot_gui.profile_name_for_symbol("US500", "M5", {"us500"}) == "us500_m5"
     assert bot_gui.profile_name_for_symbol("EURUSD.m", "H1", set()) == "eurusd_m"
     assert bot_gui.round_sig(0.000237) == pytest.approx(0.00024)
+
+
+def test_symbol_search_with_spanish_synonyms() -> None:
+    gold = {"name": "XAUUSD", "description": "Gold vs US Dollar", "path": "Metals\\Spot"}
+    nas = {"name": "NAS100", "description": "US Tech 100 Index", "path": "Indices\\US"}
+    eur = {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\Majors"}
+    assert bot_gui.symbol_matches(gold, "oro")
+    assert bot_gui.symbol_matches(gold, "gold")
+    assert bot_gui.symbol_matches(nas, "nasdaq")
+    assert bot_gui.symbol_matches(eur, "eur usd")
+    assert not bot_gui.symbol_matches(eur, "oro")
+    assert bot_gui.symbol_matches(eur, "majors")

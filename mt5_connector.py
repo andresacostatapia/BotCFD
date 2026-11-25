@@ -231,6 +231,37 @@ def find_similar_symbols(symbol: str, limit: int = 8) -> list[str]:
     return ranked[:limit]
 
 
+def list_symbols() -> list[dict[str, Any]]:
+    """
+    Todos los símbolos del bróker para el buscador del Centro de control.
+
+    :returns: lista de dicts con name, description, category (primer nivel de la
+              ruta, p. ej. 'Forex' o 'Indices'), path, spread (precio actual, None si
+              no hay cotización), digits, volume_min, visible y tradable.
+    """
+    m = _require_mt5()
+    symbols = m.symbols_get() or ()
+    disabled = getattr(m, "SYMBOL_TRADE_MODE_DISABLED", 0)
+    out: list[dict[str, Any]] = []
+    for s in symbols:
+        path = str(getattr(s, "path", "") or "")
+        point = float(getattr(s, "point", 0.0) or 0.0)
+        spread_pts = float(getattr(s, "spread", 0) or 0)
+        out.append({
+            "name": s.name,
+            "description": str(getattr(s, "description", "") or ""),
+            "path": path,
+            "category": path.replace("/", "\\").split("\\")[0] if path else "Otros",
+            "spread": spread_pts * point if spread_pts > 0 and point > 0 else None,
+            "digits": int(getattr(s, "digits", 5) or 5),
+            "volume_min": float(getattr(s, "volume_min", 0.0) or 0.0),
+            "visible": bool(getattr(s, "visible", False)),
+            "tradable": getattr(s, "trade_mode", 4) != disabled,
+        })
+    out.sort(key=lambda d: (d["category"].lower(), d["name"].lower()))
+    return out
+
+
 def ensure_symbol(symbol: str) -> bool:
     """Asegura que el símbolo exista y esté visible en Market Watch."""
     m = _require_mt5()
@@ -313,6 +344,47 @@ def get_min_stop_distance(symbol: str) -> float:
     if info is None:
         return 0.0
     return float(info.trade_stops_level) * float(info.point)
+
+
+def get_account_login() -> int | None:
+    """Número de cuenta (login) conectada, o None."""
+    m = _require_mt5()
+    info = m.account_info()
+    return int(info.login) if info is not None else None
+
+
+def get_server_time(symbol: str) -> int | None:
+    """Hora actual del servidor (epoch, en la zona del servidor) según el último tick."""
+    tick = get_tick(symbol)
+    return int(tick.time) if tick is not None and getattr(tick, "time", 0) else None
+
+
+def get_bots_pnl_since(magics: set[int], since_server_time: int) -> tuple[float, float]:
+    """
+    Resultado de las operaciones de los bots (identificadas por ``magics``).
+
+    :param since_server_time: hora del servidor (epoch) desde la que se suman los cierres.
+    :returns: (resultado cerrado desde ``since_server_time`` incluyendo comisiones y
+              swap, resultado flotante de las posiciones abiertas de los bots).
+    """
+    m = _require_mt5()
+    positions = m.positions_get() or ()
+    floating = sum(float(p.profit) + float(getattr(p, "swap", 0.0))
+                   for p in positions if p.magic in magics)
+
+    # Las posiciones se identifican por el deal de entrada (que lleva el magic del bot);
+    # los cierres por SL/TP o manuales se asocian por position_id.
+    date_to = datetime.now() + timedelta(days=2)
+    date_from = datetime.now() - timedelta(days=30)
+    deals = m.history_deals_get(date_from, date_to) or ()
+    entry_in = getattr(m, "DEAL_ENTRY_IN", 0)
+    bot_positions = {d.position_id for d in deals if d.magic in magics and d.entry == entry_in}
+    realized = sum(
+        float(d.profit) + float(d.commission) + float(d.swap)
+        for d in deals
+        if int(d.time) >= since_server_time and (d.position_id in bot_positions or d.magic in magics)
+    )
+    return realized, floating
 
 
 def get_account_snapshot() -> AccountSnapshot | None:

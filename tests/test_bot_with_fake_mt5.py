@@ -105,9 +105,18 @@ def test_dry_run_sends_nothing(fake: FakeMT5, config_file) -> None:
 
 def test_daily_loss_blocks_trading(fake: FakeMT5, config_file) -> None:
     bot = _bot_at_signal(fake, config_file, dry_run=False)
-    fake.equity = 9_600  # -4 %
+    bot.config["daily_loss_scope"] = "cuenta"
+    fake.equity = 9_600  # -4 % en la cuenta
     bot.step()
     assert fake.orders == [] and bot.risk.trading_halted
+
+
+def test_manual_loss_does_not_block_bots_by_default(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    assert bot.loss_scope == "bots"  # valor por defecto
+    fake.equity = 9_600  # -4 % por una operación manual
+    bot.step()
+    assert len(fake.orders) == 1 and not bot.risk.trading_halted
 
 
 def test_hot_reload(fake: FakeMT5, config_file) -> None:
@@ -194,7 +203,7 @@ def test_heartbeat_explains_what_bot_waits_for(fake: FakeMT5, config_file, caplo
     text = caplog.text
     assert "En espera" in text and "esperando cruce" in text
     # H1: el tick simulado está 1 min después de abrir la vela en curso -> faltan 59 min
-    assert "en 59 min" in text and "día +0.00%" in text
+    assert "en 59 min" in text and "día (bots) +0.00%" in text
     caplog.clear()
     bot.step()                         # antes de heartbeat_seconds -> no repite
     assert "En espera" not in caplog.text
@@ -300,3 +309,79 @@ def test_bot_trades_with_new_strategies(fake: FakeMT5, config_file, params) -> N
     bot.step()
     assert len(fake.orders) == 1
     assert fake.orders[0]["type"] == (fake.ORDER_TYPE_BUY if sig[idx] == 1 else fake.ORDER_TYPE_SELL)
+
+
+def _new_bot(config_file, **overrides) -> trading_bot.TradingBot:
+    cfg = {**bot_common.load_config(config_file), **overrides}
+    bot_common.save_config(cfg, config_file)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=True)
+    assert bot.start_day()
+    return bot
+
+
+def test_day_start_survives_restart(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    first = _new_bot(config_file, daily_loss_scope="cuenta")
+    assert first.risk.day_start_balance == 10_000
+    fake.balance = fake.equity = 9_700  # pérdida realizada después del inicio del día
+    second = _new_bot(config_file, daily_loss_scope="cuenta")  # "reinicio" el mismo día
+    assert second.risk.day_start_balance == 10_000
+    assert second.risk.daily_loss_percent(9_700) == pytest.approx(3.0)
+    assert second.check_daily_loss() is False  # la pérdida previa al reinicio cuenta
+
+
+def test_bots_scope_ignores_manual_trades(fake: FakeMT5, config_file) -> None:
+    from types import SimpleNamespace
+
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    fake.positions.append(SimpleNamespace(ticket=900, symbol="EURUSD", volume=1.0, magic=0,
+                                          type=0, profit=-916.0))
+    fake.equity = 10_000 - 916
+    account_bot = _new_bot(config_file, daily_loss_scope="cuenta")
+    assert account_bot.check_daily_loss() is False      # la manual cuenta
+    (config_file.parent / "logs" / "day_state.json").unlink()
+    bots_bot = _new_bot(config_file, daily_loss_scope="bots")
+    assert bots_bot.check_daily_loss() is True          # la manual NO cuenta
+    assert bots_bot.bots_pnl == (0.0, 0.0)
+
+
+def test_bots_scope_counts_bot_losses_and_shares_halt(fake: FakeMT5, config_file) -> None:
+    from types import SimpleNamespace
+
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = _new_bot(config_file, daily_loss_scope="bots")
+    t = bot.day_start_server_time
+    # Posición del bot cerrada hoy con -350 y otra abierta con -10 (= -3.6 %)
+    fake.deals += [
+        SimpleNamespace(position_id=70, magic=20250101, entry=0, type=0, symbol="EURUSD",
+                        volume=0.5, price=1.1, time=t + 5, profit=0.0, commission=-2.0, swap=0.0),
+        SimpleNamespace(position_id=70, magic=0, entry=1, type=1, symbol="EURUSD",
+                        volume=0.5, price=1.09, time=t + 50, profit=-348.0, commission=0.0, swap=0.0),
+        # cierre de AYER de otra posición del bot: no cuenta
+        SimpleNamespace(position_id=71, magic=20250101, entry=1, type=1, symbol="EURUSD",
+                        volume=0.5, price=1.09, time=t - 3600, profit=-500.0, commission=0.0, swap=0.0),
+    ]
+    fake.positions.append(SimpleNamespace(ticket=72, symbol="EURUSD", volume=0.1, magic=20250101,
+                                          type=0, profit=-10.0, swap=0.0))
+    assert bot.check_daily_loss() is False
+    assert bot.bots_pnl == (pytest.approx(-350.0), pytest.approx(-10.0))
+    # Otro perfil de la misma cuenta y mismo criterio queda detenido también
+    other_cfg = bot_common.config_path_for("gbpusd", config_file.parent)
+    bot_common.save_config({**bot_common.load_config(config_file), "magic": 555}, other_cfg)
+    other = trading_bot.TradingBot(bot_common.load_config(other_cfg), other_cfg, dry_run=True)
+    assert other.start_day()
+    fake.positions.clear()
+    fake.deals.clear()
+    assert other.check_daily_loss() is False
+    assert "otro bot" in other.risk.halt_reason
+
+
+def test_list_symbols_for_browser(fake: FakeMT5) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    symbols = mt5_connector.list_symbols()
+    names = [s["name"] for s in symbols]
+    assert set(names) == set(fake.symbols)
+    us500 = next(s for s in symbols if s["name"] == "US500")
+    assert us500["category"] == "Indices" and us500["description"] == "US 500 Index"
+    assert us500["spread"] == pytest.approx(10 * 0.00001) and us500["tradable"]
+    assert names.index("EURUSD") < names.index("US500")  # ordenados por categoría
