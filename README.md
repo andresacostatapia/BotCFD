@@ -24,7 +24,7 @@ C:\MT5Bot\
 ├── requirements-dev.txt     # Para ejecutar los tests (sin MetaTrader5)
 ├── risk_config.example.json # Todas las claves con sus valores por defecto
 ├── start_bot.bat            # Lanzador CMD (instala dependencias automáticamente)
-├── launch.ps1               # Lanzador PowerShell con log dual
+├── launch.ps1               # Lanzador PowerShell con log dual (instala dependencias)
 ├── tests\                   # pytest (incluye un MT5 falso para integración)
 └── logs\                    # Logs rotativos (se crea automáticamente)
 ```
@@ -96,7 +96,7 @@ alternativa madura.
    ```
    O manualmente: `python -m pip install -r requirements.txt`.
 
-### Instalación automática en `start_bot.bat`
+### Instalación automática (`start_bot.bat` y `launch.ps1`)
 
 | Paso | Qué comprueba | Si falta |
 |---|---|---|
@@ -106,10 +106,13 @@ alternativa madura.
 | `strategy-genome` / `deap` | Cada una por separado | Las instala; basta con que quede **una** disponible |
 | `tkinter` | `import tkinter` | No se instala con pip: indica reinstalar Python con la opción *tcl/tk and IDLE* |
 
+Ambos lanzadores hacen las mismas comprobaciones. `launch.ps1` además recarga el
+PATH tras instalar Python con winget y continúa sin tener que reabrir la consola.
+
 Al final vuelve a importar cada librería para confirmar que la instalación
 funcionó; si algo sigue faltando, se detiene con un mensaje y el comando manual.
-Las versiones mínimas del `.bat` coinciden con `requirements.txt` (si cambia una,
-cambie la otra).
+Las versiones mínimas del `.bat` y del `.ps1` coinciden con `requirements.txt`
+(si cambia una, cambie las otras).
 
 ---
 
@@ -164,6 +167,7 @@ start_bot.bat --install-only  :: solo verifica/instala dependencias
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\launch.ps1            # consola + archivo
 powershell -ExecutionPolicy Bypass -File .\launch.ps1 -DryRun -SkipPanel
+powershell -ExecutionPolicy Bypass -File .\launch.ps1 -InstallOnly   # solo dependencias
 ```
 Si MT5 no está en `C:\Program Files\MetaTrader 5\terminal64.exe`, defina la
 variable `MT5_PATH` o use `-Mt5Path`.
