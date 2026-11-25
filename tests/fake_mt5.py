@@ -17,6 +17,12 @@ ORDER_TIME_GTC = 0
 ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
 
 
+def _epoch_seconds(times: pd.Series) -> np.ndarray:
+    """Segundos desde epoch, independiente de la resolución interna de pandas."""
+    naive = times.dt.tz_localize(None) if times.dt.tz is not None else times
+    return ((naive - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)).to_numpy(dtype="int64")
+
+
 class FakeMT5:
     """Estado de un terminal falso. Se usa como módulo: atributos = API de MT5."""
 
@@ -73,14 +79,16 @@ class FakeMT5:
 
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
         last = float(self.df["close"].iloc[-1])
-        return SimpleNamespace(bid=last, ask=last + 0.0001, time=0)
+        # Hora del servidor: 1 minuto después de abrir la vela en curso (última fila).
+        now = int(_epoch_seconds(self.df["time"].iloc[-1:])[0]) + 60
+        return SimpleNamespace(bid=last, ask=last + 0.0001, time=now)
 
     def copy_rates_from_pos(self, symbol: str, tf: int, start: int, count: int) -> np.ndarray:
         sub = self.df.iloc[-count:]
         out = np.zeros(len(sub), dtype=[("time", "i8"), ("open", "f8"), ("high", "f8"),
                                          ("low", "f8"), ("close", "f8"), ("tick_volume", "i8"),
                                          ("spread", "i4"), ("real_volume", "i8")])
-        out["time"] = sub["time"].astype("int64").to_numpy() // 10**9
+        out["time"] = _epoch_seconds(sub["time"])
         out["spread"] = 10
         for col in ("open", "high", "low", "close"):
             out[col] = sub[col].to_numpy()

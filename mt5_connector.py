@@ -254,7 +254,8 @@ def get_rates(symbol: str, timeframe: str | int, n_bars: int) -> pd.DataFrame:
     Descarga las últimas ``n_bars`` velas.
 
     :returns: DataFrame con columnas time, open, high, low, close, tick_volume,
-              spread, real_volume (``time`` como datetime UTC). Vacío si falla.
+              spread, real_volume y spread_price (``time`` en hora del servidor
+              del bróker, sin zona horaria). Vacío si falla.
     """
     m = _require_mt5()
     if not ensure_symbol(symbol):
@@ -264,7 +265,8 @@ def get_rates(symbol: str, timeframe: str | int, n_bars: int) -> pd.DataFrame:
         logger.error("copy_rates_from_pos(%s) sin datos: %s", symbol, m.last_error())
         return pd.DataFrame()
     df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    # MT5 entrega las horas en la zona horaria del SERVIDOR del bróker (no UTC).
+    df["time"] = pd.to_datetime(df["time"], unit="s")
     info = m.symbol_info(symbol)
     if "spread" in df.columns and info is not None:
         # Spread histórico de cada vela en unidades de precio (lo usa el backtest).

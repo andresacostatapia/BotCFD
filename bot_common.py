@@ -67,6 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
     "loop_seconds": 60,
+    "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
     "close_positions_on_error": False,
     "terminal_path": "",              # ruta a terminal64.exe (opcional)
@@ -135,6 +136,10 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     folds = config.get("fitness_folds")
     if isinstance(folds, bool) or not isinstance(folds, int) or not 1 <= folds <= 10:
         errors.append("'fitness_folds' debe ser un entero entre 1 y 10")
+
+    hb = config.get("heartbeat_seconds")
+    if isinstance(hb, bool) or not isinstance(hb, int) or hb < 0:
+        errors.append("'heartbeat_seconds' debe ser un entero >= 0 (0 = desactivado)")
 
     for key in ("sl_atr_mult", "tp_atr_mult", "oos_pf_ratio_min", "pf_cap"):
         value = _num(key)

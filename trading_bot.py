@@ -22,7 +22,7 @@ import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,9 @@ class TradingBot:
         )
         self.params: dict[str, Any] | None = None
         self.evolution: dict[str, Any] | None = None
-        self.last_bar_time: Any = None
+        self.last_bar_time: Any = None      # última vela cuya señal ya se procesó
+        self.logged_bar_time: Any = None    # última vela ya mostrada en el log
+        self.last_heartbeat: float = 0.0    # time.monotonic() del último mensaje de espera
         self.halt_logged = False
 
     # ---------------------------------------------------------------- evolución
@@ -160,10 +162,69 @@ class TradingBot:
             terminal_path=self.config.get("terminal_path") or None,
         )
 
+    # ----------------------------------------------------------- mensajes
+    def heartbeat(self, message: str) -> None:
+        """Mensaje de espera periódico (cada ``heartbeat_seconds``; 0 = desactivado)."""
+        every = float(self.config.get("heartbeat_seconds", 60))
+        if every <= 0:
+            return
+        now = time.monotonic()
+        if now - self.last_heartbeat >= every - 1:
+            self.last_heartbeat = now
+            logger.info("En espera | %s", message)
+
+    def _day_text(self) -> str:
+        """Resultado del día en % frente al límite de pérdida diaria."""
+        st = self.risk.status()
+        pnl = -(st["daily_loss_percent"] or 0.0) + 0.0  # + 0.0 evita mostrar "-0.00"
+        return f"día {pnl:+.2f}% (límite -{st['max_daily_loss_percent']:g}%)"
+
+    def _next_bar_text(self, bar_time: Any, tick: Any) -> str:
+        """Hora de cierre de la vela en curso y minutos que faltan (hora del servidor)."""
+        try:
+            tf = timedelta(seconds=mt5c.timeframe_seconds(self.config["timeframe"]))
+            next_close = bar_time.to_pydatetime() + 2 * tf  # bar_time = apertura de la última cerrada
+            if tick is None:
+                return f"próxima vela {next_close:%H:%M}"
+            # tick.time viene en hora del servidor codificada como epoch
+            server_now = datetime.fromtimestamp(int(tick.time), tz=timezone.utc).replace(tzinfo=None)
+            remaining = (next_close - server_now).total_seconds()
+            if remaining < -tf.total_seconds():
+                return "sin cotizaciones recientes (¿mercado cerrado?)"
+            minutes = max(0, int(remaining // 60))
+            return f"próxima vela {next_close:%H:%M} (en {minutes} min)"
+        except Exception:  # noqa: BLE001 - es solo informativo
+            return "próxima vela: desconocida"
+
+    def _waiting_text(self, sig: dict[str, Any]) -> str:
+        """Explica qué condición falta para la próxima señal."""
+        p = self.params or {}
+        fast, slow, rsi_now = sig["fast_ma"], sig["slow_ma"], sig["rsi"]
+        if fast > slow:
+            return (f"rápida {fast:.6g} > lenta {slow:.6g}: esperando cruce a la BAJA "
+                    f"con RSI < {float(p['rsi_sell']):.1f} (RSI {rsi_now:.1f})")
+        return (f"rápida {fast:.6g} < lenta {slow:.6g}: esperando cruce al ALZA "
+                f"con RSI > {float(p['rsi_buy']):.1f} (RSI {rsi_now:.1f})")
+
+    @staticmethod
+    def _positions_text(positions: list[Any]) -> str:
+        """Resumen de las posiciones abiertas del bot."""
+        parts = []
+        for pos in positions:
+            side = "BUY" if getattr(pos, "type", 0) == 0 else "SELL"
+            parts.append(
+                f"{side} {pos.volume:g} @ {getattr(pos, 'price_open', 0.0):.6g} "
+                f"SL {getattr(pos, 'sl', 0.0):.6g} TP {getattr(pos, 'tp', 0.0):.6g} "
+                f"P&L {getattr(pos, 'profit', 0.0):+.2f}"
+            )
+        return "posición abierta: " + "; ".join(parts)
+
+    # ------------------------------------------------------------- iteración
     def step(self) -> None:
         """Una iteración del bucle principal."""
         self.reload_config_if_changed()
         if not self.ensure_connection():
+            self.heartbeat("sin conexión con MT5; se reintentará en el próximo ciclo")
             return
         self.check_new_day()
 
@@ -175,14 +236,14 @@ class TradingBot:
                 logger.error("Trading detenido hasta el próximo día: %s",
                              self.risk.halt_reason or self.risk.last_rejection)
                 self.halt_logged = True
+            self.heartbeat(f"trading detenido por pérdida diaria | {self._day_text()}")
             return
 
         if self.params is None:
-            logger.info("Sin parámetros válidos: el bot no abre operaciones.")
+            self.heartbeat("sin parámetros válidos: el bot no abre operaciones")
             return
 
-        if not self.risk.check_spread():
-            return
+        spread_ok = self.risk.check_spread()
 
         bars_needed = int(self.params["slow"]) + int(cfg["atr_period"]) + 50
         df = mt5c.get_rates(symbol, cfg["timeframe"], bars_needed + 1)
@@ -192,23 +253,50 @@ class TradingBot:
         df = df.iloc[:-1]  # sólo velas cerradas
 
         sig = compute_signal(df, self.params, int(cfg["atr_period"]))
-        if sig["bar_time"] == self.last_bar_time:
-            return  # esta vela ya se procesó
-        self.last_bar_time = sig["bar_time"]
-
+        bar_time = sig["bar_time"]
         positions = mt5c.get_positions(symbol, magic)
-        logger.info(
-            "Vela %s | close=%.5f fast=%.5f slow=%.5f rsi=%.1f atr=%.5f | señal=%d | "
-            "posiciones=%d | estado=%s",
-            sig["bar_time"], sig["close"], sig["fast_ma"], sig["slow_ma"], sig["rsi"],
-            sig["atr"], sig["signal"], len(positions), self.risk.status(),
-        )
-        if sig["signal"] == 0:
-            return
-        if positions:
-            logger.info("Señal ignorada: ya hay %d posición(es) con magic %d.", len(positions), magic)
-            return
-        self.open_trade(sig)
+        signal_txt = {1: "COMPRA", -1: "VENTA"}.get(sig["signal"], "ninguna")
+
+        if bar_time != self.logged_bar_time:
+            self.logged_bar_time = bar_time
+            logger.info(
+                "Vela %s cerrada (hora servidor) | close %.6g | rápida %.6g lenta %.6g | "
+                "RSI %.1f | ATR %.6g | señal: %s | posiciones: %d | %s",
+                f"{bar_time:%Y-%m-%d %H:%M}" if hasattr(bar_time, "strftime") else bar_time,
+                sig["close"], sig["fast_ma"], sig["slow_ma"], sig["rsi"], sig["atr"],
+                signal_txt, len(positions), self._day_text(),
+            )
+            self.last_heartbeat = time.monotonic()  # el mensaje de vela cuenta como latido
+
+        if bar_time != self.last_bar_time:
+            if sig["signal"] == 0:
+                self.last_bar_time = bar_time
+            elif positions:
+                self.last_bar_time = bar_time
+                logger.info("Señal de %s ignorada: ya hay %d posición(es) con magic %d.",
+                            signal_txt, len(positions), magic)
+            elif not spread_ok:
+                # No se marca la vela: se reintenta en el próximo ciclo si el spread baja.
+                self.heartbeat(f"señal de {signal_txt} pendiente: spread "
+                               f"{self.risk.last_spread:.6g} > máximo {self.risk.max_spread:.6g}")
+                return
+            else:
+                self.last_bar_time = bar_time
+                self.open_trade(sig)
+                self.last_heartbeat = time.monotonic()
+                return
+
+        tick = mt5c.get_tick(symbol)
+        price_txt = (f"{symbol} {tick.bid:.6g}/{tick.ask:.6g} spread {tick.ask - tick.bid:.6g}"
+                     if tick is not None else f"{symbol} sin cotización")
+        if not spread_ok:
+            state = f"spread alto (máx {self.risk.max_spread:.6g}): no se abrirán operaciones"
+        elif positions:
+            state = self._positions_text(positions)
+        else:
+            state = self._waiting_text(sig)
+        self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
+                       f"{self._day_text()}")
 
     def open_trade(self, sig: dict[str, Any]) -> None:
         """Calcula SL/TP con ATR, dimensiona el lote y envía la orden."""

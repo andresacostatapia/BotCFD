@@ -145,6 +145,7 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `min_pf_in_sample` | 1.0 | PF in-sample mínimo |
 | `atr_period`, `sl_atr_mult`, `tp_atr_mult` | 14, 1.5, 2.0 | SL/TP por ATR |
 | `loop_seconds` | 60 | Frecuencia del bucle |
+| `heartbeat_seconds` | 60 | Cada cuánto se muestra el mensaje "En espera" (precio, próxima vela, qué condición falta, P&L del día). `0` = desactivado |
 | `deviation` | 20 | Deslizamiento máximo en puntos |
 | `close_positions_on_error` | false | Fail-safe: cerrar posiciones del bot ante un error no controlado |
 | `terminal_path` | "" | Ruta a `terminal64.exe` si hay varias instalaciones |

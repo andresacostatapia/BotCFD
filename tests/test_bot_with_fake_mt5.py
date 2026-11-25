@@ -56,7 +56,8 @@ def test_real_account_rejected_when_demo_required(fake: FakeMT5) -> None:
 def test_get_rates_and_spread(fake: FakeMT5) -> None:
     mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
     df = mt5_connector.get_rates("EURUSD", "H1", 500)
-    assert len(df) == 500 and str(df["time"].dt.tz) == "UTC"
+    assert len(df) == 500 and df["time"].dt.tz is None  # hora del servidor, sin zona
+    assert pd.api.types.is_datetime64_any_dtype(df["time"])
     assert mt5_connector.get_spread("EURUSD") == pytest.approx(0.0001)
 
 
@@ -163,3 +164,48 @@ def test_get_rates_adds_spread_in_price(fake: FakeMT5) -> None:
     mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
     df = mt5_connector.get_rates("EURUSD", "H1", 50)
     assert df["spread_price"].iloc[0] == pytest.approx(10 * 0.00001)
+
+
+def test_candle_line_and_heartbeat_after_signal(fake: FakeMT5, config_file, caplog) -> None:
+    caplog.set_level("INFO")
+    bot = _bot_at_signal(fake, config_file, dry_run=True)
+    bot.step()                       # vela con señal -> línea de vela + [DRY-RUN]
+    assert "cerrada (hora servidor)" in caplog.text and "[DRY-RUN]" in caplog.text
+    assert "1970" not in caplog.text
+    caplog.clear()
+    bot.last_heartbeat = 0.0
+    bot.step()                       # misma vela -> mensaje de espera
+    assert "En espera" in caplog.text and "Vela" not in caplog.text
+
+
+def test_heartbeat_explains_what_bot_waits_for(fake: FakeMT5, config_file, caplog) -> None:
+    caplog.set_level("INFO")
+    sig = signal_array(IndicatorCache(fake.df), PARAMS)
+    idx = int(np.flatnonzero(sig == 0)[-1])
+    fake.df = fake.df.iloc[: idx + 2]  # última vela cerrada sin señal
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=True)
+    bot.risk.reset_daily()
+    bot.params = dict(PARAMS)
+    bot.step()                         # la línea de vela cuenta como latido
+    assert "En espera" not in caplog.text
+    bot.last_heartbeat = 0.0
+    caplog.clear()
+    bot.step()
+    text = caplog.text
+    assert "En espera" in text and "esperando cruce" in text
+    # H1: el tick simulado está 1 min después de abrir la vela en curso -> faltan 59 min
+    assert "en 59 min" in text and "día +0.00%" in text
+    caplog.clear()
+    bot.step()                         # antes de heartbeat_seconds -> no repite
+    assert "En espera" not in caplog.text
+
+
+def test_heartbeat_can_be_disabled(fake: FakeMT5, config_file, caplog) -> None:
+    caplog.set_level("INFO")
+    bot = _bot_at_signal(fake, config_file, dry_run=True)
+    bot.config["heartbeat_seconds"] = 0
+    bot.step()
+    caplog.clear()
+    bot.step()
+    assert "En espera" not in caplog.text
