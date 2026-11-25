@@ -161,3 +161,74 @@ def test_evolve_with_sl_tp(synthetic_ohlc: pd.DataFrame, backend: str) -> None:
     off = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3,
                                config={"evolver_backend": backend, "evolve_sl_tp": False}, seed=4)
     assert "sl_mult" not in off["params"]
+
+
+STRATEGY_PARAMS = {
+    "cruce_medias": {"fast": 10, "slow": 40, "rsi_buy": 50.0, "rsi_sell": 50.0},
+    "reversion_media": {"bb_period": 20, "bb_std": 2.0, "rsi_low": 35.0, "rsi_high": 65.0},
+    "ruptura": {"lookback": 20, "trend": 50},
+}
+
+
+@pytest.mark.parametrize("name", list(STRATEGY_PARAMS))
+def test_each_strategy_signals_without_lookahead(synthetic_ohlc: pd.DataFrame, name: str) -> None:
+    params = STRATEGY_PARAMS[name]
+    assert se.strategy_of(params) == name
+    full = se.signal_array(se.IndicatorCache(synthetic_ohlc), params)
+    assert (full == 1).sum() > 0 and (full == -1).sum() > 0
+    cut = 1300
+    part = se.signal_array(se.IndicatorCache(synthetic_ohlc.iloc[:cut]), params)
+    np.testing.assert_array_equal(full[:cut], part)
+
+
+@pytest.mark.parametrize("name", list(STRATEGY_PARAMS))
+def test_compute_signal_texts(synthetic_ohlc: pd.DataFrame, name: str) -> None:
+    out = se.compute_signal(synthetic_ohlc, STRATEGY_PARAMS[name])
+    assert out["strategy"] == name
+    assert out["indicators"] and out["waiting"]
+    assert (out["fast_ma"] is None) == (name != "cruce_medias")
+
+
+def test_breakout_rules(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = STRATEGY_PARAMS["ruptura"]
+    sig = se.signal_array(cache, p)
+    hh, ll, trend = cache.highest(20), cache.lowest(20), cache.sma(50)
+    c = cache.close_np
+    buys, sells = np.flatnonzero(sig == 1), np.flatnonzero(sig == -1)
+    assert np.all(c[buys] > hh[buys]) and np.all(c[buys] > trend[buys])
+    assert np.all(c[sells] < ll[sells]) and np.all(c[sells] < trend[sells])
+    # el máximo de referencia excluye la vela actual
+    assert hh[30] == pytest.approx(synthetic_ohlc["high"].iloc[10:30].max())
+
+
+def test_bollinger_rules(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = STRATEGY_PARAMS["reversion_media"]
+    sig = se.signal_array(cache, p)
+    lower = cache.sma(20) - 2.0 * cache.rolling_std(20)
+    buys = np.flatnonzero(sig == 1)
+    assert np.all(cache.close_np[buys] < lower[buys]) and np.all(cache.rsi[buys] < 35.0)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("name", ["reversion_media", "ruptura"])
+def test_evolve_new_strategies(synthetic_ohlc: pd.DataFrame, backend: str, name: str) -> None:
+    out = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3, seed=3,
+                               config={"strategy": name, "evolver_backend": backend})
+    assert out["strategy"] == name
+    assert set(se.STRATEGY_SPACES[name]) <= set(out["params"])
+    assert {"sl_mult", "tp_mult"} <= set(out["params"])
+    for key, (_kind, lo, hi) in se.STRATEGY_SPACES[name].items():
+        assert lo <= out["params"][key] <= hi
+
+
+def test_warmup_bars() -> None:
+    assert se.warmup_bars({"fast": 10, "slow": 80}) == 81
+    assert se.warmup_bars({"lookback": 20, "trend": 150}) == 151
+    assert se.warmup_bars({"bb_period": 20}) == 21
+
+
+def test_unknown_strategy_rejected() -> None:
+    with pytest.raises(ValueError):
+        se.build_search_space({"strategy": "magia"})

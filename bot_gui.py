@@ -38,7 +38,8 @@ from tkinter import messagebox, scrolledtext, simpledialog, ttk
 from typing import Any, Callable
 
 from bot_common import (
-    BASE_DIR, DEFAULT_CONFIG, LOG_DIR, MAIN_PROFILE, PROFILE_NAME_RE, VALID_TIMEFRAMES,
+    BASE_DIR, DEFAULT_CONFIG, LOG_DIR, MAIN_PROFILE, PROFILE_NAME_RE, VALID_STRATEGIES,
+    VALID_TIMEFRAMES,
     config_path_for, list_profiles, load_config, profile_paths, read_json, save_config,
     setup_logging, validate_config,
 )
@@ -88,7 +89,19 @@ PHASES: dict[str, tuple[str, str]] = {
     "finalizado": ("Detenido", C_GREY),
 }
 
+STRATEGY_NAMES = {
+    "cruce_medias": "Cruce de medias + RSI",
+    "reversion_media": "Reversión a la media (Bollinger)",
+    "ruptura": "Ruptura de rango",
+}
+
 PARAM_LABELS = {
+    "bb_period": "Periodo Bollinger (velas)",
+    "bb_std": "Ancho bandas (desv. típicas)",
+    "rsi_low": "RSI máximo para comprar",
+    "rsi_high": "RSI mínimo para vender",
+    "lookback": "Rango de ruptura (velas)",
+    "trend": "Media de tendencia (velas)",
     "fast": "Media rápida (velas)",
     "slow": "Media lenta (velas)",
     "rsi_buy": "RSI mínimo para comprar",
@@ -132,6 +145,10 @@ FIELD_GROUPS: list[tuple[str, list[Field]]] = [
               "Máximo de posiciones abiertas sumando TODOS los perfiles/símbolos. 0 = sin límite"),
     ]),
     ("Evolución", [
+        Field("strategy", "Estrategia", "choice",
+              "cruce_medias: tendencia (M15/H1). reversion_media: vuelve a la media tras salir de "
+              "las bandas de Bollinger (corto plazo). ruptura: rompe el máximo/mínimo de N velas "
+              "a favor de la tendencia", VALID_STRATEGIES),
         Field("history_bars", "Velas de historial", "int", "Velas usadas para evolucionar y validar"),
         Field("population", "Población", "int", "Combinaciones por generación"),
         Field("generations", "Generaciones", "int", "Iteraciones del algoritmo genético"),
@@ -195,12 +212,19 @@ def python_for_children() -> str:
 
 
 def describe_params(params: dict[str, Any] | None) -> str:
-    """Resumen legible de los parámetros evolucionados."""
+    """Resumen legible de los parámetros evolucionados (según la estrategia)."""
     if not params:
         return "—"
-    text = (f"Medias {params.get('fast')}/{params.get('slow')} · "
-            f"RSI > {fmt(params.get('rsi_buy'), '{:.1f}')} compra / "
-            f"< {fmt(params.get('rsi_sell'), '{:.1f}')} venta")
+    if "bb_period" in params:
+        text = (f"Bollinger {params.get('bb_period')} × {fmt(params.get('bb_std'), '{:.2f}')} · "
+                f"RSI < {fmt(params.get('rsi_low'), '{:.1f}')} compra / "
+                f"> {fmt(params.get('rsi_high'), '{:.1f}')} venta")
+    elif "lookback" in params:
+        text = f"Ruptura de {params.get('lookback')} velas · tendencia SMA {params.get('trend')}"
+    else:
+        text = (f"Medias {params.get('fast')}/{params.get('slow')} · "
+                f"RSI > {fmt(params.get('rsi_buy'), '{:.1f}')} compra / "
+                f"< {fmt(params.get('rsi_sell'), '{:.1f}')} venta")
     if "sl_mult" in params:
         text += (f" · SL {fmt(params.get('sl_mult'), '{:.2f}')}× / "
                  f"TP {fmt(params.get('tp_mult'), '{:.2f}')}× ATR")
@@ -371,13 +395,13 @@ class Card(tk.Frame):
 class MultiSymbolDialog(tk.Toplevel):
     """Pide una lista de símbolos y el timeframe para crear un perfil por símbolo."""
 
-    def __init__(self, master: tk.Tk, timeframe: str) -> None:
+    def __init__(self, master: tk.Tk, timeframe: str, strategy: str = "cruce_medias") -> None:
         super().__init__(master)
         self.title("Operar varios símbolos")
         self.configure(bg=C_BG, padx=16, pady=14)
         self.resizable(False, False)
         self.transient(master)
-        self.result: tuple[list[str], str, bool] | None = None
+        self.result: tuple[list[str], str, bool, str] | None = None
         ttk.Label(self, text="Se creará un perfil por símbolo, copiando la configuración del "
                              "perfil actual,\n"
                              "con su propio magic number. Después podrá iniciarlos "
@@ -393,6 +417,10 @@ class MultiSymbolDialog(tk.Toplevel):
         self.tf = tk.StringVar(value=timeframe)
         ttk.Combobox(row, textvariable=self.tf, values=list(VALID_TIMEFRAMES), state="readonly",
                      width=6).pack(side="left", padx=6)
+        ttk.Label(row, text="   Estrategia:").pack(side="left")
+        self.strategy = tk.StringVar(value=strategy)
+        ttk.Combobox(row, textvariable=self.strategy, values=list(VALID_STRATEGIES),
+                     state="readonly", width=16).pack(side="left", padx=6)
         self.auto_spread = tk.BooleanVar(value=True)
         ttk.Checkbutton(self, text="Comprobar los símbolos en MT5 y ajustar el spread máximo de "
                                    "cada uno (recomendado)", variable=self.auto_spread).pack(
@@ -416,7 +444,7 @@ class MultiSymbolDialog(tk.Toplevel):
         if not unique:
             messagebox.showerror("Sin símbolos", "Escriba al menos un símbolo.", parent=self)
             return
-        self.result = (unique, self.tf.get(), bool(self.auto_spread.get()))
+        self.result = (unique, self.tf.get(), bool(self.auto_spread.get()), self.strategy.get())
         self.destroy()
 
 
@@ -660,7 +688,7 @@ class ControlCenter(tk.Tk):
             ("profile", "Perfil", 110, "w"), ("symbol", "Símbolo", 90, "w"), ("tf", "TF", 50, "w"),
             ("state", "Estado", 190, "w"), ("day", "Hoy (cuenta)", 90, "e"),
             ("position", "Posición abierta", 230, "w"), ("pnl", "Resultado", 80, "e"),
-            ("evo", "Estrategia (PF valid.)", 150, "w"), ("magic", "Magic", 80, "e")], height=14)
+            ("evo", "Estrategia (PF valid.)", 190, "w"), ("magic", "Magic", 80, "e")], height=14)
         self.overview_tree.frame.pack(fill="both", expand=True)
         self.overview_tree.tag_configure("idle", foreground=C_GREY)
         self.overview_tree.bind("<Double-1>", self._on_overview_open)
@@ -725,8 +753,11 @@ class ControlCenter(tk.Tk):
                 ev = read_json(profile_paths(path).evolved) or {}
                 evo = {"accepted": ev.get("accepted"),
                        "pf_oos": (ev.get("out_of_sample") or {}).get("profit_factor")} if ev else {}
-            evo_txt = ("—" if not evo else
-                       f"{'Aceptada' if evo.get('accepted') else 'Descartada'} ({fmt(evo.get('pf_oos'))})")
+            short = {"reversion_media": "Reversión", "ruptura": "Ruptura"}.get(
+                cfg.get("strategy", ""), "Cruce medias")
+            evo_txt = (f"{short}: —" if not evo else
+                       f"{short}: {'aceptada' if evo.get('accepted') else 'descartada'} "
+                       f"({fmt(evo.get('pf_oos'))})")
             day = st.get("day_pnl_percent") if live else None
             values = (name, cfg.get("symbol", "—"), cfg.get("timeframe", "—"), label,
                       fmt(day, "{:+.2f}%"), pos_txt, fmt(pnl, "{:+.2f}") if positions else "—",
@@ -846,7 +877,8 @@ class ControlCenter(tk.Tk):
         hbox = ttk.LabelFrame(bottom, text=" Historial de evoluciones ", padding=6)
         hbox.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         self.history_tree = make_tree(hbox, [
-            ("date", "Fecha", 130, "w"), ("market", "Mercado", 90, "w"),
+            ("date", "Fecha", 125, "w"), ("market", "Mercado", 80, "w"),
+            ("strategy", "Estrategia", 105, "w"),
             ("result", "Resultado", 90, "w"), ("pf_is", "PF entreno", 75, "e"),
             ("pf_oos", "PF valid.", 70, "e"), ("trades", "Op. E/V", 65, "e")], height=9)
         self.history_tree.frame.pack(fill="both", expand=True)
@@ -1246,12 +1278,13 @@ class ControlCenter(tk.Tk):
                                  f"Corrija primero el perfil actual (se usa como plantilla):\n{exc}",
                                  parent=self)
             return
-        dialog = MultiSymbolDialog(self, str(base["timeframe"]))
+        dialog = MultiSymbolDialog(self, str(base["timeframe"]), str(base.get("strategy", "cruce_medias")))
         self.wait_window(dialog)
         if not dialog.result:
             return
-        symbols, timeframe, check = dialog.result
+        symbols, timeframe, check, strategy = dialog.result
         base["timeframe"] = timeframe
+        base["strategy"] = strategy
         if not check:
             self._create_symbol_profiles(base, symbols, None)
             return
@@ -1316,7 +1349,8 @@ class ControlCenter(tk.Tk):
                 skipped.append(f"• {name_in_broker}: {exc}")
                 continue
             existing.add(profile)
-            created.append(f"• {profile}: {name_in_broker} {cfg['timeframe']} · magic {next_magic}{note}")
+            created.append(f"• {profile}: {name_in_broker} {cfg['timeframe']} · {cfg['strategy']} · "
+                           f"magic {next_magic}{note}")
             next_magic += 1
         current = self.profile.get()
         self._refresh_profiles(select=current)
@@ -1536,14 +1570,15 @@ class ControlCenter(tk.Tk):
             evo = {"accepted": evolved.get("accepted"), "params": evolved.get("params"),
                    "pf_is": (evolved.get("in_sample") or {}).get("profit_factor"),
                    "pf_oos": (evolved.get("out_of_sample") or {}).get("profit_factor")}
+        strat = STRATEGY_NAMES.get(str(self.vars["strategy"].get()), "")
         if evo:
             ok = evo.get("accepted")
             self.card_strategy.set(
-                "Aceptada" if ok else "Descartada", C_GREEN if ok else C_ORANGE,
+                ("Aceptada" if ok else "Descartada"), C_GREEN if ok else C_ORANGE,
                 describe_params(evo.get("params")),
                 f"PF entrenamiento {fmt(evo.get('pf_is'))} · validación {fmt(evo.get('pf_oos'))}")
         else:
-            self.card_strategy.set("—", C_MUTED, "Se evoluciona al iniciar el bot")
+            self.card_strategy.set("—", C_MUTED, strat, "Se evoluciona al iniciar el bot")
 
         # --- situación
         if running or fresh:
@@ -1573,10 +1608,12 @@ class ControlCenter(tk.Tk):
         bar = st.get("last_bar") or {}
         if bar and (running or fresh):
             sig = {1: "COMPRA", -1: "VENTA"}.get(bar.get("signal"), "ninguna")
+            indicators = bar.get("indicators") or (
+                f"rápida {fmt_price(bar.get('fast_ma'))} lenta {fmt_price(bar.get('slow_ma'))} "
+                f"RSI {fmt(bar.get('rsi'), '{:.1f}')}")
             self.bar_label.configure(
                 text=f"Última vela cerrada {bar.get('time', '')} (hora servidor): cierre "
-                     f"{fmt_price(bar.get('close'))} · media rápida {fmt_price(bar.get('fast_ma'))} · "
-                     f"lenta {fmt_price(bar.get('slow_ma'))} · RSI {fmt(bar.get('rsi'), '{:.1f}')} · "
+                     f"{fmt_price(bar.get('close'))} · {indicators} · "
                      f"ATR {fmt_price(bar.get('atr'))} · señal: {sig}")
         else:
             self.bar_label.configure(text="")
@@ -1595,7 +1632,9 @@ class ControlCenter(tk.Tk):
             ok = evo.get("accepted")
             self.verdict.configure(
                 text=(f"{'✔ ACEPTADO' if ok else '✖ DESCARTADO'} · {evo.get('symbol', '')} "
-                      f"{evo.get('timeframe', '')} · {evo.get('timestamp', '')} · "
+                      f"{evo.get('timeframe', '')} · "
+                      f"{STRATEGY_NAMES.get(evo.get('strategy') or '', 'Cruce de medias + RSI')} · "
+                      f"{evo.get('timestamp', '')} · "
                       f"{evo.get('train_bars', '?')} velas de entrenamiento / {evo.get('test_bars', '?')} "
                       f"de validación · motor {evo.get('backend', '?')}\n{evo.get('reason', '')}"),
                 bg="#e3f4e8" if ok else "#fdebd3", fg=C_GREEN if ok else C_ORANGE)
@@ -1633,6 +1672,8 @@ class ControlCenter(tk.Tk):
             self.history_tree.insert("", "end", tags=("ok",) if ok else ("warn",), values=(
                 str(rec.get("timestamp", "")).replace("T", " "),
                 f"{rec.get('symbol', '')} {rec.get('timeframe', '')}",
+                {"reversion_media": "Reversión", "ruptura": "Ruptura"}.get(
+                    rec.get("strategy") or "", "Cruce medias"),
                 "Aceptado" if ok else "Descartado",
                 fmt(rec.get("pf_is")), fmt(rec.get("pf_oos")),
                 f"{rec.get('trades_is', '?')}/{rec.get('trades_oos', '?')}"))

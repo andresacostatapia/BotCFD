@@ -33,7 +33,7 @@ from bot_common import (
     profile_paths, read_json, setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
-from strategy_evolver import compute_signal, evolve_parameters
+from strategy_evolver import compute_signal, evolve_parameters, warmup_bars
 
 logger = logging.getLogger("trading_bot")
 
@@ -156,6 +156,7 @@ class TradingBot:
             "timestamp": payload["timestamp"],
             "symbol": payload["symbol"],
             "timeframe": payload["timeframe"],
+            "strategy": result.get("strategy") or self.config.get("strategy"),
             "accepted": result.get("accepted"),
             "reason": result.get("reason"),
             "params": result.get("params"),
@@ -198,7 +199,7 @@ class TradingBot:
         if new_cfg["require_demo"] and not old["require_demo"]:
             logger.info("require_demo activado: se verificará la cuenta al reconectar.")
 
-        structural = ("symbol", "timeframe", "magic")
+        structural = ("symbol", "timeframe", "magic", "strategy")
         if any(old[k] != new_cfg[k] for k in structural):
             logger.warning(
                 "Cambio de símbolo/timeframe/magic (%s %s %s -> %s %s %s): re-evolucionando...",
@@ -266,15 +267,10 @@ class TradingBot:
         except Exception:  # noqa: BLE001 - es solo informativo
             return "próxima vela: desconocida"
 
-    def _waiting_text(self, sig: dict[str, Any]) -> str:
-        """Explica qué condición falta para la próxima señal."""
-        p = self.params or {}
-        fast, slow, rsi_now = sig["fast_ma"], sig["slow_ma"], sig["rsi"]
-        if fast > slow:
-            return (f"rápida {fast:.6g} > lenta {slow:.6g}: esperando cruce a la BAJA "
-                    f"con RSI < {float(p['rsi_sell']):.1f} (RSI {rsi_now:.1f})")
-        return (f"rápida {fast:.6g} < lenta {slow:.6g}: esperando cruce al ALZA "
-                f"con RSI > {float(p['rsi_buy']):.1f} (RSI {rsi_now:.1f})")
+    @staticmethod
+    def _waiting_text(sig: dict[str, Any]) -> str:
+        """Explica qué condición falta para la próxima señal (depende de la estrategia)."""
+        return str(sig.get("waiting") or "esperando señal")
 
     @staticmethod
     def _positions_text(positions: list[Any]) -> str:
@@ -315,7 +311,7 @@ class TradingBot:
 
         spread_ok = self.risk.check_spread()
 
-        bars_needed = int(self.params["slow"]) + int(cfg["atr_period"]) + 50
+        bars_needed = warmup_bars(self.params) + int(cfg["atr_period"]) + 50
         df = mt5c.get_rates(symbol, cfg["timeframe"], bars_needed + 1)
         if df.empty or len(df) < bars_needed:
             logger.warning("Velas insuficientes para calcular señal (%d).", len(df))
@@ -332,11 +328,11 @@ class TradingBot:
         if bar_time != self.logged_bar_time:
             self.logged_bar_time = bar_time
             logger.info(
-                "Vela %s cerrada (hora servidor) | close %.6g | rápida %.6g lenta %.6g | "
-                "RSI %.1f | ATR %.6g | señal: %s | posiciones: %d | %s",
+                "Vela %s cerrada (hora servidor) | close %.6g | %s | ATR %.6g | señal: %s | "
+                "posiciones: %d | %s",
                 f"{bar_time:%Y-%m-%d %H:%M}" if hasattr(bar_time, "strftime") else bar_time,
-                sig["close"], sig["fast_ma"], sig["slow_ma"], sig["rsi"], sig["atr"],
-                signal_txt, len(positions), self._day_text(),
+                sig["close"], sig["indicators"], sig["atr"], signal_txt, len(positions),
+                self._day_text(),
             )
             self.last_heartbeat = time.monotonic()  # el mensaje de vela cuenta como latido
 
@@ -507,6 +503,7 @@ class TradingBot:
                 last_bar={
                     "time": str(sig.get("bar_time", "")),
                     "close": sig.get("close"), "fast_ma": sig.get("fast_ma"),
+                    "indicators": sig.get("indicators"), "strategy": sig.get("strategy"),
                     "slow_ma": sig.get("slow_ma"), "rsi": sig.get("rsi"),
                     "atr": sig.get("atr"), "signal": sig.get("signal"),
                 } if sig else None,
@@ -553,8 +550,10 @@ def main(argv: list[str] | None = None) -> int:
         status.write("error", str(exc), exit_code=EXIT_CONFIG)
         return EXIT_CONFIG
     logger.info(
-        "Configuración: %s %s | riesgo %g%% | historial %d velas | min_trades %d | tramos %d | %s",
-        config["symbol"], config["timeframe"], config["risk_percent"], config["history_bars"],
+        "Configuración: %s %s | estrategia %s | riesgo %g%% | historial %d velas | "
+        "min_trades %d | tramos %d | %s",
+        config["symbol"], config["timeframe"], config["strategy"], config["risk_percent"],
+        config["history_bars"],
         config["min_trades"], config["fitness_folds"], args.config.name,
     )
 

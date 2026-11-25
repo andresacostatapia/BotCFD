@@ -58,16 +58,24 @@ automáticamente a **`deap`**. Se puede forzar con `"evolver_backend": "deap"` e
 `risk_config.json`. `strategy-genome` es una librería joven (v0.1.x); `deap` es la
 alternativa madura.
 
-### Estrategia (de ejemplo)
+### Estrategias (elegibles por perfil con `strategy`)
 
-| Parámetro  | Rango       | Uso                                                    |
-|------------|-------------|--------------------------------------------------------|
-| `fast`     | Int(5, 30)  | SMA rápida                                             |
-| `slow`     | Int(30, 100)| SMA lenta (debe ser `slow > fast`, si no fitness = 0)  |
-| `rsi_buy`  | Float(40,70)| COMPRA si la SMA rápida cruza al alza y RSI(14) > valor |
-| `rsi_sell` | Float(30,60)| VENTA si la SMA rápida cruza a la baja y RSI(14) < valor |
-| `sl_mult`  | Float(1, 3) | Stop loss = valor × ATR (solo si `evolve_sl_tp` = true) |
-| `tp_mult`  | Float(1, 4) | Take profit = valor × ATR (solo si `evolve_sl_tp` = true) |
+| Estrategia | Para qué plazo | Señal | Parámetros que evoluciona |
+|---|---|---|---|
+| `cruce_medias` (por defecto) | M15 / H1 (tendencia) | COMPRA si la SMA rápida cruza al alza la lenta y RSI(14) > `rsi_buy`; VENTA si cruza a la baja y RSI < `rsi_sell` | `fast` Int(5,30), `slow` Int(30,100) (`slow > fast`), `rsi_buy` Float(40,70), `rsi_sell` Float(30,60) |
+| `reversion_media` | M5 / M15 (corto plazo) | COMPRA si el cierre cae **bajo la banda inferior** de Bollinger con RSI < `rsi_low`; VENTA si supera la **banda superior** con RSI > `rsi_high` | `bb_period` Int(10,50), `bb_std` Float(1.5,3), `rsi_low` Float(15,40), `rsi_high` Float(60,85) |
+| `ruptura` | M5 / M15 / H1 | COMPRA si el cierre **supera el máximo** de las `lookback` velas anteriores estando sobre la SMA `trend`; VENTA si **cae bajo el mínimo** estando bajo la SMA | `lookback` Int(10,100), `trend` Int(20,200) |
+
+Además, con `evolve_sl_tp` (por defecto) se evolucionan las salidas:
+
+| Parámetro | Rango | Uso |
+|---|---|---|
+| `sl_mult` | Float(1, 3) | Stop loss = valor × ATR |
+| `tp_mult` | Float(1, 4) | Take profit = valor × ATR |
+
+Todas las estrategias pasan por el mismo backtest con costes y la misma validación
+walk-forward. Ninguna tiene ventaja garantizada: pruébelas en demo y en varios
+símbolos/timeframes, y deje que la validación descarte las que no funcionen.
 
 * **Fitness:** Profit Factor del backtest (restando `commission_per_trade` y el
   spread histórico a cada operación), multiplicado por `(trades / min_trades)²` si
@@ -147,6 +155,7 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `oos_pf_ratio_min` | 0.80 | PF_oos mínimo relativo a PF_is |
 | `min_pf_in_sample` | 1.0 | PF in-sample mínimo |
 | `atr_period`, `sl_atr_mult`, `tp_atr_mult` | 14, 1.5, 2.0 | SL/TP por ATR (fijos, se usan solo si `evolve_sl_tp` = false) |
+| `strategy` | cruce_medias | `cruce_medias`, `reversion_media` o `ruptura` (ver tabla de estrategias) |
 | `evolve_sl_tp` | true | El algoritmo genético elige también los multiplicadores de SL y TP. Más libertad = más riesgo de sobreajuste; la validación walk-forward lo controla |
 | `loop_seconds` | 60 | Frecuencia del bucle |
 | `heartbeat_seconds` | 60 | Cada cuánto se muestra el mensaje "En espera" (precio, próxima vela, qué condición falta, P&L del día). `0` = desactivado |

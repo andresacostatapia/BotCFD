@@ -283,3 +283,20 @@ def test_global_position_limit_across_profiles(fake: FakeMT5, config_file) -> No
     bot.last_bar_time = None
     bot.step()
     assert len(fake.orders) == 1
+
+
+@pytest.mark.parametrize("params", [
+    {"bb_period": 20, "bb_std": 2.0, "rsi_low": 35.0, "rsi_high": 65.0, "sl_mult": 1.5, "tp_mult": 1.0},
+    {"lookback": 20, "trend": 50, "sl_mult": 2.0, "tp_mult": 3.0},
+])
+def test_bot_trades_with_new_strategies(fake: FakeMT5, config_file, params) -> None:
+    sig = signal_array(IndicatorCache(fake.df), params)
+    idx = int(np.flatnonzero(sig)[-2])
+    fake.df = fake.df.iloc[: idx + 2]
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.risk.reset_daily()
+    bot.params = dict(params)
+    bot.step()
+    assert len(fake.orders) == 1
+    assert fake.orders[0]["type"] == (fake.ORDER_TYPE_BUY if sig[idx] == 1 else fake.ORDER_TYPE_SELL)

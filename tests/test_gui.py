@@ -64,3 +64,16 @@ def test_bot_process_runs_and_stops(tmp_path, monkeypatch) -> None:
     bp.request_stop()
     assert (tmp_path / "logs" / "stop_principal.flag").exists()
     assert sys.executable
+
+
+def test_describe_params_per_strategy() -> None:
+    assert "Bollinger 20" in bot_gui.describe_params({"bb_period": 20, "bb_std": 2.0,
+                                                       "rsi_low": 30, "rsi_high": 70})
+    assert "Ruptura de 24 velas" in bot_gui.describe_params({"lookback": 24, "trend": 100})
+
+
+def test_profile_name_for_symbol() -> None:
+    assert bot_gui.profile_name_for_symbol("US500", "M5", set()) == "us500"
+    assert bot_gui.profile_name_for_symbol("US500", "M5", {"us500"}) == "us500_m5"
+    assert bot_gui.profile_name_for_symbol("EURUSD.m", "H1", set()) == "eurusd_m"
+    assert bot_gui.round_sig(0.000237) == pytest.approx(0.00024)

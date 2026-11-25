@@ -34,6 +34,7 @@ EVOLVED_PARAMS_PATH: Path = BASE_DIR / "evolved_params.json"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
+VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura")
 
 # ---------------------------------------------------------------------------
 # Perfiles (varias instancias del bot, cada una con su risk_config_<nombre>.json)
@@ -158,6 +159,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
     "evolve_sl_tp": True,             # evolucionar también los multiplicadores SL/TP
+    "strategy": "cruce_medias",       # cruce_medias | reversion_media | ruptura
     "loop_seconds": 60,
     "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
@@ -212,6 +214,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     if config.get("timeframe") not in VALID_TIMEFRAMES:
         errors.append(f"'timeframe' debe ser uno de {VALID_TIMEFRAMES}")
+
+    if config.get("strategy") not in VALID_STRATEGIES:
+        errors.append(f"'strategy' debe ser una de {VALID_STRATEGIES}")
 
     if not isinstance(config.get("evolve_sl_tp"), bool):
         errors.append("'evolve_sl_tp' debe ser true/false")

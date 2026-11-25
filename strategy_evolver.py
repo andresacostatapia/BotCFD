@@ -10,10 +10,16 @@ Backend de optimización
 * Alternativo: ``deap`` si ``strategy-genome`` no está instalado o falla.
   Se puede forzar con ``config["evolver_backend"] = "deap"``.
 
-Estrategia (educativa)
-----------------------
-* COMPRA: la SMA rápida cruza por encima de la lenta y RSI(14) > ``rsi_buy``.
-* VENTA:  la SMA rápida cruza por debajo de la lenta y RSI(14) < ``rsi_sell``.
+Estrategias (educativas), elegidas con ``config["strategy"]``
+-------------------------------------------------------------
+* ``cruce_medias`` (tendencia): COMPRA si la SMA rápida cruza al alza la lenta y
+  RSI(14) > ``rsi_buy``; VENTA si cruza a la baja y RSI(14) < ``rsi_sell``.
+* ``reversion_media`` (corto plazo): COMPRA si el cierre cae bajo la banda inferior
+  de Bollinger (``bb_period``, ``bb_std``) con RSI < ``rsi_low``; VENTA si supera la
+  banda superior con RSI > ``rsi_high``.
+* ``ruptura`` (corto/medio plazo): COMPRA si el cierre supera el máximo de las
+  ``lookback`` velas anteriores estando sobre la SMA ``trend``; VENTA si cae bajo
+  el mínimo estando bajo la SMA.
 * Salida: SL = sl_mult x ATR, TP = tp_mult x ATR. Con ``evolve_sl_tp`` (por
   defecto) ambos multiplicadores se evolucionan (SL 1.0-3.0, TP 1.0-4.0); si no,
   se usan los fijos de la configuración (1.5 / 2.0). El bot en vivo usa los mismos.
@@ -48,6 +54,31 @@ SLTP_SPACE: dict[str, tuple[type, float, float]] = {
     "tp_mult": (float, 1.0, 4.0),
 }
 
+#: Estrategias disponibles: nombre -> espacio de búsqueda de sus parámetros de entrada.
+STRATEGY_SPACES: dict[str, dict[str, tuple[type, float, float]]] = {
+    # Tendencia: cruce de medias simples filtrado por RSI (la estrategia original).
+    "cruce_medias": SEARCH_SPACE,
+    # Reversión a la media: cierre fuera de las bandas de Bollinger con RSI extremo.
+    "reversion_media": {
+        "bb_period": (int, 10, 50),
+        "bb_std": (float, 1.5, 3.0),
+        "rsi_low": (float, 15.0, 40.0),
+        "rsi_high": (float, 60.0, 85.0),
+    },
+    # Ruptura: cierre por encima del máximo (o debajo del mínimo) de las N velas
+    # anteriores, a favor de la tendencia (SMA larga).
+    "ruptura": {
+        "lookback": (int, 10, 100),
+        "trend": (int, 20, 200),
+    },
+}
+STRATEGY_LABELS: dict[str, str] = {
+    "cruce_medias": "Cruce de medias + RSI (tendencia)",
+    "reversion_media": "Reversión a la media (Bandas de Bollinger + RSI)",
+    "ruptura": "Ruptura de rango (máximo/mínimo de N velas + tendencia)",
+}
+DEFAULT_STRATEGY: str = "cruce_medias"
+
 RSI_PERIOD: int = 14
 MIN_BARS: int = 300
 
@@ -64,6 +95,7 @@ _DEFAULTS: dict[str, Any] = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
     "evolve_sl_tp": True,
+    "strategy": DEFAULT_STRATEGY,
     "evolver_backend": "auto",
     "evolver_seed": None,
 }
@@ -122,6 +154,34 @@ class IndicatorCache:
         else:
             self.spread = np.zeros(len(self.df), dtype=float)
         self._sma: dict[int, np.ndarray] = {}
+        self._std: dict[int, np.ndarray] = {}
+        self._highest: dict[int, np.ndarray] = {}
+        self._lowest: dict[int, np.ndarray] = {}
+
+    def rolling_std(self, period: int) -> np.ndarray:
+        """Desviación típica móvil del cierre (para Bollinger), cacheada."""
+        period = int(period)
+        if period not in self._std:
+            self._std[period] = self.close.rolling(period, min_periods=period).std(ddof=0).to_numpy()
+        return self._std[period]
+
+    def highest(self, lookback: int) -> np.ndarray:
+        """Máximo de los ``lookback`` máximos ANTERIORES a cada vela (sin incluirla)."""
+        lookback = int(lookback)
+        if lookback not in self._highest:
+            self._highest[lookback] = (self.df["high"].astype(float)
+                                       .rolling(lookback, min_periods=lookback).max()
+                                       .shift(1).to_numpy())
+        return self._highest[lookback]
+
+    def lowest(self, lookback: int) -> np.ndarray:
+        """Mínimo de los ``lookback`` mínimos ANTERIORES a cada vela (sin incluirla)."""
+        lookback = int(lookback)
+        if lookback not in self._lowest:
+            self._lowest[lookback] = (self.df["low"].astype(float)
+                                      .rolling(lookback, min_periods=lookback).min()
+                                      .shift(1).to_numpy())
+        return self._lowest[lookback]
 
     def sma(self, period: int) -> np.ndarray:
         """SMA cacheada por periodo."""
@@ -137,10 +197,28 @@ class IndicatorCache:
 # ---------------------------------------------------------------------------
 # Señales
 # ---------------------------------------------------------------------------
+def strategy_of(params: dict[str, Any]) -> str:
+    """Deduce la estrategia a partir de las claves de los parámetros."""
+    if "bb_period" in params:
+        return "reversion_media"
+    if "lookback" in params:
+        return "ruptura"
+    return "cruce_medias"
+
+
+def warmup_bars(params: dict[str, Any]) -> int:
+    """Velas mínimas para que los indicadores de la estrategia estén calculados."""
+    periods = [int(params[k]) for k in ("fast", "slow", "bb_period", "lookback", "trend") if k in params]
+    return max(periods + [RSI_PERIOD]) + 1
+
+
 def build_search_space(config: dict[str, Any] | None = None) -> dict[str, tuple[type, float, float]]:
-    """Espacio de búsqueda: entradas siempre; SL/TP (x ATR) si ``evolve_sl_tp`` es true."""
+    """Espacio de búsqueda de la estrategia elegida; SL/TP (x ATR) si ``evolve_sl_tp``."""
     cfg = {**_DEFAULTS, **(config or {})}
-    space = dict(SEARCH_SPACE)
+    name = cfg.get("strategy") or DEFAULT_STRATEGY
+    if name not in STRATEGY_SPACES:
+        raise ValueError(f"Estrategia desconocida: {name!r}. Use una de {list(STRATEGY_SPACES)}")
+    space = dict(STRATEGY_SPACES[name])
     if cfg.get("evolve_sl_tp"):
         space.update(SLTP_SPACE)
     return space
@@ -151,7 +229,8 @@ def normalize_params(
 ) -> dict[str, Any]:
     """Convierte y limita los parámetros al espacio de búsqueda."""
     if space is None:
-        space = {**SEARCH_SPACE, **{k: v for k, v in SLTP_SPACE.items() if k in params}}
+        space = {**STRATEGY_SPACES[strategy_of(params)],
+                 **{k: v for k, v in SLTP_SPACE.items() if k in params}}
     out: dict[str, Any] = {}
     for name, (kind, lo, hi) in space.items():
         value = float(params[name])
@@ -161,8 +240,19 @@ def normalize_params(
 
 
 def params_are_valid(params: dict[str, Any]) -> bool:
-    """Regla de coherencia: la media lenta debe ser mayor que la rápida."""
-    return int(params["slow"]) > int(params["fast"])
+    """Reglas de coherencia (cruce de medias: la media lenta debe ser mayor que la rápida)."""
+    if strategy_of(params) == "cruce_medias":
+        return int(params["slow"]) > int(params["fast"])
+    return True
+
+
+def _fresh(cond: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """True en la vela donde ``cond`` pasa de falso a verdadero (y los datos son válidos)."""
+    prev = np.roll(cond, 1)
+    prev[0] = True  # nunca señal en la primera vela
+    valid_prev = np.roll(valid, 1)
+    valid_prev[0] = False
+    return cond & ~prev & valid & valid_prev
 
 
 def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
@@ -170,40 +260,102 @@ def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
     Vector de señales por vela (1 = compra, -1 = venta, 0 = nada).
 
     La señal de la vela ``i`` sólo usa información disponible al cierre de ``i``.
+    La estrategia se deduce de los parámetros (ver ``strategy_of``).
     """
-    fast = cache.sma(int(params["fast"]))
-    slow = cache.sma(int(params["slow"]))
+    name = strategy_of(params)
     r = cache.rsi
-    above = fast > slow
-    prev_above = np.roll(above, 1)
-    valid = ~(np.isnan(fast) | np.isnan(slow) | np.isnan(r))
-    valid_prev = np.roll(valid, 1)
-    valid_prev[0] = False
-    cross_up = above & ~prev_above & valid & valid_prev
-    cross_dn = ~above & prev_above & valid & valid_prev
+    c = cache.close_np
     sig = np.zeros(len(cache), dtype=np.int8)
-    sig[cross_up & (r > float(params["rsi_buy"]))] = 1
-    sig[cross_dn & (r < float(params["rsi_sell"]))] = -1
+
+    if name == "cruce_medias":
+        fast = cache.sma(int(params["fast"]))
+        slow = cache.sma(int(params["slow"]))
+        valid = ~(np.isnan(fast) | np.isnan(slow) | np.isnan(r))
+        above = fast > slow
+        cross_up = _fresh(above, valid)
+        cross_dn = _fresh(~above, valid)
+        sig[cross_up & (r > float(params["rsi_buy"]))] = 1
+        sig[cross_dn & (r < float(params["rsi_sell"]))] = -1
+
+    elif name == "reversion_media":
+        period, k = int(params["bb_period"]), float(params["bb_std"])
+        mid, sd = cache.sma(period), cache.rolling_std(period)
+        lower, upper = mid - k * sd, mid + k * sd
+        valid = ~(np.isnan(lower) | np.isnan(r))
+        sig[_fresh(c < lower, valid) & (r < float(params["rsi_low"]))] = 1
+        sig[_fresh(c > upper, valid) & (r > float(params["rsi_high"]))] = -1
+
+    elif name == "ruptura":
+        hh, ll = cache.highest(int(params["lookback"])), cache.lowest(int(params["lookback"]))
+        trend = cache.sma(int(params["trend"]))
+        valid = ~(np.isnan(hh) | np.isnan(ll) | np.isnan(trend))
+        sig[_fresh(c > hh, valid) & (c > trend)] = 1
+        sig[_fresh(c < ll, valid) & (c < trend)] = -1
+
     return sig
+
+
+def describe_state(cache: IndicatorCache, params: dict[str, Any], i: int) -> tuple[str, str]:
+    """
+    Texto de los indicadores y de la condición que falta para la próxima señal
+    en la vela ``i``. Devuelve (indicadores, espera).
+    """
+    name = strategy_of(params)
+    c, r = float(cache.close_np[i]), float(cache.rsi[i])
+    if name == "cruce_medias":
+        fast = float(cache.sma(int(params["fast"]))[i])
+        slow = float(cache.sma(int(params["slow"]))[i])
+        ind = f"rápida {fast:.6g} lenta {slow:.6g} RSI {r:.1f}"
+        if fast > slow:
+            wait = (f"rápida > lenta: esperando cruce a la BAJA con RSI < "
+                    f"{float(params['rsi_sell']):.1f} (RSI {r:.1f})")
+        else:
+            wait = (f"rápida < lenta: esperando cruce al ALZA con RSI > "
+                    f"{float(params['rsi_buy']):.1f} (RSI {r:.1f})")
+        return ind, wait
+    if name == "reversion_media":
+        period, k = int(params["bb_period"]), float(params["bb_std"])
+        mid, sd = float(cache.sma(period)[i]), float(cache.rolling_std(period)[i])
+        lower, upper = mid - k * sd, mid + k * sd
+        ind = f"banda inf {lower:.6g} media {mid:.6g} banda sup {upper:.6g} RSI {r:.1f}"
+        wait = (f"esperando cierre bajo {lower:.6g} con RSI < {float(params['rsi_low']):.1f} "
+                f"(compra) o sobre {upper:.6g} con RSI > {float(params['rsi_high']):.1f} "
+                f"(venta) · cierre {c:.6g} RSI {r:.1f}")
+        return ind, wait
+    hh = float(cache.highest(int(params["lookback"]))[i])
+    ll = float(cache.lowest(int(params["lookback"]))[i])
+    trend = float(cache.sma(int(params["trend"]))[i])
+    ind = f"máx {params['lookback']} velas {hh:.6g} mín {ll:.6g} tendencia {trend:.6g}"
+    if c > trend:
+        wait = f"tendencia alcista: esperando cierre por ENCIMA de {hh:.6g} (cierre {c:.6g})"
+    else:
+        wait = f"tendencia bajista: esperando cierre por DEBAJO de {ll:.6g} (cierre {c:.6g})"
+    return ind, wait
 
 
 def compute_signal(df: pd.DataFrame, params: dict[str, Any], atr_period: int = 14) -> dict[str, Any]:
     """
     Señal en la ÚLTIMA vela del DataFrame (debe ser una vela cerrada).
 
-    :returns: dict con ``signal`` (1/-1/0), ``atr``, ``close``, ``rsi``,
-              ``fast_ma``, ``slow_ma`` y ``bar_time`` (si existe la columna time).
+    :returns: dict con ``signal`` (1/-1/0), ``atr``, ``close``, ``rsi``, ``strategy``,
+              ``indicators`` y ``waiting`` (textos), ``fast_ma``/``slow_ma`` (solo en
+              cruce de medias, si no None) y ``bar_time``.
     """
     cache = IndicatorCache(df, atr_period)
     sig = signal_array(cache, params)
     last = len(cache) - 1
+    indicators, waiting = describe_state(cache, params, last)
+    cross = strategy_of(params) == "cruce_medias"
     return {
         "signal": int(sig[last]),
+        "strategy": strategy_of(params),
         "atr": float(cache.atr[last]),
         "close": float(cache.close_np[last]),
         "rsi": float(cache.rsi[last]),
-        "fast_ma": float(cache.sma(int(params["fast"]))[last]),
-        "slow_ma": float(cache.sma(int(params["slow"]))[last]),
+        "fast_ma": float(cache.sma(int(params["fast"]))[last]) if cross else None,
+        "slow_ma": float(cache.sma(int(params["slow"]))[last]) if cross else None,
+        "indicators": indicators,
+        "waiting": waiting,
         "bar_time": cache.df["time"].iloc[last] if "time" in cache.df.columns else last,
     }
 
@@ -464,7 +616,7 @@ def _run_backend(
 ) -> tuple[dict[str, Any], float, str]:
     """Ejecuta el backend pedido (con fallback automático en modo 'auto')."""
     backend = (backend or "auto").lower()
-    search_space = search_space or dict(SEARCH_SPACE)
+    search_space = search_space or dict(STRATEGY_SPACES[DEFAULT_STRATEGY])
     if backend in ("auto", "strategy-genome", "strategy_genome"):
         try:
             best, fit = _evolve_strategy_genome(fitness, pop, gens, seed, search_space)
@@ -522,9 +674,10 @@ def evolve_parameters(
     split = int(n * float(cfg["train_ratio"]))
 
     logger.info(
-        "Evolucionando parámetros: %d velas (train %d / test %d) | pop=%d gens=%d | "
+        "Evolucionando parámetros: estrategia %s | %d velas (train %d / test %d) | pop=%d gens=%d | "
         "tramos de fitness=%d | SL/TP %s | backend=%s",
-        n, split, n - split, pop, gens, int(cfg["fitness_folds"]),
+        cfg.get("strategy") or DEFAULT_STRATEGY, n, split, n - split, pop, gens,
+        int(cfg["fitness_folds"]),
         "evolucionados" if cfg.get("evolve_sl_tp") else
         f"fijos ({cfg['sl_atr_mult']}x / {cfg['tp_atr_mult']}x ATR)",
         cfg["evolver_backend"],
@@ -544,7 +697,7 @@ def evolve_parameters(
 
     reasons: list[str] = []
     if not params_are_valid(best):
-        reasons.append(f"parámetros inválidos (slow={best['slow']} <= fast={best['fast']})")
+        reasons.append(f"parámetros inválidos: {best}")
     if is_m.trades < int(cfg["min_trades"]):
         reasons.append(f"pocas operaciones in-sample ({is_m.trades} < {cfg['min_trades']})")
     if is_m.profit_factor < float(cfg["min_pf_in_sample"]):
@@ -573,6 +726,7 @@ def evolve_parameters(
         ],
         "out_of_sample": oos_m.to_dict(),
         "backend": backend,
+        "strategy": strategy_of(best),
         "train_bars": split,
         "test_bars": n - split,
     }
@@ -589,7 +743,8 @@ def evolve_parameters(
 
 
 __all__ = [
-    "SEARCH_SPACE", "SLTP_SPACE", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
+    "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
+    "strategy_of", "warmup_bars", "describe_state", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",
     "normalize_params", "params_are_valid", "fold_bounds", "sma", "rsi", "atr",
 ]
