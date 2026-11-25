@@ -70,6 +70,8 @@ class TradingBot:
             return False
         df = df.iloc[:-1]  # descartar la vela en formación
 
+        logger.info("Datos para evolución: %s %s | %d velas cerradas desde %s hasta %s (hora servidor)",
+                    cfg["symbol"], cfg["timeframe"], len(df), df["time"].iloc[0], df["time"].iloc[-1])
         result = evolve_parameters(
             df, pop=int(cfg["population"]), gens=int(cfg["generations"]), config=cfg
         )
@@ -346,8 +348,8 @@ class TradingBot:
     def run(self) -> None:
         """Bucle principal: una iteración cada ``loop_seconds``."""
         logger.info(
-            "Bucle principal iniciado (%s cada %ss)%s. Ctrl+C para detener.",
-            self.config["symbol"], self.config["loop_seconds"],
+            "Bucle principal iniciado (%s %s, revisión cada %ss)%s. Ctrl+C para detener.",
+            self.config["symbol"], self.config["timeframe"], self.config["loop_seconds"],
             " [DRY-RUN]" if self.dry_run else "",
         )
         while True:
@@ -381,6 +383,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         logger.error("%s", exc)
         return EXIT_CONFIG
+    logger.info(
+        "Configuración: %s %s | riesgo %g%% | historial %d velas | min_trades %d | tramos %d | %s",
+        config["symbol"], config["timeframe"], config["risk_percent"], config["history_bars"],
+        config["min_trades"], config["fitness_folds"], args.config.name,
+    )
 
     bot: TradingBot | None = None
     try:

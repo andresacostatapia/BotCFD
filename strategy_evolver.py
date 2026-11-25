@@ -319,13 +319,14 @@ def make_fitness(
     Con ``fitness_folds`` = 1 el fitness es el PF penalizado de todo el rango.
     Con ``fitness_folds`` = k > 1 el rango de ENTRENAMIENTO se divide en k tramos
     consecutivos y el fitness es el PEOR de los k (cada tramo exige
-    ``min_trades / k`` operaciones). Así se premian combinaciones estables en
+    ``ceil(min_trades / k)`` operaciones). Así se premian combinaciones estables en
     todo el periodo, no las que tienen un pico de suerte en un solo tramo.
     Nunca se usan datos de validación (out-of-sample).
     """
     min_trades = int(config.get("min_trades", _DEFAULTS["min_trades"]))
     folds = fold_bounds(start, end, int(config.get("fitness_folds", _DEFAULTS["fitness_folds"])))
-    min_trades_fold = max(1, round(min_trades / len(folds)))
+    # ceil: la suma de mínimos por tramo nunca queda por debajo de min_trades
+    min_trades_fold = max(1, math.ceil(min_trades / len(folds)))
 
     def _fitness(params: dict[str, Any]) -> float:
         p = normalize_params(params)
