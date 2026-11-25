@@ -23,7 +23,7 @@ C:\MT5Bot\
 ├── requirements.txt
 ├── requirements-dev.txt     # Para ejecutar los tests (sin MetaTrader5)
 ├── risk_config.example.json # Todas las claves con sus valores por defecto
-├── start_bot.bat            # Lanzador CMD
+├── start_bot.bat            # Lanzador CMD (instala dependencias automáticamente)
 ├── launch.ps1               # Lanzador PowerShell con log dual
 ├── tests\                   # pytest (incluye un MT5 falso para integración)
 └── logs\                    # Logs rotativos (se crea automáticamente)
@@ -87,12 +87,29 @@ alternativa madura.
 2. Instale **MetaTrader 5**, inicie sesión en una **cuenta DEMO** y active el botón
    **Algo Trading** (y en *Herramientas → Opciones → Asesores Expertos*, permita el
    trading algorítmico).
-3. Copie el proyecto, por ejemplo en `C:\MT5Bot\`, y ejecute:
+3. Copie el proyecto, por ejemplo en `C:\MT5Bot\`. Las dependencias se instalan
+   **automáticamente** la primera vez que ejecuta `start_bot.bat`. Para solo
+   instalar/verificar, sin abrir el panel ni el bot:
    ```bat
    cd C:\MT5Bot
-   python -m pip install -r requirements.txt
+   start_bot.bat --install-only
    ```
-   (`start_bot.bat` y `launch.ps1` instalan las dependencias si faltan).
+   O manualmente: `python -m pip install -r requirements.txt`.
+
+### Instalación automática en `start_bot.bat`
+
+| Paso | Qué comprueba | Si falta |
+|---|---|---|
+| Python | `python` o `py -3` en el PATH, versión ≥ 3.10 | Ofrece instalar Python 3.12 con `winget` (pregunta S/N); si no hay winget, indica cómo instalarlo |
+| pip | `python -m pip --version` | Lo instala con `python -m ensurepip --upgrade` |
+| `MetaTrader5`, `pandas`, `numpy` | Cada una por separado (`import ...`) | Instala solo la que falta con `pip install`; si falla, reintenta con `--user` |
+| `strategy-genome` / `deap` | Cada una por separado | Las instala; basta con que quede **una** disponible |
+| `tkinter` | `import tkinter` | No se instala con pip: indica reinstalar Python con la opción *tcl/tk and IDLE* |
+
+Al final vuelve a importar cada librería para confirmar que la instalación
+funcionó; si algo sigue faltando, se detiene con un mensaje y el comando manual.
+Las versiones mínimas del `.bat` coinciden con `requirements.txt` (si cambia una,
+cambie la otra).
 
 ---
 
@@ -142,6 +159,7 @@ O todo en uno:
 ```bat
 start_bot.bat                 :: panel -> bot, salida en logs\bot_YYYYMMDD_HHMMSS.log
 start_bot.bat --dry-run       :: igual, sin enviar órdenes
+start_bot.bat --install-only  :: solo verifica/instala dependencias
 ```
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\launch.ps1            # consola + archivo
