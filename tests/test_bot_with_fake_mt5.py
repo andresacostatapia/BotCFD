@@ -140,7 +140,8 @@ def test_main_full_flow_aborts_or_runs(fake: FakeMT5, config_file, monkeypatch) 
 def test_unhandled_error_closes_positions_when_configured(fake: FakeMT5, config_file, monkeypatch) -> None:
     bot_common.save_config({"max_spread": 0.0005, "close_positions_on_error": True,
                             "min_pf_in_sample": 0.0, "oos_pf_ratio_min": 0.0001,
-                            "min_trades": 1, "min_trades_oos": 1}, config_file)
+                            "min_trades": 1, "min_trades_oos": 1, "min_pf_oos": 0.0,
+                            "validation_windows": 1, "regime_filter": False}, config_file)
     fake.positions.append(__import__("types").SimpleNamespace(
         ticket=99, symbol="EURUSD", volume=0.1, magic=20250101, type=0))
 

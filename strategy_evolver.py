@@ -32,11 +32,13 @@ from __future__ import annotations
 import logging
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+
+from bot_common import hour_allowed
 
 logger = logging.getLogger("strategy_evolver")
 
@@ -79,7 +81,24 @@ STRATEGY_LABELS: dict[str, str] = {
 }
 DEFAULT_STRATEGY: str = "cruce_medias"
 
+#: Filtro de régimen: nivel de ADX (tendencia exige ADX > nivel; reversión, ADX < nivel).
+REGIME_SPACE: dict[str, tuple[type, float, float]] = {"adx": (float, 15.0, 40.0)}
+#: Gestión de la salida (si se evoluciona): break-even y trailing en múltiplos de ATR.
+EXIT_SPACES: dict[str, dict[str, tuple[type, float, float]]] = {
+    "ninguna": {},
+    "breakeven": {"be_mult": (float, 0.5, 2.5)},
+    "trailing": {"trail_mult": (float, 1.0, 3.5)},
+}
+#: Todas las claves opcionales que pueden aparecer en unos parámetros.
+EXTRA_SPACE: dict[str, tuple[type, float, float]] = {
+    **SLTP_SPACE, **REGIME_SPACE, **EXIT_SPACES["breakeven"], **EXIT_SPACES["trailing"],
+}
+
 RSI_PERIOD: int = 14
+#: Tope del PF de entrenamiento usado en la regla "PF validación >= ratio x PF entrenamiento":
+#: con entrenamientos espectaculares (PF 5-10) la regla exigiría demasiado; con el tope,
+#: un PF de validación >= 0.8 x 2.5 = 2.0 nunca se rechaza por esta regla.
+IS_PF_REFERENCE_CAP: float = 2.5
 MIN_BARS: int = 300
 
 _DEFAULTS: dict[str, Any] = {
@@ -98,6 +117,16 @@ _DEFAULTS: dict[str, Any] = {
     "strategy": DEFAULT_STRATEGY,
     "evolver_backend": "auto",
     "evolver_seed": None,
+    # Las mejoras están desactivadas por defecto en el evolucionador "suelto";
+    # el bot y el laboratorio las activan desde la configuración general.
+    "validation_windows": 1,
+    "min_pf_oos": 1.0,
+    "regime_filter": False,
+    "trading_hours": "",
+    "exit_management": "ninguna",
+    "be_atr_mult": 1.0,
+    "trail_atr_mult": 2.0,
+    "max_bars_in_trade": 0,
 }
 
 
@@ -132,6 +161,22 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index de Wilder (fuerza de la tendencia, 0-100)."""
+    high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+    up, down = high.diff(), -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    alpha = 1.0 / period
+    atr_s = tr.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_s
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr_s
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    return dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+
+
 class IndicatorCache:
     """Precalcula y cachea indicadores sobre un DataFrame para acelerar el fitness."""
 
@@ -154,9 +199,33 @@ class IndicatorCache:
         else:
             self.spread = np.zeros(len(self.df), dtype=float)
         self._sma: dict[int, np.ndarray] = {}
+        self._adx: np.ndarray | None = None
+        self._allowed: dict[str, np.ndarray] = {}
+        if "time" in self.df.columns:
+            self.hours = pd.to_datetime(self.df["time"]).dt.hour.to_numpy()
+        else:
+            self.hours = np.full(len(self.df), -1)
         self._std: dict[int, np.ndarray] = {}
         self._highest: dict[int, np.ndarray] = {}
         self._lowest: dict[int, np.ndarray] = {}
+
+    @property
+    def adx(self) -> np.ndarray:
+        """ADX(14), calculado bajo demanda."""
+        if self._adx is None:
+            self._adx = adx(self.df, 14).to_numpy()
+        return self._adx
+
+    def session_allowed(self, spec: str) -> np.ndarray:
+        """Vector booleano: True si la vela abre dentro del horario permitido."""
+        spec = (spec or "").strip()
+        if spec not in self._allowed:
+            if not spec or (self.hours < 0).all():
+                self._allowed[spec] = np.ones(len(self.df), dtype=bool)
+            else:
+                lookup = np.array([hour_allowed(h, spec) for h in range(24)])
+                self._allowed[spec] = lookup[np.clip(self.hours, 0, 23)]
+        return self._allowed[spec]
 
     def rolling_std(self, period: int) -> np.ndarray:
         """Desviación típica móvil del cierre (para Bollinger), cacheada."""
@@ -219,8 +288,11 @@ def build_search_space(config: dict[str, Any] | None = None) -> dict[str, tuple[
     if name not in STRATEGY_SPACES:
         raise ValueError(f"Estrategia desconocida: {name!r}. Use una de {list(STRATEGY_SPACES)}")
     space = dict(STRATEGY_SPACES[name])
+    if cfg.get("regime_filter"):
+        space.update(REGIME_SPACE)
     if cfg.get("evolve_sl_tp"):
         space.update(SLTP_SPACE)
+        space.update(EXIT_SPACES.get(str(cfg.get("exit_management", "ninguna")), {}))
     return space
 
 
@@ -230,7 +302,7 @@ def normalize_params(
     """Convierte y limita los parámetros al espacio de búsqueda."""
     if space is None:
         space = {**STRATEGY_SPACES[strategy_of(params)],
-                 **{k: v for k, v in SLTP_SPACE.items() if k in params}}
+                 **{k: v for k, v in EXTRA_SPACE.items() if k in params}}
     out: dict[str, Any] = {}
     for name, (kind, lo, hi) in space.items():
         value = float(params[name])
@@ -292,14 +364,32 @@ def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
         sig[_fresh(c > hh, valid) & (c > trend)] = 1
         sig[_fresh(c < ll, valid) & (c < trend)] = -1
 
+    if "adx" in params:  # filtro de régimen
+        level = float(params["adx"])
+        with np.errstate(invalid="ignore"):
+            ok = cache.adx < level if name == "reversion_media" else cache.adx > level
+        sig[~np.nan_to_num(ok, nan=0).astype(bool)] = 0
+
     return sig
 
 
 def describe_state(cache: IndicatorCache, params: dict[str, Any], i: int) -> tuple[str, str]:
     """
     Texto de los indicadores y de la condición que falta para la próxima señal
-    en la vela ``i``. Devuelve (indicadores, espera).
+    en la vela ``i`` (incluye el filtro ADX si está activo). Devuelve (indicadores, espera).
     """
+    ind, wait = _describe_entry(cache, params, i)
+    if "adx" in params:
+        value, level = float(cache.adx[i]), float(params["adx"])
+        need = "<" if strategy_of(params) == "reversion_media" else ">"
+        ok = value < level if need == "<" else value > level
+        ind += f" ADX {value:.1f}"
+        wait += f" · ADX {value:.1f} (necesita {need} {level:.1f}{': OK' if ok else ': aún no'})"
+    return ind, wait
+
+
+def _describe_entry(cache: IndicatorCache, params: dict[str, Any], i: int) -> tuple[str, str]:
+    """Textos de la condición de entrada propia de cada estrategia."""
     name = strategy_of(params)
     c, r = float(cache.close_np[i]), float(cache.rsi[i])
     if name == "cruce_medias":
@@ -376,10 +466,33 @@ class BacktestMetrics:
     profit_factor: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
+    pnls: list[float] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        """Representación serializable (redondeada)."""
-        return {k: (round(v, 6) if isinstance(v, float) else v) for k, v in asdict(self).items()}
+        """Representación serializable (redondeada, sin la lista de operaciones)."""
+        return {k: (round(v, 6) if isinstance(v, float) else v)
+                for k, v in asdict(self).items() if k != "pnls"}
+
+
+def metrics_from_pnls(pnls: list[float], pf_cap: float = 10.0) -> BacktestMetrics:
+    """Calcula las métricas a partir de la lista de resultados de cada operación."""
+    m = BacktestMetrics(trades=len(pnls), pnls=list(pnls))
+    if not pnls:
+        return m
+    arr = np.asarray(pnls, dtype=float)
+    m.wins = int((arr > 0).sum())
+    m.losses = int((arr <= 0).sum())
+    m.gross_profit = float(arr[arr > 0].sum())
+    m.gross_loss = float(-arr[arr <= 0].sum())
+    m.net_profit = float(arr.sum())
+    m.win_rate = m.wins / m.trades
+    if m.gross_loss > 0:
+        m.profit_factor = min(m.gross_profit / m.gross_loss, pf_cap)
+    else:
+        m.profit_factor = pf_cap if m.gross_profit > 0 else 0.0
+    equity = np.cumsum(arr)
+    m.max_drawdown = float((np.maximum.accumulate(np.maximum(equity, 0.0)) - equity).max())
+    return m
 
 
 def backtest(
@@ -390,23 +503,30 @@ def backtest(
     config: dict[str, Any] | None = None,
 ) -> BacktestMetrics:
     """
-    Backtest simple de una posición a la vez en el rango de velas [start, end).
+    Backtest de una posición a la vez en el rango de velas [start, end).
 
-    * Entrada a la apertura de la vela siguiente a la señal.
-    * SL/TP con ATR de la vela de la señal.
+    * Entrada a la apertura de la vela siguiente a la señal, si esa vela está
+      dentro del horario permitido (``trading_hours``).
+    * SL/TP con el ATR de la vela de la señal (multiplicadores evolucionados o fijos).
     * Si SL y TP se tocan en la misma vela se asume SL (conservador).
+    * Gestión de la salida (``exit_management``), aplicada al cierre de cada vela:
+      ``breakeven`` mueve el SL a la entrada cuando el precio avanza ``be_mult`` x ATR;
+      ``trailing`` arrastra el SL a ``trail_mult`` x ATR del mejor precio.
+    * ``max_bars_in_trade`` > 0: cierre al cierre de la vela N.
     * Posición abierta al final del rango -> se cierra al último cierre.
-    * Se resta ``commission_per_trade`` (precio) a cada operación y, si los
-      datos traen la columna ``spread_price``, también el spread de la vela de entrada.
+    * Coste: ``commission_per_trade`` + spread histórico de la vela de entrada.
     """
     cfg = {**_DEFAULTS, **(config or {})}
     commission = float(cfg["commission_per_trade"])
-    # Multiplicadores de SL/TP: los evolucionados (si existen) o los de la configuración.
     sl_mult = float(params.get("sl_mult", cfg["sl_atr_mult"]))
     tp_mult = float(params.get("tp_mult", cfg["tp_atr_mult"]))
-    pf_cap = float(cfg["pf_cap"])
+    mode = str(cfg.get("exit_management", "ninguna"))
+    be_mult = float(params.get("be_mult", cfg["be_atr_mult"]))
+    trail_mult = float(params.get("trail_mult", cfg["trail_atr_mult"]))
+    max_bars = int(cfg.get("max_bars_in_trade", 0) or 0)
 
     sig = signal_array(cache, params)
+    allowed = cache.session_allowed(str(cfg.get("trading_hours", "")))
     o, hi, lo, c, a = cache.open_, cache.high, cache.low, cache.close_np, cache.atr
     end = min(end, len(cache))
 
@@ -415,7 +535,7 @@ def backtest(
     while i < end - 1:
         side = sig[i]
         atr_i = a[i]
-        if side == 0 or not math.isfinite(atr_i) or atr_i <= 0:
+        if side == 0 or not allowed[i + 1] or not math.isfinite(atr_i) or atr_i <= 0:
             i += 1
             continue
         entry = o[i + 1]
@@ -423,6 +543,7 @@ def backtest(
             sl, tp = entry - sl_mult * atr_i, entry + tp_mult * atr_i
         else:
             sl, tp = entry + sl_mult * atr_i, entry - tp_mult * atr_i
+        best = entry
 
         exit_price = c[end - 1]
         exit_idx = end - 1
@@ -441,29 +562,28 @@ def backtest(
                 if lo[j] <= tp:
                     exit_price, exit_idx = tp, j
                     break
+            if max_bars and (j - i) >= max_bars:
+                exit_price, exit_idx = c[j], j
+                break
+            # Gestión de la salida con la información de la vela j (vale desde la j+1).
+            if side == 1:
+                best = max(best, hi[j])
+                if mode == "breakeven" and best - entry >= be_mult * atr_i:
+                    sl = max(sl, entry)
+                elif mode == "trailing":
+                    sl = max(sl, best - trail_mult * atr_i)
+            else:
+                best = min(best, lo[j])
+                if mode == "breakeven" and entry - best >= be_mult * atr_i:
+                    sl = min(sl, entry)
+                elif mode == "trailing":
+                    sl = min(sl, best + trail_mult * atr_i)
 
-        # Coste: comisión fija + spread histórico de la vela de entrada.
         pnl = (exit_price - entry) * side - commission - cache.spread[i + 1]
-        pnls.append(pnl)
+        pnls.append(float(pnl))
         i = max(exit_idx, i + 1)  # tras salir se pueden buscar nuevas señales
 
-    m = BacktestMetrics(trades=len(pnls))
-    if not pnls:
-        return m
-    arr = np.asarray(pnls)
-    m.wins = int((arr > 0).sum())
-    m.losses = int((arr <= 0).sum())
-    m.gross_profit = float(arr[arr > 0].sum())
-    m.gross_loss = float(-arr[arr <= 0].sum())
-    m.net_profit = float(arr.sum())
-    m.win_rate = m.wins / m.trades
-    if m.gross_loss > 0:
-        m.profit_factor = min(m.gross_profit / m.gross_loss, pf_cap)
-    else:
-        m.profit_factor = pf_cap if m.gross_profit > 0 else 0.0
-    equity = np.cumsum(arr)
-    m.max_drawdown = float((np.maximum.accumulate(np.maximum(equity, 0.0)) - equity).max())
-    return m
+    return metrics_from_pnls(pnls, float(cfg["pf_cap"]))
 
 
 def fitness_from_metrics(metrics: BacktestMetrics, min_trades: int) -> float:
@@ -638,6 +758,24 @@ def _run_backend(
 # ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
+def walk_forward_windows(n: int, train_ratio: float, k: int) -> list[tuple[int, int, int]]:
+    """
+    Ventanas walk-forward ancladas: [(fin_entreno, inicio_test, fin_test), ...].
+
+    El tramo de validación (el ``1 - train_ratio`` final) se divide en ``k`` partes
+    consecutivas; cada ventana entrena con todo lo anterior a su parte.
+    """
+    split = int(n * train_ratio)
+    k = max(1, int(k))
+    size = (n - split) // k
+    out = []
+    for i in range(k):
+        t0 = split + i * size
+        t1 = n if i == k - 1 else split + (i + 1) * size
+        out.append((t0, t0, t1))
+    return out
+
+
 def evolve_parameters(
     df: pd.DataFrame,
     pop: int = 20,
@@ -646,17 +784,24 @@ def evolve_parameters(
     seed: int | None = None,
 ) -> dict[str, Any]:
     """
-    Evoluciona los parámetros y los valida con Walk-Forward (70% / 30%).
+    Evoluciona los parámetros y los valida con walk-forward.
 
-    :param df: velas OHLC ordenadas cronológicamente (sólo velas cerradas).
-    :param pop: tamaño de población.
-    :param gens: número de generaciones.
-    :param config: configuración (comisión, min_trades, ratios, ATR...).
-    :param seed: semilla para reproducibilidad (si None, se usa config["evolver_seed"]).
-    :returns: dict con las claves
-        ``accepted`` (bool), ``reason`` (str), ``params`` (dict),
-        ``in_sample`` / ``out_of_sample`` (métricas), ``fitness_in_sample``,
-        ``backend``, ``train_bars``, ``test_bars``.
+    * ``validation_windows`` = 1: un solo corte (70% entrena / 30% valida); los
+      parámetros elegidos son los del entrenamiento.
+    * ``validation_windows`` = K > 1: walk-forward anclado con K ventanas. Cada una
+      evoluciona con los datos anteriores y se valida con su tramo; se juntan todas
+      las operaciones de validación. Si el proceso supera la validación, los
+      parámetros para operar se evolucionan con TODO el historial (los más recientes).
+
+    Criterios de aceptación: parámetros coherentes, suficientes operaciones,
+    PF de entrenamiento >= ``min_pf_in_sample``, PF de validación >= ``min_pf_oos``
+    y >= ``oos_pf_ratio_min`` x PF de entrenamiento (con tope ``IS_PF_REFERENCE_CAP``),
+    y (con K > 1) al menos el 60%
+    de las ventanas con PF >= 1.
+
+    :returns: dict con ``accepted``, ``reason``, ``params``, ``in_sample``,
+        ``out_of_sample``, ``in_sample_folds``, ``windows``, ``backend``,
+        ``strategy``, ``train_bars``, ``test_bars`` y ``validation``.
     """
     cfg = {**_DEFAULTS, **(config or {})}
     if seed is None:
@@ -667,33 +812,65 @@ def evolve_parameters(
         reason = f"datos insuficientes: {n} velas (mínimo {MIN_BARS})"
         logger.error("Evolución abortada: %s", reason)
         return {"accepted": False, "reason": reason, "params": None,
-                "in_sample": None, "out_of_sample": None, "backend": None}
+                "in_sample": None, "out_of_sample": None, "backend": None,
+                "strategy": cfg.get("strategy")}
 
     cache = IndicatorCache(df, int(cfg["atr_period"]))
     n = len(cache)
     split = int(n * float(cfg["train_ratio"]))
+    k = int(cfg.get("validation_windows", 1) or 1)
+    space = build_search_space(cfg)
+    backend_name = str(cfg["evolver_backend"])
 
     logger.info(
-        "Evolucionando parámetros: estrategia %s | %d velas (train %d / test %d) | pop=%d gens=%d | "
-        "tramos de fitness=%d | SL/TP %s | backend=%s",
-        cfg.get("strategy") or DEFAULT_STRATEGY, n, split, n - split, pop, gens,
-        int(cfg["fitness_folds"]),
+        "Evolucionando parámetros: estrategia %s | %d velas (train %d / test %d) | validación %s | "
+        "pop=%d gens=%d | tramos de fitness=%d | SL/TP %s | ADX %s | horario %s | salida %s | backend=%s",
+        cfg.get("strategy") or DEFAULT_STRATEGY, n, split, n - split,
+        "1 corte" if k == 1 else f"walk-forward {k} ventanas", pop, gens, int(cfg["fitness_folds"]),
         "evolucionados" if cfg.get("evolve_sl_tp") else
         f"fijos ({cfg['sl_atr_mult']}x / {cfg['tp_atr_mult']}x ATR)",
-        cfg["evolver_backend"],
-    )
-    fitness = make_fitness(cache, 0, split, cfg)
-    space = build_search_space(cfg)
-    best, best_fit, backend = _run_backend(
-        str(cfg["evolver_backend"]), fitness, pop, gens, seed, space
+        "sí" if cfg.get("regime_filter") else "no", cfg.get("trading_hours") or "24 h",
+        cfg.get("exit_management", "ninguna"), backend_name,
     )
 
-    is_m = backtest(cache, best, 0, split, cfg)
-    is_folds = [
-        backtest(cache, best, a, b, cfg).to_dict()
-        for a, b in fold_bounds(0, split, int(cfg["fitness_folds"]))
-    ]
-    oos_m = backtest(cache, best, split, n, cfg)
+    def _evolve(train_end: int, run_seed: int | None) -> tuple[dict[str, Any], float, str]:
+        fitness = make_fitness(cache, 0, train_end, cfg)
+        return _run_backend(backend_name, fitness, pop, gens, run_seed, space)
+
+    windows_info: list[dict[str, Any]] = []
+    if k <= 1:
+        best, best_fit, backend = _evolve(split, seed)
+        is_m = backtest(cache, best, 0, split, cfg)
+        oos_m = backtest(cache, best, split, n, cfg)
+        fold_range = (0, split)
+        mean_is_pf = is_m.profit_factor
+        positive_ok = True
+    else:
+        oos_pnls: list[float] = []
+        is_pfs: list[float] = []
+        for w, (train_end, t0, t1) in enumerate(walk_forward_windows(n, float(cfg["train_ratio"]), k)):
+            wp, _wf, backend = _evolve(train_end, None if seed is None else int(seed) + w + 1)
+            w_is = backtest(cache, wp, 0, train_end, cfg)
+            w_oos = backtest(cache, wp, t0, t1, cfg)
+            oos_pnls += w_oos.pnls
+            is_pfs.append(w_is.profit_factor)
+            windows_info.append({
+                "train_end": train_end, "test_start": t0, "test_end": t1, "params": wp,
+                "pf_is": round(w_is.profit_factor, 4), "trades_is": w_is.trades,
+                "pf_oos": round(w_oos.profit_factor, 4), "trades_oos": w_oos.trades,
+            })
+        oos_m = metrics_from_pnls(oos_pnls, float(cfg["pf_cap"]))
+        mean_is_pf = float(np.mean(is_pfs)) if is_pfs else 0.0
+        positives = sum(1 for wi in windows_info if wi["trades_oos"] > 0 and wi["pf_oos"] >= 1.0)
+        need = math.ceil(0.6 * k)
+        positive_ok = positives >= need
+        # Parámetros para operar: evolucionados con todo el historial.
+        best, best_fit, backend = _evolve(n, seed)
+        is_m = backtest(cache, best, 0, n, cfg)
+        fold_range = (0, n)
+
+    is_folds = [backtest(cache, best, a, b, cfg).to_dict()
+                for a, b in fold_bounds(*fold_range, int(cfg["fitness_folds"]))]
 
     reasons: list[str] = []
     if not params_are_valid(best):
@@ -706,12 +883,17 @@ def evolve_parameters(
         )
     if oos_m.trades < int(cfg["min_trades_oos"]):
         reasons.append(f"pocas operaciones out-of-sample ({oos_m.trades} < {cfg['min_trades_oos']})")
-    threshold = float(cfg["oos_pf_ratio_min"]) * is_m.profit_factor
+    if oos_m.profit_factor < float(cfg.get("min_pf_oos", 0.0)):
+        reasons.append(f"PF out-of-sample {oos_m.profit_factor:.3f} < mínimo {float(cfg['min_pf_oos']):.2f}")
+    threshold = float(cfg["oos_pf_ratio_min"]) * min(mean_is_pf, IS_PF_REFERENCE_CAP)
     if oos_m.profit_factor < threshold:
         reasons.append(
             f"PF out-of-sample {oos_m.profit_factor:.3f} < {float(cfg['oos_pf_ratio_min']):.2f} x "
             f"PF in-sample ({threshold:.3f})"
         )
+    if not positive_ok:
+        positives = sum(1 for wi in windows_info if wi["trades_oos"] > 0 and wi["pf_oos"] >= 1.0)
+        reasons.append(f"solo {positives} de {k} ventanas de validación con PF >= 1")
 
     accepted = not reasons
     reason = "validación walk-forward superada" if accepted else "; ".join(reasons)
@@ -725,26 +907,31 @@ def evolve_parameters(
             {"profit_factor": f["profit_factor"], "trades": f["trades"]} for f in is_folds
         ],
         "out_of_sample": oos_m.to_dict(),
+        "windows": windows_info,
+        "validation": "1 corte" if k <= 1 else f"walk-forward {k} ventanas",
         "backend": backend,
         "strategy": strategy_of(best),
-        "train_bars": split,
+        "train_bars": split if k <= 1 else n,
         "test_bars": n - split,
     }
     log = logger.info if accepted else logger.warning
     log(
         "Resultado evolución [%s]: %s | params=%s | IS: PF=%.3f trades=%d (por tramo: %s) | "
-        "OOS: PF=%.3f trades=%d",
+        "OOS: PF=%.3f trades=%d%s",
         "ACEPTADO" if accepted else "DESCARTADO", reason, best,
         is_m.profit_factor, is_m.trades,
         ", ".join(f"{f['profit_factor']:.2f}/{f['trades']}" for f in is_folds),
         oos_m.profit_factor, oos_m.trades,
+        (" | ventanas: " + ", ".join(f"{w['pf_oos']:.2f}/{w['trades_oos']}" for w in windows_info))
+        if windows_info else "",
     )
     return result
 
 
 __all__ = [
     "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
-    "strategy_of", "warmup_bars", "describe_state", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
+    "strategy_of", "warmup_bars", "describe_state", "walk_forward_windows", "metrics_from_pnls",
+    "REGIME_SPACE", "EXIT_SPACES", "EXTRA_SPACE", "adx", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",
     "normalize_params", "params_are_valid", "fold_bounds", "sma", "rsi", "atr",
 ]

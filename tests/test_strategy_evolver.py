@@ -232,3 +232,86 @@ def test_warmup_bars() -> None:
 def test_unknown_strategy_rejected() -> None:
     with pytest.raises(ValueError):
         se.build_search_space({"strategy": "magia"})
+
+
+# ------------------------------------------------------------------ Fase 2
+def test_adx_range(synthetic_ohlc: pd.DataFrame) -> None:
+    values = se.adx(synthetic_ohlc).dropna()
+    assert len(values) > 1000 and values.between(0, 100).all()
+
+
+def test_regime_filter_blocks_signals(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    base = STRATEGY_PARAMS["ruptura"]
+    plain = se.signal_array(cache, base)
+    strict = se.signal_array(cache, {**base, "adx": 40.0})
+    loose = se.signal_array(cache, {**base, "adx": 1.0})
+    assert np.count_nonzero(strict) < np.count_nonzero(plain)
+    idx = np.flatnonzero(strict)
+    assert np.all(cache.adx[idx] > 40.0)
+    assert np.count_nonzero(loose) <= np.count_nonzero(plain)
+    rev = se.signal_array(cache, {**STRATEGY_PARAMS["reversion_media"], "adx": 20.0})
+    assert np.all(cache.adx[np.flatnonzero(rev)] < 20.0)
+
+
+def test_session_filter_restricts_entries(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = STRATEGY_PARAMS["cruce_medias"]
+    all_day = se.backtest(cache, p, 0, len(cache), {})
+    london = se.backtest(cache, p, 0, len(cache), {"trading_hours": "8-16"})
+    assert 0 < london.trades < all_day.trades
+    allowed = cache.session_allowed("8-16")
+    assert allowed.sum() == pytest.approx(len(cache) * 8 / 24, rel=0.02)
+
+
+def test_exit_management_changes_results(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = {**STRATEGY_PARAMS["ruptura"], "sl_mult": 2.0, "tp_mult": 4.0}
+    plain = se.backtest(cache, p, 0, len(cache), {})
+    be = se.backtest(cache, {**p, "be_mult": 0.8}, 0, len(cache), {"exit_management": "breakeven"})
+    trail = se.backtest(cache, {**p, "trail_mult": 1.0}, 0, len(cache), {"exit_management": "trailing"})
+    timed = se.backtest(cache, p, 0, len(cache), {"max_bars_in_trade": 3})
+    assert plain.to_dict() != be.to_dict() != trail.to_dict()
+    # el break-even convierte pérdidas en operaciones ~0 (menos de coste): más "empates"
+    assert np.sum(np.abs(np.asarray(be.pnls)) < 0.0002) > np.sum(np.abs(np.asarray(plain.pnls)) < 0.0002)
+    assert timed.trades >= plain.trades  # al cerrar antes caben más operaciones
+
+
+def test_search_space_with_new_options() -> None:
+    space = se.build_search_space({"regime_filter": True, "evolve_sl_tp": True,
+                                   "exit_management": "trailing", "strategy": "ruptura"})
+    assert {"lookback", "trend", "adx", "sl_mult", "tp_mult", "trail_mult"} == set(space)
+    space = se.build_search_space({"exit_management": "breakeven", "evolve_sl_tp": False})
+    assert "be_mult" not in space and "adx" not in space
+
+
+def test_walk_forward_windows_cover_validation() -> None:
+    wins = se.walk_forward_windows(1000, 0.7, 3)
+    assert wins[0][0] == 700 and wins[-1][2] == 1000
+    assert [w[2] for w in wins[:-1]] == [w[1] for w in wins[1:]]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_multi_window_walk_forward(synthetic_ohlc: pd.DataFrame, backend: str) -> None:
+    cfg = {"validation_windows": 3, "evolver_backend": backend, "regime_filter": True,
+           "exit_management": "breakeven", "strategy": "ruptura"}
+    out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, config=cfg, seed=5)
+    assert len(out["windows"]) == 3 and out["validation"] == "walk-forward 3 ventanas"
+    assert out["out_of_sample"]["trades"] == sum(w["trades_oos"] for w in out["windows"])
+    assert {"adx", "be_mult"} <= set(out["params"])
+    assert out["train_bars"] == len(synthetic_ohlc)  # parámetros finales con todo el historial
+
+
+def test_min_pf_oos_rejects(synthetic_ohlc: pd.DataFrame) -> None:
+    out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, seed=1,
+                               config={"min_pf_oos": 50.0, "pf_cap": 100.0})
+    assert out["accepted"] is False and "mínimo 50.00" in out["reason"]
+
+
+def test_ratio_rule_uses_capped_in_sample_pf(synthetic_ohlc: pd.DataFrame, monkeypatch) -> None:
+    # Con PF de entrenamiento muy alto, un PF de validación >= 2.0 no se rechaza por la regla de ratio.
+    out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, seed=2,
+                               config={"strategy": "ruptura", "min_trades": 1, "min_trades_oos": 1})
+    if out["in_sample"]["profit_factor"] > 2.5 and out["out_of_sample"]["profit_factor"] >= 2.0:
+        assert "x PF in-sample" not in out["reason"]
+    assert se.IS_PF_REFERENCE_CAP == 2.5
