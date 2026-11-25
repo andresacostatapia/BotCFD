@@ -49,5 +49,22 @@
     "telegram_token": "",
     "telegram_chat_id": "",
     "autostart_bots": false,
-    "lab_workers": 0
+    "lab_workers": 0,
+    "scout_enabled": false,
+    "scout_interval_minutes": 60,
+    "scout_categories": [],
+    "scout_timeframes": [
+        "M15",
+        "H1"
+    ],
+    "scout_strategies": [
+        "cruce_medias",
+        "reversion_media",
+        "ruptura"
+    ],
+    "scout_max_symbols": 20,
+    "scout_max_spread_atr": 0.15,
+    "scout_min_pf_oos": 1.2,
+    "scout_min_trades_oos": 15,
+    "scout_confirmations": 2
 }

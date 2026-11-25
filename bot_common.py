@@ -196,6 +196,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "telegram_chat_id": "",
     "autostart_bots": False,          # el Centro de control inicia los perfiles activos al abrirse
     "lab_workers": 0,                 # procesos del laboratorio (0 = automático)
+    # --- Explorador (scout.py): propone símbolos nuevos ---
+    "scout_enabled": False,           # explorar automáticamente mientras el Centro de control está abierto
+    "scout_interval_minutes": 60,     # cada cuánto explora
+    "scout_categories": [],           # categorías del bróker a revisar (p. ej. ["Forex", "Indices"])
+    "scout_timeframes": ["M15", "H1"],
+    "scout_strategies": ["cruce_medias", "reversion_media", "ruptura"],
+    "scout_max_symbols": 20,          # máx. símbolos por exploración (los de menor spread/ATR)
+    "scout_max_spread_atr": 0.15,     # descarta símbolos cuyo spread supera esta fracción del ATR(H1)
+    "scout_min_pf_oos": 1.2,          # PF de validación mínimo (más exigente que el bot)
+    "scout_min_trades_oos": 15,       # operaciones de validación mínimas
+    "scout_confirmations": 2,         # exploraciones seguidas aceptada antes de proponer
 }
 
 
@@ -410,6 +421,26 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             errors.append(f"'{key}' debe ser >= 0")
 
     for key in ("be_atr_mult", "trail_atr_mult"):
+        value = _num(key)
+        if value is not None and value <= 0:
+            errors.append(f"'{key}' debe ser > 0")
+
+    if not isinstance(config.get("scout_enabled"), bool):
+        errors.append("'scout_enabled' debe ser true/false")
+    cats = config.get("scout_categories")
+    if not isinstance(cats, list) or not all(isinstance(c, str) for c in cats):
+        errors.append("'scout_categories' debe ser una lista de textos")
+    tfs = config.get("scout_timeframes")
+    if not isinstance(tfs, list) or not tfs or any(t not in VALID_TIMEFRAMES for t in tfs):
+        errors.append(f"'scout_timeframes' debe ser una lista no vacía de {VALID_TIMEFRAMES}")
+    strats = config.get("scout_strategies")
+    if not isinstance(strats, list) or not strats or any(s not in VALID_STRATEGIES for s in strats):
+        errors.append(f"'scout_strategies' debe ser una lista no vacía de {VALID_STRATEGIES}")
+    for key in ("scout_interval_minutes", "scout_max_symbols", "scout_min_trades_oos", "scout_confirmations"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            errors.append(f"'{key}' debe ser un entero >= 1")
+    for key in ("scout_min_pf_oos", "scout_max_spread_atr"):
         value = _num(key)
         if value is not None and value <= 0:
             errors.append(f"'{key}' debe ser > 0")
