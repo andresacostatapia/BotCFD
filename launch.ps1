@@ -222,7 +222,7 @@ try {
 
         switch ($exitCode) {
             0       { Write-Ok    'Bot finalizado correctamente.' }
-            2       { Write-Err   'Configuracion invalida o cuenta no DEMO (codigo 2).' }
+            2       { Write-Err   'Configuracion invalida, simbolo inexistente o cuenta no DEMO (codigo 2). Vea la linea [ERROR] arriba.' }
             3       { Write-Err   'No se pudo conectar con MetaTrader 5 (codigo 3).' }
             4       { Write-Warn  'Parametros descartados por la validacion walk-forward (codigo 4).' }
             default { Write-Err   "El bot termino con codigo $exitCode. Revise $logFile" }

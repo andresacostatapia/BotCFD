@@ -142,3 +142,24 @@ def test_unhandled_error_closes_positions_when_configured(fake: FakeMT5, config_
     assert trading_bot.main(["--config", str(config_file)]) == trading_bot.EXIT_ERROR
     assert fake.positions == []
     assert not mt5_connector.is_connected()
+
+
+def test_unknown_symbol_suggests_correct_name(fake: FakeMT5, caplog) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    assert mt5_connector.find_similar_symbols("us500")[0] == "US500"
+    assert mt5_connector.find_similar_symbols("EUR/USD")[0] == "EURUSD"
+    assert mt5_connector.ensure_symbol("us500") is False
+    assert "US500" in caplog.text
+    assert mt5_connector.ensure_symbol("US500") is True
+
+
+def test_main_exits_with_config_code_on_unknown_symbol(fake: FakeMT5, config_file) -> None:
+    bot_common.save_config({"symbol": "us500"}, config_file)
+    assert trading_bot.main(["--config", str(config_file)]) == trading_bot.EXIT_CONFIG
+    assert not mt5_connector.is_connected()
+
+
+def test_get_rates_adds_spread_in_price(fake: FakeMT5) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    df = mt5_connector.get_rates("EURUSD", "H1", 50)
+    assert df["spread_price"].iloc[0] == pytest.approx(10 * 0.00001)

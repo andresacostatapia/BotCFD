@@ -106,6 +106,11 @@ class IndicatorCache:
         self.close_np = self.close.to_numpy()
         self.rsi = rsi(self.close).to_numpy()
         self.atr = atr(self.df, atr_period).to_numpy()
+        # Spread histórico por vela (precio). Si no viene en los datos, coste 0.
+        if "spread_price" in self.df.columns:
+            self.spread = self.df["spread_price"].fillna(0.0).to_numpy(dtype=float)
+        else:
+            self.spread = np.zeros(len(self.df), dtype=float)
         self._sma: dict[int, np.ndarray] = {}
 
     def sma(self, period: int) -> np.ndarray:
@@ -216,7 +221,8 @@ def backtest(
     * SL/TP con ATR de la vela de la señal.
     * Si SL y TP se tocan en la misma vela se asume SL (conservador).
     * Posición abierta al final del rango -> se cierra al último cierre.
-    * Se resta ``commission_per_trade`` (precio) a cada operación.
+    * Se resta ``commission_per_trade`` (precio) a cada operación y, si los
+      datos traen la columna ``spread_price``, también el spread de la vela de entrada.
     """
     cfg = {**_DEFAULTS, **(config or {})}
     commission = float(cfg["commission_per_trade"])
@@ -259,7 +265,8 @@ def backtest(
                     exit_price, exit_idx = tp, j
                     break
 
-        pnl = (exit_price - entry) * side - commission
+        # Coste: comisión fija + spread histórico de la vela de entrada.
+        pnl = (exit_price - entry) * side - commission - cache.spread[i + 1]
         pnls.append(pnl)
         i = max(exit_idx, i + 1)  # tras salir se pueden buscar nuevas señales
 

@@ -16,7 +16,9 @@ funciones fallan con un mensaje claro sólo cuando se llaman.
 
 from __future__ import annotations
 
+import difflib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -194,12 +196,52 @@ def safe_shutdown() -> None:
 # ---------------------------------------------------------------------------
 # Datos de mercado
 # ---------------------------------------------------------------------------
+def _normalize_symbol(name: str) -> str:
+    """Nombre en minúsculas y sin signos (us500, US500.a y US-500 -> us500 / us500a)."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def find_similar_symbols(symbol: str, limit: int = 8) -> list[str]:
+    """
+    Busca en el bróker símbolos con nombre parecido (para sugerir correcciones).
+
+    Orden: misma palabra ignorando mayúsculas, mismo nombre sin signos,
+    nombres que lo contienen y, por último, coincidencias aproximadas.
+    """
+    m = _require_mt5()
+    symbols = m.symbols_get()
+    if not symbols:
+        return []
+    names = [s.name for s in symbols]
+    query = _normalize_symbol(symbol)
+    ranked: list[str] = []
+
+    def _add(candidates: list[str]) -> None:
+        for name in candidates:
+            if name not in ranked:
+                ranked.append(name)
+
+    _add([n for n in names if n.lower() == symbol.lower()])
+    _add([n for n in names if _normalize_symbol(n) == query])
+    if query:
+        _add(sorted((n for n in names if query in _normalize_symbol(n)), key=len))
+    upper_map = {n.upper(): n for n in names}
+    _add([upper_map[c] for c in difflib.get_close_matches(symbol.upper(), list(upper_map), n=limit, cutoff=0.6)])
+    return ranked[:limit]
+
+
 def ensure_symbol(symbol: str) -> bool:
     """Asegura que el símbolo exista y esté visible en Market Watch."""
     m = _require_mt5()
     info = m.symbol_info(symbol)
     if info is None:
-        logger.error("Símbolo %s no encontrado en el bróker.", symbol)
+        suggestions = find_similar_symbols(symbol)
+        hint = (f" ¿Quiso decir: {', '.join(suggestions)}?" if suggestions
+                else " Revise el nombre exacto en 'Observación del mercado' de MT5.")
+        logger.error(
+            "Símbolo '%s' no encontrado en el bróker (los nombres distinguen mayúsculas).%s",
+            symbol, hint,
+        )
         return False
     if not info.visible and not m.symbol_select(symbol, True):
         logger.error("No se pudo activar %s en Market Watch: %s", symbol, m.last_error())
@@ -223,6 +265,10 @@ def get_rates(symbol: str, timeframe: str | int, n_bars: int) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    info = m.symbol_info(symbol)
+    if "spread" in df.columns and info is not None:
+        # Spread histórico de cada vela en unidades de precio (lo usa el backtest).
+        df["spread_price"] = df["spread"].astype(float) * float(info.point)
     return df.reset_index(drop=True)
 
 

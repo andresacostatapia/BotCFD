@@ -49,7 +49,7 @@ class ConfigPanel(tk.Tk):
         """Construye la ventana y carga la configuración existente (o la de defecto)."""
         super().__init__()
         self.title("Panel de Configuración MT5 Bot")
-        self.geometry("450x500")
+        self.geometry("450x540")
         self.minsize(420, 480)
 
         self.vars: dict[str, tk.StringVar] = {}
@@ -187,6 +187,46 @@ class ConfigPanel(tk.Tk):
         self.set_status(f"Configuración guardada en {path.name}.", COLOR_OK)
         messagebox.showinfo("Configuración guardada", f"Se guardó correctamente:\n{path}", parent=self)
 
+    def _check_symbol(self, mt5c: Any, symbol: str) -> tuple[bool, str]:
+        """
+        Verifica el símbolo en el bróker (ofrece corregir el nombre si no existe)
+        y compara su spread actual con el spread máximo del formulario.
+
+        :returns: (todo correcto, texto para el label de estado).
+        """
+        if not mt5c.ensure_symbol(symbol):
+            suggestions = mt5c.find_similar_symbols(symbol)
+            if not suggestions:
+                return False, (f"El símbolo '{symbol}' no existe en este bróker. Copie el nombre "
+                               "exacto desde 'Observación del mercado' en MT5.")
+            best = suggestions[0]
+            if messagebox.askyesno(
+                "Símbolo no encontrado",
+                f"El símbolo '{symbol}' no existe en este bróker "
+                f"(los nombres distinguen mayúsculas).\n\n¿Usar '{best}'?",
+                parent=self,
+            ) and mt5c.ensure_symbol(best):
+                symbol = best
+                self.vars["symbol"].set(best)
+            else:
+                return False, (f"El símbolo '{symbol}' no existe. "
+                               f"Sugerencias: {', '.join(suggestions)}")
+
+        spread = mt5c.get_spread(symbol)
+        spec = mt5c.get_symbol_spec(symbol)
+        lot_txt = f" | lote mín. bróker {spec.volume_min:g}" if spec is not None else ""
+        try:
+            max_spread = float(self.vars["max_spread"].get())
+        except ValueError:
+            max_spread = float("nan")
+        if spread != spread:  # NaN: sin cotización (mercado cerrado)
+            return False, f"{symbol}: sin cotización ahora (¿mercado cerrado?){lot_txt}"
+        if not spread <= max_spread:
+            return False, (f"{symbol}: spread actual {spread:g} > máximo {max_spread:g}. "
+                           f"El bot NO operará: suba 'Spread máximo' (p. ej. {spread * 2:g}) y guarde."
+                           f"{lot_txt}")
+        return True, f"{symbol}: spread actual {spread:g} <= máximo {max_spread:g}{lot_txt}"
+
     def on_test_connection(self) -> None:
         """Conecta a MT5, muestra balance/equity y cierra la conexión."""
         self.set_status("Conectando con MetaTrader 5...", COLOR_INFO)
@@ -204,16 +244,17 @@ class ConfigPanel(tk.Tk):
                 )
                 return
             account = mt5c.mt5.account_info()
-            symbol = self.vars["symbol"].get().strip()
-            spread_txt = ""
-            if symbol and mt5c.ensure_symbol(symbol):
-                spread_txt = f" | spread {symbol}: {mt5c.get_spread(symbol):.5f}"
-            self.set_status(
+            account_txt = (
                 f"Conexión OK | login {account.login} ({account.server}) | "
-                f"balance {account.balance:.2f} {account.currency} | "
-                f"equity {account.equity:.2f}{spread_txt}",
-                COLOR_OK,
+                f"balance {account.balance:.2f} {account.currency} | equity {account.equity:.2f}"
             )
+            symbol = self.vars["symbol"].get().strip()
+            if not symbol:
+                self.set_status(account_txt, COLOR_OK)
+                return
+
+            ok_symbol, symbol_txt = self._check_symbol(mt5c, symbol)
+            self.set_status(f"{account_txt}\n{symbol_txt}", COLOR_OK if ok_symbol else COLOR_ERR)
         except SystemExit as exc:  # cuenta real con "Solo DEMO" marcado
             self.set_status(str(exc), COLOR_ERR)
         except Exception as exc:  # noqa: BLE001 - mostrar cualquier error en la GUI

@@ -56,7 +56,14 @@ class FakeMT5:
         return SimpleNamespace(trade_allowed=True) if self.initialized else None
 
     # --- símbolos
-    def symbol_info(self, symbol: str) -> SimpleNamespace:
+    symbols: tuple[str, ...] = ("EURUSD", "GBPUSD", "US500", "US30", "USDJPY")
+
+    def symbols_get(self) -> tuple[SimpleNamespace, ...]:
+        return tuple(SimpleNamespace(name=n) for n in self.symbols)
+
+    def symbol_info(self, symbol: str) -> SimpleNamespace | None:
+        if symbol not in self.symbols:
+            return None
         return SimpleNamespace(visible=True, trade_tick_size=0.00001, trade_tick_value=1.0,
                                volume_min=0.01, volume_max=100.0, volume_step=0.01,
                                digits=5, point=0.00001, trade_stops_level=10)
@@ -74,6 +81,7 @@ class FakeMT5:
                                          ("low", "f8"), ("close", "f8"), ("tick_volume", "i8"),
                                          ("spread", "i4"), ("real_volume", "i8")])
         out["time"] = sub["time"].astype("int64").to_numpy() // 10**9
+        out["spread"] = 10
         for col in ("open", "high", "low", "close"):
             out[col] = sub[col].to_numpy()
         return out

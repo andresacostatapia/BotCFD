@@ -109,7 +109,8 @@ echo [INFO] Salida redirigida a "%LOGFILE%"  (Ctrl+C para detener)
 set "RC=%ERRORLEVEL%"
 echo [INFO] trading_bot.py finalizo con codigo %RC%. Revise "%LOGFILE%".
 if "%RC%"=="0" goto :end
-if "%RC%"=="2" echo [ERROR] Problema de configuracion o cuenta no DEMO.
+if "%RC%"=="2" echo [ERROR] Configuracion invalida, simbolo inexistente o cuenta no DEMO.
+if "%RC%"=="2" echo         Busque la linea [ERROR] en "%LOGFILE%" (incluye sugerencias de simbolo).
 if "%RC%"=="3" echo [ERROR] No se pudo conectar con MetaTrader 5.
 if "%RC%"=="4" echo [ERROR] Los parametros evolucionados no superaron la validacion walk-forward.
 goto :end

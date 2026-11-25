@@ -100,3 +100,12 @@ def test_evolution_is_reproducible(synthetic_ohlc: pd.DataFrame, backend: str) -
     a = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3, config=cfg, seed=7)
     b = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3, config=cfg, seed=7)
     assert a["params"] == b["params"]
+
+
+def test_historical_spread_is_a_cost(synthetic_ohlc: pd.DataFrame) -> None:
+    p = {"fast": 10, "slow": 40, "rsi_buy": 50.0, "rsi_sell": 50.0}
+    base = se.backtest(se.IndicatorCache(synthetic_ohlc), p, 0, len(synthetic_ohlc))
+    wide = synthetic_ohlc.assign(spread_price=0.0003)
+    costly = se.backtest(se.IndicatorCache(wide), p, 0, len(wide))
+    assert costly.trades == base.trades
+    assert costly.net_profit == pytest.approx(base.net_profit - 0.0003 * base.trades)

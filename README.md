@@ -126,15 +126,15 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `risk_percent` | 1.0 | % del equity arriesgado por operación |
 | `max_daily_loss_percent` | 3.0 | % de pérdida diaria (sobre el balance de inicio del día, usando equity) que detiene el trading hasta el día siguiente |
 | `max_lot` / `min_lot` | 1.0 / 0.01 | Límites de lote (además de los del bróker) |
-| `max_spread` | 0.00020 | Spread máximo en unidades de precio (ask − bid) |
+| `max_spread` | 0.00020 | Spread máximo en unidades de precio (ask − bid). **Depende del activo:** ~0.0002 en EURUSD, ~1.0 en US500. "Probar conexión MT5" muestra el spread actual |
 | `magic` | 20250101 | Identifica las órdenes del bot |
-| `symbol` / `timeframe` | EURUSD / H1 | Símbolo (respete sufijos del bróker, p. ej. `EURUSD.m`) y M1/M5/M15/H1/H4 |
+| `symbol` / `timeframe` | EURUSD / H1 | Símbolo con el nombre **exacto** del bróker (distingue mayúsculas: `US500`, no `us500`; respete sufijos como `EURUSD.m`). Si no existe, el panel y el log sugieren nombres parecidos |
 | `require_demo` | true | Aborta si la cuenta no es DEMO |
 | `history_bars` | 2000 | Velas para evolución + validación |
 | `population` / `generations` | 20 / 10 | Tamaño de la evolución |
 | `evolver_backend` | auto | `auto`, `strategy-genome` o `deap` |
 | `evolver_seed` | null | Semilla para reproducibilidad |
-| `commission_per_trade` | 0.00007 | Coste fijo estimado por operación (precio) |
+| `commission_per_trade` | 0.00007 | Comisión fija estimada por operación (precio). El backtest suma además el spread histórico de cada vela |
 | `min_trades` / `min_trades_oos` | 20 / 5 | Mínimo de operaciones in-sample / out-of-sample |
 | `train_ratio` | 0.70 | Proporción de entrenamiento walk-forward |
 | `oos_pf_ratio_min` | 0.80 | PF_oos mínimo relativo a PF_is |
