@@ -57,6 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "commission_per_trade": 0.00007,  # coste fijo estimado por trade (precio)
     "min_trades": 20,                 # mínimo de trades in-sample sin penalizar
     "min_trades_oos": 5,              # mínimo de trades out-of-sample
+    "fitness_folds": 3,               # tramos del entrenamiento; fitness = peor tramo (1 = desactivado)
     "train_ratio": 0.70,              # walk-forward: 70% train / 30% validación
     "oos_pf_ratio_min": 0.80,         # PF_oos debe ser >= 0.8 * PF_is
     "min_pf_in_sample": 1.0,          # PF in-sample mínimo aceptable
@@ -130,6 +131,10 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         value = config.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' debe ser un entero positivo")
+
+    folds = config.get("fitness_folds")
+    if isinstance(folds, bool) or not isinstance(folds, int) or not 1 <= folds <= 10:
+        errors.append("'fitness_folds' debe ser un entero entre 1 y 10")
 
     for key in ("sl_atr_mult", "tp_atr_mult", "oos_pf_ratio_min", "pf_cap"):
         value = _num(key)

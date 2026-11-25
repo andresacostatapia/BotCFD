@@ -66,9 +66,12 @@ alternativa madura.
 | `rsi_buy`  | Float(40,70)| COMPRA si la SMA rápida cruza al alza y RSI(14) > valor |
 | `rsi_sell` | Float(30,60)| VENTA si la SMA rápida cruza a la baja y RSI(14) < valor |
 
-* **Fitness:** Profit Factor del backtest (restando `commission_per_trade` a cada
-  operación), multiplicado por `(trades / min_trades)²` si hay menos de
-  `min_trades` operaciones (penaliza las "curvas de 1 trade").
+* **Fitness:** Profit Factor del backtest (restando `commission_per_trade` y el
+  spread histórico a cada operación), multiplicado por `(trades / min_trades)²` si
+  hay menos de `min_trades` operaciones (penaliza las "curvas de 1 trade").
+  Con `fitness_folds = 3` (por defecto) el entrenamiento se divide en 3 tramos y
+  el fitness es el **peor** de ellos: una combinación solo puntúa alto si funciona
+  en todo el periodo. Los datos de validación nunca se usan para elegir.
 * **Backtest:** entrada a la apertura de la vela siguiente a la señal, SL/TP con ATR,
   si SL y TP se tocan en la misma vela se asume SL (conservador). El mismo
   modelo de SL/TP que usa el bot en vivo.
@@ -136,6 +139,7 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `evolver_seed` | null | Semilla para reproducibilidad |
 | `commission_per_trade` | 0.00007 | Comisión fija estimada por operación (precio). El backtest suma además el spread histórico de cada vela |
 | `min_trades` / `min_trades_oos` | 20 / 5 | Mínimo de operaciones in-sample / out-of-sample |
+| `fitness_folds` | 3 | Divide el entrenamiento en N tramos y puntúa cada combinación por su **peor** tramo (premia la estabilidad, reduce el sobreajuste). `1` = PF de todo el entrenamiento |
 | `train_ratio` | 0.70 | Proporción de entrenamiento walk-forward |
 | `oos_pf_ratio_min` | 0.80 | PF_oos mínimo relativo a PF_is |
 | `min_pf_in_sample` | 1.0 | PF in-sample mínimo |

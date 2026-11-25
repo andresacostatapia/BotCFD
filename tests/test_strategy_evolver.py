@@ -109,3 +109,29 @@ def test_historical_spread_is_a_cost(synthetic_ohlc: pd.DataFrame) -> None:
     costly = se.backtest(se.IndicatorCache(wide), p, 0, len(wide))
     assert costly.trades == base.trades
     assert costly.net_profit == pytest.approx(base.net_profit - 0.0003 * base.trades)
+
+
+def test_fold_bounds_cover_range() -> None:
+    folds = se.fold_bounds(0, 1400, 3)
+    assert folds[0][0] == 0 and folds[-1][1] == 1400 and len(folds) == 3
+    assert all(a < b for a, b in folds)
+    assert all(folds[i][1] == folds[i + 1][0] for i in range(2))
+
+
+def test_fold_fitness_is_worst_fold(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = {"fast": 10, "slow": 40, "rsi_buy": 50.0, "rsi_sell": 50.0}
+    cfg = {"fitness_folds": 3, "min_trades": 9}
+    expected = min(
+        se.fitness_from_metrics(se.backtest(cache, p, a, b, cfg), 3)
+        for a, b in se.fold_bounds(0, 1400, 3)
+    )
+    assert se.make_fitness(cache, 0, 1400, cfg)(p) == pytest.approx(expected)
+    single = se.make_fitness(cache, 0, 1400, {"fitness_folds": 1, "min_trades": 9})(p)
+    assert single == pytest.approx(
+        se.fitness_from_metrics(se.backtest(cache, p, 0, 1400, cfg), 9))
+
+
+def test_evolve_reports_fold_metrics(synthetic_ohlc: pd.DataFrame) -> None:
+    out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, config={"fitness_folds": 3}, seed=2)
+    assert len(out["in_sample_folds"]) == 3

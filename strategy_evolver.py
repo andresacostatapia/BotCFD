@@ -47,6 +47,7 @@ _DEFAULTS: dict[str, Any] = {
     "commission_per_trade": 0.00007,
     "min_trades": 20,
     "min_trades_oos": 5,
+    "fitness_folds": 3,
     "train_ratio": 0.70,
     "oos_pf_ratio_min": 0.80,
     "min_pf_in_sample": 1.0,
@@ -302,17 +303,40 @@ def fitness_from_metrics(metrics: BacktestMetrics, min_trades: int) -> float:
     return float(metrics.profit_factor) * penalty
 
 
+def fold_bounds(start: int, end: int, folds: int) -> list[tuple[int, int]]:
+    """Divide [start, end) en ``folds`` tramos consecutivos de tamaño similar."""
+    folds = max(1, int(folds))
+    edges = np.linspace(start, end, folds + 1).astype(int)
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+
+
 def make_fitness(
     cache: IndicatorCache, start: int, end: int, config: dict[str, Any]
 ) -> Callable[[dict[str, Any]], float]:
-    """Crea la función de fitness (params -> float) para el rango indicado."""
+    """
+    Crea la función de fitness (params -> float) para el rango indicado.
+
+    Con ``fitness_folds`` = 1 el fitness es el PF penalizado de todo el rango.
+    Con ``fitness_folds`` = k > 1 el rango de ENTRENAMIENTO se divide en k tramos
+    consecutivos y el fitness es el PEOR de los k (cada tramo exige
+    ``min_trades / k`` operaciones). Así se premian combinaciones estables en
+    todo el periodo, no las que tienen un pico de suerte en un solo tramo.
+    Nunca se usan datos de validación (out-of-sample).
+    """
     min_trades = int(config.get("min_trades", _DEFAULTS["min_trades"]))
+    folds = fold_bounds(start, end, int(config.get("fitness_folds", _DEFAULTS["fitness_folds"])))
+    min_trades_fold = max(1, round(min_trades / len(folds)))
 
     def _fitness(params: dict[str, Any]) -> float:
         p = normalize_params(params)
         if not params_are_valid(p):
             return 0.0  # slow <= fast: inválido
-        return fitness_from_metrics(backtest(cache, p, start, end, config), min_trades)
+        if len(folds) == 1:
+            return fitness_from_metrics(backtest(cache, p, start, end, config), min_trades)
+        return min(
+            fitness_from_metrics(backtest(cache, p, a, b, config), min_trades_fold)
+            for a, b in folds
+        )
 
     return _fitness
 
@@ -467,13 +491,18 @@ def evolve_parameters(
     split = int(n * float(cfg["train_ratio"]))
 
     logger.info(
-        "Evolucionando parámetros: %d velas (train %d / test %d) | pop=%d gens=%d | backend=%s",
-        n, split, n - split, pop, gens, cfg["evolver_backend"],
+        "Evolucionando parámetros: %d velas (train %d / test %d) | pop=%d gens=%d | "
+        "tramos de fitness=%d | backend=%s",
+        n, split, n - split, pop, gens, int(cfg["fitness_folds"]), cfg["evolver_backend"],
     )
     fitness = make_fitness(cache, 0, split, cfg)
     best, best_fit, backend = _run_backend(str(cfg["evolver_backend"]), fitness, pop, gens, seed)
 
     is_m = backtest(cache, best, 0, split, cfg)
+    is_folds = [
+        backtest(cache, best, a, b, cfg).to_dict()
+        for a, b in fold_bounds(0, split, int(cfg["fitness_folds"]))
+    ]
     oos_m = backtest(cache, best, split, n, cfg)
 
     reasons: list[str] = []
@@ -502,6 +531,9 @@ def evolve_parameters(
         "params": best,
         "fitness_in_sample": round(best_fit, 6),
         "in_sample": is_m.to_dict(),
+        "in_sample_folds": [
+            {"profit_factor": f["profit_factor"], "trades": f["trades"]} for f in is_folds
+        ],
         "out_of_sample": oos_m.to_dict(),
         "backend": backend,
         "train_bars": split,
@@ -509,9 +541,12 @@ def evolve_parameters(
     }
     log = logger.info if accepted else logger.warning
     log(
-        "Resultado evolución [%s]: %s | params=%s | IS: PF=%.3f trades=%d | OOS: PF=%.3f trades=%d",
+        "Resultado evolución [%s]: %s | params=%s | IS: PF=%.3f trades=%d (por tramo: %s) | "
+        "OOS: PF=%.3f trades=%d",
         "ACEPTADO" if accepted else "DESCARTADO", reason, best,
-        is_m.profit_factor, is_m.trades, oos_m.profit_factor, oos_m.trades,
+        is_m.profit_factor, is_m.trades,
+        ", ".join(f"{f['profit_factor']:.2f}/{f['trades']}" for f in is_folds),
+        oos_m.profit_factor, oos_m.trades,
     )
     return result
 
@@ -519,5 +554,5 @@ def evolve_parameters(
 __all__ = [
     "SEARCH_SPACE", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",
-    "normalize_params", "params_are_valid", "sma", "rsi", "atr",
+    "normalize_params", "params_are_valid", "fold_bounds", "sma", "rsi", "atr",
 ]

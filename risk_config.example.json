@@ -16,6 +16,7 @@
     "commission_per_trade": 7e-05,
     "min_trades": 20,
     "min_trades_oos": 5,
+    "fitness_folds": 3,
     "train_ratio": 0.7,
     "oos_pf_ratio_min": 0.8,
     "min_pf_in_sample": 1.0,
