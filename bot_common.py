@@ -66,6 +66,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "atr_period": 14,
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
+    "evolve_sl_tp": True,             # evolucionar también los multiplicadores SL/TP
     "loop_seconds": 60,
     "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
@@ -119,6 +120,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     if config.get("timeframe") not in VALID_TIMEFRAMES:
         errors.append(f"'timeframe' debe ser uno de {VALID_TIMEFRAMES}")
+
+    if not isinstance(config.get("evolve_sl_tp"), bool):
+        errors.append("'evolve_sl_tp' debe ser true/false")
 
     if not isinstance(config.get("require_demo"), bool):
         errors.append("'require_demo' debe ser true/false")

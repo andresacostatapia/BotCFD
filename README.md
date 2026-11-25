@@ -45,7 +45,7 @@ get_rates(history_bars) ─► evolve_parameters()  [70% train / 30% validación
 Bucle cada 60 s:
   recarga en caliente · reconexión · reset a las 00:00
   check_daily_loss() ─► check_spread() ─► señal en vela cerrada
-  sin posición (mismo magic) ─► SL/TP ATR (1.5× / 2.0×) ─► calculate_lot()
+  sin posición (mismo magic) ─► SL/TP ATR (evolucionados o 1.5× / 2.0×) ─► calculate_lot()
   ─► order_send (IOC, con fallback FOK/RETURN) ─► verifica retcode
 ```
 
@@ -65,6 +65,8 @@ alternativa madura.
 | `slow`     | Int(30, 100)| SMA lenta (debe ser `slow > fast`, si no fitness = 0)  |
 | `rsi_buy`  | Float(40,70)| COMPRA si la SMA rápida cruza al alza y RSI(14) > valor |
 | `rsi_sell` | Float(30,60)| VENTA si la SMA rápida cruza a la baja y RSI(14) < valor |
+| `sl_mult`  | Float(1, 3) | Stop loss = valor × ATR (solo si `evolve_sl_tp` = true) |
+| `tp_mult`  | Float(1, 4) | Take profit = valor × ATR (solo si `evolve_sl_tp` = true) |
 
 * **Fitness:** Profit Factor del backtest (restando `commission_per_trade` y el
   spread histórico a cada operación), multiplicado por `(trades / min_trades)²` si
@@ -143,7 +145,8 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `train_ratio` | 0.70 | Proporción de entrenamiento walk-forward |
 | `oos_pf_ratio_min` | 0.80 | PF_oos mínimo relativo a PF_is |
 | `min_pf_in_sample` | 1.0 | PF in-sample mínimo |
-| `atr_period`, `sl_atr_mult`, `tp_atr_mult` | 14, 1.5, 2.0 | SL/TP por ATR |
+| `atr_period`, `sl_atr_mult`, `tp_atr_mult` | 14, 1.5, 2.0 | SL/TP por ATR (fijos, se usan solo si `evolve_sl_tp` = false) |
+| `evolve_sl_tp` | true | El algoritmo genético elige también los multiplicadores de SL y TP. Más libertad = más riesgo de sobreajuste; la validación walk-forward lo controla |
 | `loop_seconds` | 60 | Frecuencia del bucle |
 | `heartbeat_seconds` | 60 | Cada cuánto se muestra el mensaje "En espera" (precio, próxima vela, qué condición falta, P&L del día). `0` = desactivado |
 | `deviation` | 20 | Deslizamiento máximo en puntos |

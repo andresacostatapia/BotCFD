@@ -24,6 +24,7 @@
     "atr_period": 14,
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
+    "evolve_sl_tp": true,
     "loop_seconds": 60,
     "heartbeat_seconds": 60,
     "deviation": 20,

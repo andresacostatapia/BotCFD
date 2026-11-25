@@ -310,8 +310,9 @@ class TradingBot:
             logger.warning("SKIP: ATR inválido (%s).", atr_value)
             return
 
-        sl_dist = float(cfg["sl_atr_mult"]) * atr_value
-        tp_dist = float(cfg["tp_atr_mult"]) * atr_value
+        params = self.params or {}
+        sl_dist = float(params.get("sl_mult", cfg["sl_atr_mult"])) * atr_value
+        tp_dist = float(params.get("tp_mult", cfg["tp_atr_mult"])) * atr_value
         min_stop = mt5c.get_min_stop_distance(symbol)
         if sl_dist <= min_stop or tp_dist <= min_stop:
             logger.warning(

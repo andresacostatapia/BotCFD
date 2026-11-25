@@ -135,3 +135,29 @@ def test_fold_fitness_is_worst_fold(synthetic_ohlc: pd.DataFrame) -> None:
 def test_evolve_reports_fold_metrics(synthetic_ohlc: pd.DataFrame) -> None:
     out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, config={"fitness_folds": 3}, seed=2)
     assert len(out["in_sample_folds"]) == 3
+
+
+def test_search_space_includes_sl_tp_when_enabled() -> None:
+    assert {"sl_mult", "tp_mult"} <= set(se.build_search_space({"evolve_sl_tp": True}))
+    assert "sl_mult" not in se.build_search_space({"evolve_sl_tp": False})
+
+
+def test_backtest_uses_evolved_sl_tp(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    base = {"fast": 10, "slow": 40, "rsi_buy": 50.0, "rsi_sell": 50.0}
+    fixed = se.backtest(cache, base, 0, len(cache), {"sl_atr_mult": 1.5, "tp_atr_mult": 2.0})
+    same = se.backtest(cache, {**base, "sl_mult": 1.5, "tp_mult": 2.0}, 0, len(cache), {})
+    wide = se.backtest(cache, {**base, "sl_mult": 3.0, "tp_mult": 4.0}, 0, len(cache), {})
+    assert fixed.to_dict() == same.to_dict()
+    assert wide.trades < fixed.trades  # operaciones más largas -> menos operaciones
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_evolve_with_sl_tp(synthetic_ohlc: pd.DataFrame, backend: str) -> None:
+    out = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3,
+                               config={"evolver_backend": backend, "evolve_sl_tp": True}, seed=4)
+    p = out["params"]
+    assert 1.0 <= p["sl_mult"] <= 3.0 and 1.0 <= p["tp_mult"] <= 4.0
+    off = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3,
+                               config={"evolver_backend": backend, "evolve_sl_tp": False}, seed=4)
+    assert "sl_mult" not in off["params"]

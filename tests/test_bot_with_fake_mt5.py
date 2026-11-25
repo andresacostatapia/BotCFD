@@ -209,3 +209,12 @@ def test_heartbeat_can_be_disabled(fake: FakeMT5, config_file, caplog) -> None:
     caplog.clear()
     bot.step()
     assert "En espera" not in caplog.text
+
+
+def test_live_order_uses_evolved_sl_tp(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    bot.params = {**PARAMS, "sl_mult": 3.0, "tp_mult": 1.0}
+    bot.step()
+    order = fake.orders[0]
+    sl_dist, tp_dist = abs(order["price"] - order["sl"]), abs(order["tp"] - order["price"])
+    assert sl_dist == pytest.approx(3 * tp_dist, abs=3e-5)  # precios redondeados a 5 decimales

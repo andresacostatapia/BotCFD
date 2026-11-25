@@ -14,7 +14,9 @@ Estrategia (educativa)
 ----------------------
 * COMPRA: la SMA rápida cruza por encima de la lenta y RSI(14) > ``rsi_buy``.
 * VENTA:  la SMA rápida cruza por debajo de la lenta y RSI(14) < ``rsi_sell``.
-* Salida: SL = 1.5 x ATR, TP = 2.0 x ATR (igual que en el bot en vivo).
+* Salida: SL = sl_mult x ATR, TP = tp_mult x ATR. Con ``evolve_sl_tp`` (por
+  defecto) ambos multiplicadores se evolucionan (SL 1.0-3.0, TP 1.0-4.0); si no,
+  se usan los fijos de la configuración (1.5 / 2.0). El bot en vivo usa los mismos.
 
 Este módulo NO importa MetaTrader5: recibe un DataFrame OHLC por parámetro.
 """
@@ -40,6 +42,12 @@ SEARCH_SPACE: dict[str, tuple[type, float, float]] = {
     "rsi_sell": (float, 30.0, 60.0),
 }
 
+#: Espacio adicional para las salidas (multiplicadores de ATR), si evolve_sl_tp = true
+SLTP_SPACE: dict[str, tuple[type, float, float]] = {
+    "sl_mult": (float, 1.0, 3.0),
+    "tp_mult": (float, 1.0, 4.0),
+}
+
 RSI_PERIOD: int = 14
 MIN_BARS: int = 300
 
@@ -55,6 +63,7 @@ _DEFAULTS: dict[str, Any] = {
     "atr_period": 14,
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
+    "evolve_sl_tp": True,
     "evolver_backend": "auto",
     "evolver_seed": None,
 }
@@ -128,10 +137,23 @@ class IndicatorCache:
 # ---------------------------------------------------------------------------
 # Señales
 # ---------------------------------------------------------------------------
-def normalize_params(params: dict[str, Any]) -> dict[str, Any]:
+def build_search_space(config: dict[str, Any] | None = None) -> dict[str, tuple[type, float, float]]:
+    """Espacio de búsqueda: entradas siempre; SL/TP (x ATR) si ``evolve_sl_tp`` es true."""
+    cfg = {**_DEFAULTS, **(config or {})}
+    space = dict(SEARCH_SPACE)
+    if cfg.get("evolve_sl_tp"):
+        space.update(SLTP_SPACE)
+    return space
+
+
+def normalize_params(
+    params: dict[str, Any], space: dict[str, tuple[type, float, float]] | None = None
+) -> dict[str, Any]:
     """Convierte y limita los parámetros al espacio de búsqueda."""
+    if space is None:
+        space = {**SEARCH_SPACE, **{k: v for k, v in SLTP_SPACE.items() if k in params}}
     out: dict[str, Any] = {}
-    for name, (kind, lo, hi) in SEARCH_SPACE.items():
+    for name, (kind, lo, hi) in space.items():
         value = float(params[name])
         value = min(max(value, lo), hi)
         out[name] = int(round(value)) if kind is int else round(value, 4)
@@ -227,7 +249,9 @@ def backtest(
     """
     cfg = {**_DEFAULTS, **(config or {})}
     commission = float(cfg["commission_per_trade"])
-    sl_mult, tp_mult = float(cfg["sl_atr_mult"]), float(cfg["tp_atr_mult"])
+    # Multiplicadores de SL/TP: los evolucionados (si existen) o los de la configuración.
+    sl_mult = float(params.get("sl_mult", cfg["sl_atr_mult"]))
+    tp_mult = float(params.get("tp_mult", cfg["tp_atr_mult"]))
     pf_cap = float(cfg["pf_cap"])
 
     sig = signal_array(cache, params)
@@ -324,12 +348,14 @@ def make_fitness(
     Nunca se usan datos de validación (out-of-sample).
     """
     min_trades = int(config.get("min_trades", _DEFAULTS["min_trades"]))
+    space = build_search_space(config)
     folds = fold_bounds(start, end, int(config.get("fitness_folds", _DEFAULTS["fitness_folds"])))
     # ceil: la suma de mínimos por tramo nunca queda por debajo de min_trades
     min_trades_fold = max(1, math.ceil(min_trades / len(folds)))
 
     def _fitness(params: dict[str, Any]) -> float:
-        p = normalize_params(params)
+        # Sólo las claves presentes: SL/TP ausentes -> se usan los fijos de la configuración.
+        p = normalize_params(params, {k: v for k, v in space.items() if k in params})
         if not params_are_valid(p):
             return 0.0  # slow <= fast: inválido
         if len(folds) == 1:
@@ -346,14 +372,15 @@ def make_fitness(
 # Backends de optimización
 # ---------------------------------------------------------------------------
 def _evolve_strategy_genome(
-    fitness: Callable[[dict[str, Any]], float], pop: int, gens: int, seed: int | None
+    fitness: Callable[[dict[str, Any]], float], pop: int, gens: int, seed: int | None,
+    search_space: dict[str, tuple[type, float, float]],
 ) -> tuple[dict[str, Any], float]:
     """Optimiza con strategy-genome. Devuelve (mejores parámetros, fitness)."""
     from strategy_genome import evolve, space as sp
 
     space = {
         name: (sp.Int(int(lo), int(hi)) if kind is int else sp.Float(float(lo), float(hi)))
-        for name, (kind, lo, hi) in SEARCH_SPACE.items()
+        for name, (kind, lo, hi) in search_space.items()
     }
     result = evolve(
         lambda genome: fitness(dict(genome.params)),
@@ -365,19 +392,20 @@ def _evolve_strategy_genome(
     )
     if result.best_params is None:
         raise RuntimeError("strategy-genome no devolvió ningún genoma válido")
-    best = normalize_params(result.best_params)
+    best = normalize_params(result.best_params, search_space)
     return best, fitness(best)
 
 
 def _evolve_deap(
-    fitness: Callable[[dict[str, Any]], float], pop: int, gens: int, seed: int | None
+    fitness: Callable[[dict[str, Any]], float], pop: int, gens: int, seed: int | None,
+    search_space: dict[str, tuple[type, float, float]],
 ) -> tuple[dict[str, Any], float]:
     """Optimiza con DEAP (algoritmo genético simple con elitismo)."""
     from deap import algorithms, base, creator, tools
 
-    names = list(SEARCH_SPACE)
-    lows = [float(SEARCH_SPACE[n][1]) for n in names]
-    highs = [float(SEARCH_SPACE[n][2]) for n in names]
+    names = list(search_space)
+    lows = [float(search_space[n][1]) for n in names]
+    highs = [float(search_space[n][2]) for n in names]
 
     # creator.create registra clases globales: sólo una vez por proceso.
     if not hasattr(creator, "MT5BotFitnessMax"):
@@ -390,7 +418,7 @@ def _evolve_deap(
     rng = random.Random(seed)
 
     def _decode(ind: list[float]) -> dict[str, Any]:
-        return normalize_params(dict(zip(names, ind)))
+        return normalize_params(dict(zip(names, ind)), search_space)
 
     def _clamp(ind: list[float]) -> list[float]:
         for k, (lo, hi) in enumerate(zip(lows, highs)):
@@ -432,12 +460,14 @@ def _run_backend(
     pop: int,
     gens: int,
     seed: int | None,
+    search_space: dict[str, tuple[type, float, float]] | None = None,
 ) -> tuple[dict[str, Any], float, str]:
     """Ejecuta el backend pedido (con fallback automático en modo 'auto')."""
     backend = (backend or "auto").lower()
+    search_space = search_space or dict(SEARCH_SPACE)
     if backend in ("auto", "strategy-genome", "strategy_genome"):
         try:
-            best, fit = _evolve_strategy_genome(fitness, pop, gens, seed)
+            best, fit = _evolve_strategy_genome(fitness, pop, gens, seed, search_space)
             return best, fit, "strategy-genome"
         except ImportError:
             if backend != "auto":
@@ -448,7 +478,7 @@ def _run_backend(
                 raise
             logger.exception("strategy-genome falló; usando DEAP como alternativa.")
     if backend in ("auto", "deap"):
-        best, fit = _evolve_deap(fitness, pop, gens, seed)
+        best, fit = _evolve_deap(fitness, pop, gens, seed, search_space)
         return best, fit, "deap"
     raise ValueError(f"evolver_backend desconocido: {backend!r}")
 
@@ -493,11 +523,17 @@ def evolve_parameters(
 
     logger.info(
         "Evolucionando parámetros: %d velas (train %d / test %d) | pop=%d gens=%d | "
-        "tramos de fitness=%d | backend=%s",
-        n, split, n - split, pop, gens, int(cfg["fitness_folds"]), cfg["evolver_backend"],
+        "tramos de fitness=%d | SL/TP %s | backend=%s",
+        n, split, n - split, pop, gens, int(cfg["fitness_folds"]),
+        "evolucionados" if cfg.get("evolve_sl_tp") else
+        f"fijos ({cfg['sl_atr_mult']}x / {cfg['tp_atr_mult']}x ATR)",
+        cfg["evolver_backend"],
     )
     fitness = make_fitness(cache, 0, split, cfg)
-    best, best_fit, backend = _run_backend(str(cfg["evolver_backend"]), fitness, pop, gens, seed)
+    space = build_search_space(cfg)
+    best, best_fit, backend = _run_backend(
+        str(cfg["evolver_backend"]), fitness, pop, gens, seed, space
+    )
 
     is_m = backtest(cache, best, 0, split, cfg)
     is_folds = [
@@ -553,7 +589,7 @@ def evolve_parameters(
 
 
 __all__ = [
-    "SEARCH_SPACE", "evolve_parameters", "backtest", "compute_signal", "signal_array",
+    "SEARCH_SPACE", "SLTP_SPACE", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",
     "normalize_params", "params_are_valid", "fold_bounds", "sma", "rsi", "atr",
 ]
