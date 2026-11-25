@@ -3,13 +3,14 @@ rem ==========================================================================
 rem  start_bot.bat - Lanzador del MT5 Bot (Windows)
 rem  1) Verifica Python 3.10+ (ofrece instalarlo con winget si falta)
 rem  2) Verifica pip y cada libreria; instala automaticamente las que falten
-rem  3) Verifica/abre MetaTrader 5   4) Abre el panel de configuracion
-rem  5) Lanza trading_bot.py con salida a logs\bot_YYYYMMDD_HHMMSS.log
+rem  3) Verifica/abre MetaTrader 5
+rem  4) Abre el CENTRO DE CONTROL (bot_gui.py): configurar, lanzar y ver resultados
 rem
 rem  Uso:
-rem    start_bot.bat                  flujo completo
-rem    start_bot.bat --dry-run        argumentos extra se pasan al bot
-rem    start_bot.bat --install-only   solo verifica/instala dependencias
+rem    start_bot.bat                      abre el Centro de control (recomendado)
+rem    start_bot.bat --install-only       solo verifica/instala dependencias
+rem    start_bot.bat --console            modo consola anterior: panel simple + bot
+rem    start_bot.bat --console --dry-run  modo consola sin enviar ordenes
 rem  Ruta de MT5 personalizada:  set MT5_PATH=D:\MT5\terminal64.exe
 rem ==========================================================================
 chcp 65001 >nul
@@ -23,7 +24,11 @@ if not defined MT5_PATH set "MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.e
 if not exist "logs" mkdir "logs"
 set "RC=0"
 set "INSTALL_ONLY=0"
+set "CONSOLE=0"
 if /I "%~1"=="--install-only" set "INSTALL_ONLY=1"
+if /I "%~1"=="--console" set "CONSOLE=1"
+set "BOTARGS=%*"
+if defined BOTARGS set "BOTARGS=%BOTARGS:--console=%"
 
 echo ==========================================================
 echo   MT5 Bot - lanzador  (framework educativo, usar en DEMO)
@@ -92,6 +97,7 @@ tasklist /FI "IMAGENAME eq terminal64.exe" 2>nul | find /I "terminal64.exe" >nul
 if errorlevel 1 goto :mt5_missing
 :mt5_ok
 echo [OK] MetaTrader 5 en ejecucion.
+if "%CONSOLE%"=="0" goto :gui
 
 rem ------------------------------------------------------ 4) Panel config
 echo [INFO] Abriendo panel de configuracion. Guarde y cierre la ventana para continuar.
@@ -103,9 +109,9 @@ set "TS="
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"`) do set "TS=%%i"
 if not defined TS set "TS=%RANDOM%"
 set "LOGFILE=logs\bot_%TS%.log"
-echo [INFO] Iniciando trading_bot.py %*
+echo [INFO] Iniciando trading_bot.py %BOTARGS%
 echo [INFO] Salida redirigida a "%LOGFILE%"  (Ctrl+C para detener)
-%PY% trading_bot.py %* > "%LOGFILE%" 2>&1
+%PY% trading_bot.py %BOTARGS% > "%LOGFILE%" 2>&1
 set "RC=%ERRORLEVEL%"
 echo [INFO] trading_bot.py finalizo con codigo %RC%. Revise "%LOGFILE%".
 if "%RC%"=="0" goto :end
@@ -113,6 +119,30 @@ if "%RC%"=="2" echo [ERROR] Configuracion invalida, simbolo inexistente o cuenta
 if "%RC%"=="2" echo         Busque la linea [ERROR] en "%LOGFILE%" (incluye sugerencias de simbolo).
 if "%RC%"=="3" echo [ERROR] No se pudo conectar con MetaTrader 5.
 if "%RC%"=="4" echo [ERROR] Los parametros evolucionados no superaron la validacion walk-forward.
+goto :end
+
+rem ------------------------------------------------- Centro de control
+:gui
+%PY% -c "import bot_gui" >nul 2>&1
+if errorlevel 1 goto :gui_fail
+rem  pythonw / pyw abren la ventana sin consola negra detras
+set "PYW=%PY%"
+if /I not "%PY%"=="python" goto :pyw_launcher
+where pythonw >nul 2>&1
+if not errorlevel 1 set "PYW=pythonw"
+goto :pyw_done
+:pyw_launcher
+where pyw >nul 2>&1
+if not errorlevel 1 set "PYW=pyw -3"
+:pyw_done
+echo [INFO] Abriendo el Centro de control...
+start "" %PYW% bot_gui.py
+endlocal & exit /b 0
+
+:gui_fail
+set "RC=1"
+echo [ERROR] No se pudo abrir el Centro de control. Detalle del error:
+%PY% -c "import bot_gui"
 goto :end
 
 rem ------------------------------------------------------------- errores

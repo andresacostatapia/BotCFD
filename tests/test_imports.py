@@ -43,3 +43,17 @@ def test_invalid_config_rejected(tmp_path) -> None:
     assert "min_lot" in str(exc.value) and "timeframe" in str(exc.value)
     with pytest.raises(ValueError):
         bot_common.save_config({"risk_percent": -1}, path)
+
+
+def test_profile_helpers(tmp_path) -> None:
+    from bot_common import config_path_for, list_profiles, profile_name, profile_paths
+
+    assert list_profiles(tmp_path) == []
+    bot_common.save_config({}, config_path_for("principal", tmp_path))
+    bot_common.save_config({"timeframe": "M5"}, config_path_for("m5", tmp_path))
+    (tmp_path / "risk_config_MAL NOMBRE.json").write_text("{}")
+    assert list_profiles(tmp_path) == ["principal", "m5"]
+    assert profile_name(tmp_path / "risk_config_m5.json") == "m5"
+    p = profile_paths(tmp_path / "risk_config_m5.json")
+    assert p.evolved.name == "evolved_params_m5.json" and p.log_file == "trading_bot_m5.log"
+    assert profile_paths(tmp_path / "risk_config.json").evolved.name == "evolved_params.json"

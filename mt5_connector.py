@@ -20,6 +20,7 @@ import difflib
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -323,6 +324,15 @@ def get_account_snapshot() -> AccountSnapshot | None:
     return AccountSnapshot(balance=float(info.balance), equity=float(info.equity))
 
 
+def count_positions_by_magics(magics: set[int]) -> int:
+    """Cuántas posiciones abiertas (de cualquier símbolo) tienen alguno de esos magic."""
+    m = _require_mt5()
+    positions = m.positions_get()
+    if positions is None:
+        return 0
+    return sum(1 for p in positions if p.magic in magics)
+
+
 def get_positions(symbol: str, magic: int) -> list[Any]:
     """Posiciones abiertas del símbolo que pertenecen al bot (mismo magic)."""
     m = _require_mt5()
@@ -330,6 +340,60 @@ def get_positions(symbol: str, magic: int) -> list[Any]:
     if positions is None:
         return []
     return [p for p in positions if p.magic == magic]
+
+
+def get_bot_deals(magic: int, days: int = 7, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Operaciones CERRADAS del bot (identificadas por magic) en los últimos ``days`` días.
+
+    Agrupa los deals por posición: la entrada debe llevar el magic del bot y la
+    salida puede ser manual, por SL o por TP. El resultado incluye comisión y swap.
+
+    :returns: lista de dicts (más reciente primero) con ticket, symbol, side,
+              volume, open_time, open_price, close_time, close_price, profit.
+    """
+    m = _require_mt5()
+    date_to = datetime.now() + timedelta(days=2)  # margen por la zona horaria del servidor
+    date_from = datetime.now() - timedelta(days=days)
+    deals = m.history_deals_get(date_from, date_to)
+    if not deals:
+        return []
+
+    entry_in = getattr(m, "DEAL_ENTRY_IN", 0)
+    exits = {getattr(m, "DEAL_ENTRY_OUT", 1), getattr(m, "DEAL_ENTRY_OUT_BY", 3)}
+    entries = {d.position_id: d for d in deals if d.magic == magic and d.entry == entry_in}
+    by_position: dict[int, list[Any]] = {}
+    for d in deals:
+        if d.position_id in entries:
+            by_position.setdefault(d.position_id, []).append(d)
+
+    def _fmt_time(ts: int) -> str:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    out: list[dict[str, Any]] = []
+    for pos_id, pos_deals in by_position.items():
+        closing = [d for d in pos_deals if d.entry in exits]
+        if not closing:
+            continue  # posición todavía abierta
+        entry = entries[pos_id]
+        last = max(closing, key=lambda d: d.time)
+        total = sum(float(d.profit) + float(d.commission) + float(d.swap) for d in pos_deals)
+        out.append({
+            "ticket": int(pos_id),
+            "symbol": entry.symbol,
+            "side": "BUY" if entry.type == getattr(m, "DEAL_TYPE_BUY", 0) else "SELL",
+            "volume": float(entry.volume),
+            "open_time": _fmt_time(entry.time),
+            "open_price": float(entry.price),
+            "close_time": _fmt_time(last.time),
+            "close_price": float(last.price),
+            "profit": round(total, 2),
+            "_sort": int(last.time),
+        })
+    out.sort(key=lambda r: r["_sort"], reverse=True)
+    for row in out:
+        row.pop("_sort")
+    return out[:limit]
 
 
 class MT5DataProvider:

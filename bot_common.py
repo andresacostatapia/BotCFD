@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
+from dataclasses import dataclass
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -31,6 +34,94 @@ EVOLVED_PARAMS_PATH: Path = BASE_DIR / "evolved_params.json"
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
+
+# ---------------------------------------------------------------------------
+# Perfiles (varias instancias del bot, cada una con su risk_config_<nombre>.json)
+# ---------------------------------------------------------------------------
+MAIN_PROFILE: str = "principal"
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+
+
+@dataclass(frozen=True)
+class ProfilePaths:
+    """Archivos asociados a un perfil (todos relativos a la carpeta de su configuración)."""
+
+    name: str
+    config: Path
+    evolved: Path      # resultado de la última evolución
+    history: Path      # historial de evoluciones (una línea JSON por ejecución)
+    status: Path       # estado en vivo que escribe el bot para el Centro de control
+    stop_flag: Path    # si existe, el bot se detiene de forma ordenada
+    log_file: str      # nombre del log rotativo dentro de logs/
+
+
+def profile_name(config_path: Path) -> str:
+    """'risk_config.json' -> 'principal'; 'risk_config_m5.json' -> 'm5'."""
+    stem = Path(config_path).stem
+    if stem == "risk_config":
+        return MAIN_PROFILE
+    if stem.startswith("risk_config_"):
+        return stem[len("risk_config_"):]
+    return stem
+
+
+def config_path_for(name: str, base_dir: Path | None = None) -> Path:
+    """Ruta del archivo de configuración de un perfil."""
+    base = base_dir or BASE_DIR
+    return base / ("risk_config.json" if name == MAIN_PROFILE else f"risk_config_{name}.json")
+
+
+def profile_paths(config_path: Path) -> ProfilePaths:
+    """Calcula los archivos de un perfil a partir de su archivo de configuración."""
+    config_path = Path(config_path)
+    name = profile_name(config_path)
+    suffix = "" if name == MAIN_PROFILE else f"_{name}"
+    logs = config_path.parent / "logs"
+    return ProfilePaths(
+        name=name,
+        config=config_path,
+        evolved=config_path.parent / f"evolved_params{suffix}.json",
+        history=logs / f"evolution_history_{name}.jsonl",
+        status=logs / f"status_{name}.json",
+        stop_flag=logs / f"stop_{name}.flag",
+        log_file=f"trading_bot{suffix}.log",
+    )
+
+
+def list_profiles(base_dir: Path | None = None) -> list[str]:
+    """Perfiles existentes: 'principal' primero y luego risk_config_*.json ordenados."""
+    base = base_dir or BASE_DIR
+    names = [MAIN_PROFILE] if (base / "risk_config.json").exists() else []
+    names += sorted(
+        profile_name(p) for p in base.glob("risk_config_*.json")
+        if PROFILE_NAME_RE.match(profile_name(p))
+    )
+    return names
+
+
+def write_json_atomic(path: Path, data: Any) -> bool:
+    """Escribe JSON de forma atómica. Devuelve False si falla (p. ej. archivo bloqueado)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except OSError:
+        return False
+
+
+def read_json(path: Path) -> Any | None:
+    """Lee un JSON; None si no existe o no se puede leer."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def now_iso() -> str:
+    """Fecha/hora local en formato ISO (segundos)."""
+    return datetime.now().isoformat(timespec="seconds")
 
 # ---------------------------------------------------------------------------
 # Configuración por defecto
@@ -71,6 +162,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
     "close_positions_on_error": False,
+    "max_open_positions_total": 3,    # máx. posiciones abiertas entre TODOS los perfiles (0 = sin límite)
     "terminal_path": "",              # ruta a terminal64.exe (opcional)
 }
 
@@ -140,6 +232,10 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     folds = config.get("fitness_folds")
     if isinstance(folds, bool) or not isinstance(folds, int) or not 1 <= folds <= 10:
         errors.append("'fitness_folds' debe ser un entero entre 1 y 10")
+
+    mot = config.get("max_open_positions_total")
+    if isinstance(mot, bool) or not isinstance(mot, int) or mot < 0:
+        errors.append("'max_open_positions_total' debe ser un entero >= 0 (0 = sin límite)")
 
     hb = config.get("heartbeat_seconds")
     if isinstance(hb, bool) or not isinstance(hb, int) or hb < 0:
@@ -233,9 +329,10 @@ def setup_logging(
 
     formatter = logging.Formatter(LOG_FORMAT)
 
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    root.addHandler(console)
+    if sys.stdout is not None:  # con pythonw.exe no hay consola
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
     file_handler = RotatingFileHandler(
         LOG_DIR / log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"

@@ -14,7 +14,8 @@ genética de parámetros, validación walk-forward y gestión de riesgo.
 
 ```
 C:\MT5Bot\
-├── config_panel.py          # GUI tkinter para configurar riesgos -> risk_config.json
+├── bot_gui.py               # CENTRO DE CONTROL: perfiles, configurar, lanzar, ver resultados
+├── config_panel.py          # GUI tkinter simple para configurar riesgos -> risk_config.json
 ├── risk_manager.py          # RiskManager (sin dependencia de MT5, testeable)
 ├── mt5_connector.py         # Conexión MT5 con reintentos + verificación DEMO + órdenes
 ├── strategy_evolver.py      # Evolución genética + backtest + walk-forward (sin MT5)
@@ -23,7 +24,7 @@ C:\MT5Bot\
 ├── requirements.txt
 ├── requirements-dev.txt     # Para ejecutar los tests (sin MetaTrader5)
 ├── risk_config.example.json # Todas las claves con sus valores por defecto
-├── start_bot.bat            # Lanzador CMD (instala dependencias automáticamente)
+├── start_bot.bat            # Lanzador: instala dependencias y abre el Centro de control
 ├── launch.ps1               # Lanzador PowerShell con log dual (instala dependencias)
 ├── tests\                   # pytest (incluye un MT5 falso para integración)
 └── logs\                    # Logs rotativos (se crea automáticamente)
@@ -151,13 +152,55 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 | `heartbeat_seconds` | 60 | Cada cuánto se muestra el mensaje "En espera" (precio, próxima vela, qué condición falta, P&L del día). `0` = desactivado |
 | `deviation` | 20 | Deslizamiento máximo en puntos |
 | `close_positions_on_error` | false | Fail-safe: cerrar posiciones del bot ante un error no controlado |
+| `max_open_positions_total` | 3 | Máximo de posiciones abiertas sumando **todos los perfiles** (0 = sin límite) |
 | `terminal_path` | "" | Ruta a `terminal64.exe` si hay varias instalaciones |
 
 ---
 
+## Centro de control (recomendado)
+
+Doble clic en **`start_bot.bat`**: instala lo que falte, abre MetaTrader 5 si no
+está abierto y muestra la ventana **MT5 Bot — Centro de control**
+(`python bot_gui.py` hace lo mismo sin el instalador).
+
+| Pestaña | Qué permite |
+|---|---|
+| **Panel** | Iniciar / detener el bot del perfil seleccionado, modo simulación, estado, cuenta (equity y resultado del día), mercado (bid/ask/spread), estrategia evolucionada, posición abierta, última vela y **log en vivo** con colores |
+| **Todos los símbolos** | Tabla con todos los perfiles a la vez: estado, posición, resultado y estrategia de cada uno. **Iniciar todos / Detener todos**. Doble clic en una fila abre su panel |
+| **Configuración** | Todos los parámetros (incluidos los avanzados) agrupados, con explicación al pasar el ratón, validación, **Probar conexión MT5** (comprueba símbolo y spread) y valores por defecto |
+| **Resultados** | Última evolución (aceptada/descartada y por qué), parámetros elegidos, métricas de entrenamiento vs. validación, tramos, **historial de evoluciones** y **operaciones cerradas** del bot con su resultado |
+
+### Perfiles y varios símbolos a la vez
+
+Cada **perfil** es un archivo `risk_config_<nombre>.json` (el principal es
+`risk_config.json`) con su propio símbolo, timeframe y **magic number**, su log
+(`logs/trading_bot_<nombre>.log`), su resultado de evolución
+(`evolved_params_<nombre>.json`) y su propio proceso del bot. Varios perfiles
+pueden funcionar **simultáneamente**.
+
+* **Varios símbolos…**: escriba por ejemplo `GBPUSD, USDJPY, US500`. Se crea un
+  perfil por símbolo copiando la configuración actual, con magic único; si MT5
+  está conectado, comprueba que cada símbolo exista (corrige `us500` → `US500`) y
+  ajusta su **spread máximo** a ~2,5× el spread actual de ese símbolo.
+* **Nuevo perfil…**: copia del perfil actual, por ejemplo para otro timeframe.
+* **Riesgo combinado:** cada perfil arriesga su `% por operación`. Dos límites se
+  aplican a **toda la cuenta**: `Pérdida diaria máxima` (todos se detienen juntos)
+  y `Máx. posiciones (todos)` = `max_open_positions_total` (por defecto 3): un bot
+  no abre si ya hay ese número de posiciones abiertas entre todos los perfiles.
+  Recuerde que pares como EURUSD y GBPUSD suelen moverse juntos.
+* **Detener:** la ventana crea `logs/stop_<perfil>.flag` y el bot termina de forma
+  ordenada en ~1 s (las posiciones abiertas se mantienen con su SL/TP). Al cerrar
+  la ventana se detienen todos los bots que lanzó.
+
 ## Instrucciones de uso
 
 ### Orden de ejecución
+
+**Con el Centro de control:** `start_bot.bat` → pestaña **Configuración** →
+**Probar conexión MT5** → **Guardar** → pestaña **Panel** → marque **Modo
+simulación** → **Iniciar bot**. Cuando todo se vea bien, desmarque la simulación.
+
+**Por consola** (modo anterior):
 
 1. Abrir MT5, iniciar sesión en **DEMO**, activar **Algo Trading**.
 2. `python config_panel.py` → ajustar valores → **Probar conexión MT5** →
@@ -168,9 +211,11 @@ conserva al guardar). Valores por defecto en `risk_config.example.json`.
 O todo en uno:
 
 ```bat
-start_bot.bat                 :: panel -> bot, salida en logs\bot_YYYYMMDD_HHMMSS.log
-start_bot.bat --dry-run       :: igual, sin enviar órdenes
-start_bot.bat --install-only  :: solo verifica/instala dependencias
+start_bot.bat                          :: Centro de control (recomendado)
+start_bot.bat --install-only           :: solo verifica/instala dependencias
+start_bot.bat --console                :: panel simple -> bot, log en logs\bot_*.log
+start_bot.bat --console --dry-run      :: igual, sin enviar órdenes
+python trading_bot.py --config risk_config_m5.json   :: un perfil concreto
 ```
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\launch.ps1            # consola + archivo
@@ -231,8 +276,10 @@ no DEMO · `3` conexión MT5 · `4` validación walk-forward no superada.
 3. **Métrica única (Profit Factor):** ignora drawdown, duración y estabilidad.
    → Optimización multiobjetivo (PF, drawdown, nº de operaciones) con NSGA-II,
    que `strategy-genome` ya soporta.
-4. **Una posición por símbolo y una sola estrategia de ejemplo** (cruce de SMA + RSI).
-   → Cartera multisímbolo con control de correlación y riesgo agregado.
+4. **Una sola estrategia de ejemplo** (cruce de SMA + RSI) y una posición por perfil.
+   Varios símbolos funcionan en paralelo (un perfil cada uno) con límite global de
+   posiciones, pero sin control de correlación entre ellos. → Estrategias de corto plazo
+   (reversión a la media, ruptura) y control de exposición por divisa.
 5. **El día de trading usa la hora local del PC** (reset a las 00:00 locales), no la
    hora del servidor del bróker. → Opción para usar la hora del servidor.
 6. **La pérdida diaria sólo detiene nuevas entradas**; no cierra las posiciones
@@ -241,7 +288,9 @@ no DEMO · `3` conexión MT5 · `4` validación walk-forward no superada.
 8. **Persistencia mínima:** el estado (balance de inicio del día) se recalcula al
    reiniciar, por lo que reiniciar el bot a mitad del día reinicia el contador de
    pérdida diaria. → Guardar estado diario en disco.
-9. **La GUI y los lanzadores sólo se han verificado de forma estática** (no hay
+9. **El Centro de control se ha probado en Linux con un MT5 simulado** (arranque,
+   log en vivo, parada, varios perfiles a la vez); en Windows con MT5 real falta
+   la prueba del usuario. Los lanzadores `.bat`/`.ps1` sólo se han revisado de forma estática (no hay
    Windows/MT5 en el entorno de desarrollo); la lógica sí está cubierta por tests
    con un MT5 simulado. → Probarlos en su equipo antes de confiar en ellos.
 

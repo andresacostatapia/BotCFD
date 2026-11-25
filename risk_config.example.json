@@ -29,5 +29,6 @@
     "heartbeat_seconds": 60,
     "deviation": 20,
     "close_positions_on_error": false,
+    "max_open_positions_total": 3,
     "terminal_path": ""
 }

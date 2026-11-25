@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -27,27 +28,69 @@ from pathlib import Path
 from typing import Any
 
 import mt5_connector as mt5c
-from bot_common import CONFIG_PATH, EVOLVED_PARAMS_PATH, load_config, setup_logging
+from bot_common import (
+    CONFIG_PATH, ProfilePaths, config_path_for, list_profiles, load_config, now_iso,
+    profile_paths, read_json, setup_logging, write_json_atomic,
+)
 from risk_manager import RiskManager
 from strategy_evolver import compute_signal, evolve_parameters
 
 logger = logging.getLogger("trading_bot")
 
 EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_CONNECTION, EXIT_VALIDATION = 0, 1, 2, 3, 4
+DEALS_REFRESH_SECONDS = 300
+
+
+class StatusFile:
+    """Estado en vivo del bot (JSON) que lee el Centro de control (bot_gui.py)."""
+
+    def __init__(self, paths: ProfilePaths, dry_run: bool) -> None:
+        """Prepara el archivo de estado del perfil."""
+        self.paths = paths
+        self.dry_run = dry_run
+        self.persistent: dict[str, Any] = {}
+
+    def write(self, phase: str, message: str = "", **extra: Any) -> None:
+        """
+        Escribe el estado. ``phase``: iniciando, conectando, evolucionando, operando,
+        detenido_perdida, sin_parametros, descartado, error o finalizado.
+        """
+        data = {
+            "profile": self.paths.name,
+            "pid": os.getpid(),
+            "dry_run": self.dry_run,
+            "updated": now_iso(),
+            **self.persistent,
+            "phase": phase,
+            "message": message,
+            **extra,
+        }
+        write_json_atomic(self.paths.status, data)
+
+
 
 
 class TradingBot:
     """Bot de trading: mantiene estado, parámetros evolucionados y el bucle principal."""
 
-    def __init__(self, config: dict[str, Any], config_path: Path, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        config_path: Path,
+        dry_run: bool = False,
+        status: StatusFile | None = None,
+    ) -> None:
         """
         :param config: configuración ya validada.
-        :param config_path: ruta de risk_config.json (para recarga en caliente).
+        :param config_path: ruta de risk_config*.json (para recarga en caliente).
         :param dry_run: si True, no se envían órdenes reales.
+        :param status: archivo de estado para el Centro de control (opcional).
         """
         self.config = config
         self.config_path = config_path
+        self.paths = profile_paths(config_path)
         self.dry_run = dry_run
+        self.status = status or StatusFile(self.paths, dry_run)
         self.config_mtime = config_path.stat().st_mtime
         self.risk = RiskManager(
             config["symbol"], int(config["magic"]), config, provider=mt5c.MT5DataProvider()
@@ -58,6 +101,12 @@ class TradingBot:
         self.logged_bar_time: Any = None    # última vela ya mostrada en el log
         self.last_heartbeat: float = 0.0    # time.monotonic() del último mensaje de espera
         self.halt_logged = False
+        self.last_message = "iniciando"
+        self.last_sig: dict[str, Any] | None = None
+        self.last_positions: list[Any] = []
+        self.last_tick: Any = None
+        self._deals: list[dict[str, Any]] = []
+        self._deals_time = 0.0
 
     # ---------------------------------------------------------------- evolución
     def evolve(self) -> bool:
@@ -91,19 +140,37 @@ class TradingBot:
         return True
 
     def _save_evolution(self, result: dict[str, Any]) -> None:
-        """Guarda el resultado de la evolución en evolved_params.json (auditoría)."""
+        """Guarda la evolución en evolved_params*.json y la añade al historial del perfil."""
         payload = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": now_iso(),
+            "profile": self.paths.name,
             "symbol": self.config["symbol"],
             "timeframe": self.config["timeframe"],
+            "history_bars": self.config["history_bars"],
             **result,
         }
+        if not write_json_atomic(self.paths.evolved, payload):
+            logger.error("No se pudo guardar %s", self.paths.evolved)
+
+        summary = {
+            "timestamp": payload["timestamp"],
+            "symbol": payload["symbol"],
+            "timeframe": payload["timeframe"],
+            "accepted": result.get("accepted"),
+            "reason": result.get("reason"),
+            "params": result.get("params"),
+            "pf_is": (result.get("in_sample") or {}).get("profit_factor"),
+            "trades_is": (result.get("in_sample") or {}).get("trades"),
+            "pf_oos": (result.get("out_of_sample") or {}).get("profit_factor"),
+            "trades_oos": (result.get("out_of_sample") or {}).get("trades"),
+        }
+        self.status.persistent["evolution"] = summary
         try:
-            EVOLVED_PARAMS_PATH.write_text(
-                json.dumps(payload, indent=4, ensure_ascii=False, default=str), encoding="utf-8"
-            )
+            self.paths.history.parent.mkdir(parents=True, exist_ok=True)
+            with self.paths.history.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(summary, ensure_ascii=False, default=str) + "\n")
         except OSError:
-            logger.exception("No se pudo guardar %s", EVOLVED_PARAMS_PATH)
+            logger.exception("No se pudo escribir el historial %s", self.paths.history)
 
     # --------------------------------------------------------- recarga en caliente
     def reload_config_if_changed(self) -> None:
@@ -167,6 +234,7 @@ class TradingBot:
     # ----------------------------------------------------------- mensajes
     def heartbeat(self, message: str) -> None:
         """Mensaje de espera periódico (cada ``heartbeat_seconds``; 0 = desactivado)."""
+        self.last_message = message
         every = float(self.config.get("heartbeat_seconds", 60))
         if every <= 0:
             return
@@ -257,6 +325,8 @@ class TradingBot:
         sig = compute_signal(df, self.params, int(cfg["atr_period"]))
         bar_time = sig["bar_time"]
         positions = mt5c.get_positions(symbol, magic)
+        self.last_sig = sig
+        self.last_positions = positions
         signal_txt = {1: "COMPRA", -1: "VENTA"}.get(sig["signal"], "ninguna")
 
         if bar_time != self.logged_bar_time:
@@ -289,6 +359,7 @@ class TradingBot:
                 return
 
         tick = mt5c.get_tick(symbol)
+        self.last_tick = tick
         price_txt = (f"{symbol} {tick.bid:.6g}/{tick.ask:.6g} spread {tick.ask - tick.bid:.6g}"
                      if tick is not None else f"{symbol} sin cotización")
         if not spread_ok:
@@ -321,6 +392,9 @@ class TradingBot:
             )
             return
 
+        if not self.portfolio_allows_new_trade():
+            return
+
         lot = self.risk.calculate_lot(sl_dist)
         if lot is None:
             logger.warning("SKIP: el RiskManager rechazó la operación: %s", self.risk.last_rejection)
@@ -346,6 +420,30 @@ class TradingBot:
             deviation=int(cfg["deviation"]), comment="MT5Bot evo",
         )
 
+    def portfolio_magics(self) -> set[int]:
+        """Magic numbers de TODOS los perfiles de la carpeta (para el límite global)."""
+        magics = {int(self.config["magic"])}
+        base = self.config_path.parent
+        for name in list_profiles(base):
+            cfg = read_json(config_path_for(name, base)) or {}
+            if isinstance(cfg.get("magic"), int):
+                magics.add(cfg["magic"])
+        return magics
+
+    def portfolio_allows_new_trade(self) -> bool:
+        """Respeta 'max_open_positions_total' sumando las posiciones de todos los perfiles."""
+        limit = int(self.config.get("max_open_positions_total", 0))
+        if limit <= 0:
+            return True
+        open_total = mt5c.count_positions_by_magics(self.portfolio_magics())
+        if open_total >= limit:
+            logger.warning(
+                "SKIP: límite global de posiciones alcanzado (%d abiertas entre todos los "
+                "perfiles, máximo %d).", open_total, limit,
+            )
+            return False
+        return True
+
     def run(self) -> None:
         """Bucle principal: una iteración cada ``loop_seconds``."""
         logger.info(
@@ -356,8 +454,73 @@ class TradingBot:
         while True:
             started = time.monotonic()
             self.step()
-            elapsed = time.monotonic() - started
-            time.sleep(max(1.0, float(self.config["loop_seconds"]) - elapsed))
+            self.publish_status()
+            # Espera en tramos de 1 s para reaccionar rápido a una parada solicitada.
+            deadline = started + max(1.0, float(self.config["loop_seconds"]))
+            while time.monotonic() < deadline:
+                if self.stop_requested():
+                    logger.info("Parada solicitada desde el Centro de control.")
+                    return
+                time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+
+    def stop_requested(self) -> bool:
+        """True si existe el archivo de parada del perfil (lo crea el Centro de control)."""
+        return self.paths.stop_flag.exists()
+
+    def publish_status(self) -> None:
+        """Escribe el estado en vivo para el Centro de control (nunca lanza excepciones)."""
+        try:
+            if self.risk.trading_halted:
+                phase = "detenido_perdida"
+            elif self.params is None:
+                phase = "sin_parametros"
+            else:
+                phase = "operando"
+            account = self.risk.provider.get_account() if self.risk.provider else None
+            now = time.monotonic()
+            if now - self._deals_time >= DEALS_REFRESH_SECONDS or not self._deals_time:
+                self._deals_time = now
+                try:
+                    self._deals = mt5c.get_bot_deals(int(self.config["magic"]))
+                except Exception:  # noqa: BLE001 - informativo
+                    logger.debug("No se pudo leer el historial de operaciones", exc_info=True)
+            sig = self.last_sig or {}
+            tick = self.last_tick
+            st = self.risk.status()
+            # Se conservan en el estado final (al detenerse) para que la ventana los siga mostrando.
+            if account is not None:
+                self.status.persistent["account"] = {"balance": account.balance, "equity": account.equity}
+            self.status.persistent["deals"] = self._deals
+            self.status.write(
+                phase,
+                self.last_message,
+                symbol=self.config["symbol"],
+                timeframe=self.config["timeframe"],
+                magic=int(self.config["magic"]),
+                params=self.params,
+                day_pnl_percent=-(st["daily_loss_percent"] or 0.0) + 0.0,
+                max_daily_loss_percent=st["max_daily_loss_percent"],
+                halt_reason=st["halt_reason"],
+                price={"bid": tick.bid, "ask": tick.ask} if tick is not None else None,
+                spread=st["last_spread"],
+                max_spread=st["max_spread"],
+                last_bar={
+                    "time": str(sig.get("bar_time", "")),
+                    "close": sig.get("close"), "fast_ma": sig.get("fast_ma"),
+                    "slow_ma": sig.get("slow_ma"), "rsi": sig.get("rsi"),
+                    "atr": sig.get("atr"), "signal": sig.get("signal"),
+                } if sig else None,
+                positions=[{
+                    "ticket": getattr(p, "ticket", None),
+                    "side": "BUY" if getattr(p, "type", 0) == 0 else "SELL",
+                    "volume": getattr(p, "volume", None),
+                    "price_open": getattr(p, "price_open", None),
+                    "sl": getattr(p, "sl", None), "tp": getattr(p, "tp", None),
+                    "profit": getattr(p, "profit", None),
+                } for p in self.last_positions],
+            )
+        except Exception:  # noqa: BLE001 - el estado nunca debe tumbar el bot
+            logger.debug("No se pudo publicar el estado", exc_info=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -371,18 +534,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Punto de entrada. Devuelve el código de salida."""
     args = parse_args(argv)
-    setup_logging("trading_bot.log")
+    paths = profile_paths(args.config)
+    setup_logging(paths.log_file)
+    status = StatusFile(paths, args.dry_run)
+    try:
+        paths.stop_flag.unlink(missing_ok=True)  # descartar una parada pendiente antigua
+    except OSError:
+        pass
     logger.info("=" * 70)
-    logger.info("Iniciando MT5 Bot%s", " [DRY-RUN]" if args.dry_run else "")
+    logger.info("Iniciando MT5 Bot (perfil '%s')%s", paths.name, " [DRY-RUN]" if args.dry_run else "")
+    status.write("iniciando", "cargando configuración")
 
     # 1) Configuración
     try:
         config = load_config(args.config)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         logger.error("%s", exc)
-        return EXIT_CONFIG
-    except ValueError as exc:
-        logger.error("%s", exc)
+        status.write("error", str(exc), exit_code=EXIT_CONFIG)
         return EXIT_CONFIG
     logger.info(
         "Configuración: %s %s | riesgo %g%% | historial %d velas | min_trades %d | tramos %d | %s",
@@ -391,38 +559,51 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     bot: TradingBot | None = None
+    exit_code = EXIT_ERROR
+    final_message = ""
     try:
+        status.write("conectando", "conectando con MetaTrader 5",
+                     symbol=config["symbol"], timeframe=config["timeframe"])
         # 2) Conexión (SystemExit si la cuenta no es demo y se exige demo)
         if not mt5c.connect_mt5_with_retry(
             require_demo=bool(config["require_demo"]),
             terminal_path=config.get("terminal_path") or None,
         ):
-            return EXIT_CONNECTION
+            exit_code, final_message = EXIT_CONNECTION, "no se pudo conectar con MetaTrader 5"
+            return exit_code
         if not mt5c.ensure_symbol(config["symbol"]):
-            return EXIT_CONFIG
+            exit_code, final_message = EXIT_CONFIG, f"símbolo '{config['symbol']}' no encontrado"
+            return exit_code
 
         # 3) RiskManager + reset diario
-        bot = TradingBot(config, args.config, dry_run=args.dry_run)
+        bot = TradingBot(config, args.config, dry_run=args.dry_run, status=status)
         if not bot.risk.reset_daily():
-            return EXIT_CONNECTION
+            exit_code, final_message = EXIT_CONNECTION, "no se pudo leer el balance de la cuenta"
+            return exit_code
 
         # 4-5) Evolución + validación walk-forward
+        status.write("evolucionando", "buscando y validando parámetros")
         if not bot.evolve():
+            reason = (bot.evolution or {}).get("reason", "sin datos")
             logger.error("Abortando: la validación walk-forward no fue superada. Ver %s",
-                         EVOLVED_PARAMS_PATH.name)
-            return EXIT_VALIDATION
+                         paths.evolved.name)
+            exit_code, final_message = EXIT_VALIDATION, f"parámetros descartados: {reason}"
+            return exit_code
 
-        # 6) Bucle principal
+        # 6) Bucle principal (termina con Ctrl+C o con la parada del Centro de control)
         bot.run()
-        return EXIT_OK  # pragma: no cover - run() es infinito
+        exit_code, final_message = EXIT_OK, "detenido por el usuario"
+        return exit_code
 
     except KeyboardInterrupt:
         logger.info("Ctrl+C recibido: deteniendo el bot de forma limpia.")
-        return EXIT_OK
+        exit_code, final_message = EXIT_OK, "detenido con Ctrl+C"
+        return exit_code
     except SystemExit as exc:
         logger.error("%s", exc)
-        return EXIT_CONFIG
-    except Exception:
+        exit_code, final_message = EXIT_CONFIG, str(exc)
+        return exit_code
+    except Exception as exc:
         logger.exception("Error no controlado en el bot (traceback completo arriba).")
         cfg = bot.config if bot is not None else config
         if cfg.get("close_positions_on_error"):
@@ -434,9 +615,16 @@ def main(argv: list[str] | None = None) -> int:
                 logger.exception("Fail-safe: error cerrando posiciones.")
         else:
             logger.warning("Fail-safe: las posiciones abiertas se mantienen (con su SL/TP).")
-        return EXIT_ERROR
+        exit_code, final_message = EXIT_ERROR, f"error inesperado: {exc}"
+        return exit_code
     finally:
         mt5c.safe_shutdown()
+        try:
+            paths.stop_flag.unlink(missing_ok=True)
+        except OSError:
+            pass
+        phase = {EXIT_OK: "finalizado", EXIT_VALIDATION: "descartado"}.get(exit_code, "error")
+        status.write(phase, final_message, exit_code=exit_code)
         logger.info("Bot finalizado.")
 
 

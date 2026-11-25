@@ -7,7 +7,8 @@ venv/
 
 # Datos locales del bot
 risk_config.json
-risk_config.json.tmp
-evolved_params.json
+risk_config_*.json
+*.json.tmp
+evolved_params*.json
 logs/*
 !logs/.gitkeep

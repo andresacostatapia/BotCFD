@@ -28,7 +28,6 @@ def fake(monkeypatch: pytest.MonkeyPatch, synthetic_ohlc: pd.DataFrame) -> FakeM
 def config_file(tmp_path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "risk_config.json"
     bot_common.save_config({"max_spread": 0.0005}, path)
-    monkeypatch.setattr(trading_bot, "EVOLVED_PARAMS_PATH", tmp_path / "evolved.json")
     return path
 
 
@@ -218,3 +217,69 @@ def test_live_order_uses_evolved_sl_tp(fake: FakeMT5, config_file) -> None:
     order = fake.orders[0]
     sl_dist, tp_dist = abs(order["price"] - order["sl"]), abs(order["tp"] - order["price"])
     assert sl_dist == pytest.approx(3 * tp_dist, abs=3e-5)  # precios redondeados a 5 decimales
+
+
+def test_status_file_and_history(fake: FakeMT5, config_file, monkeypatch) -> None:
+    import json
+
+    from bot_common import profile_paths, read_json
+
+    paths = profile_paths(config_file)
+    calls = {"n": 0}
+
+    def one_step_then_stop(self):
+        self.step()
+        self.publish_status()
+        calls["n"] += 1
+        status = read_json(paths.status)
+        assert status["phase"] in ("operando", "sin_parametros")
+        assert status["account"]["equity"] == 10_000.0
+        assert status["profile"] == "principal" and status["symbol"] == "EURUSD"
+
+    monkeypatch.setattr(trading_bot.TradingBot, "run", one_step_then_stop)
+    code = trading_bot.main(["--config", str(config_file), "--dry-run"])
+    final = read_json(paths.status)
+    assert final["exit_code"] == code
+    assert final["phase"] == ("finalizado" if code == 0 else "descartado")
+    assert "evolution" in final
+    lines = paths.history.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1 and "pf_oos" in json.loads(lines[0])
+    assert paths.evolved.exists()
+
+
+def test_stop_flag_ends_run_loop(fake: FakeMT5, config_file, monkeypatch) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=True)
+    bot.config["loop_seconds"] = 2
+    bot.paths.stop_flag.parent.mkdir(parents=True, exist_ok=True)
+    bot.paths.stop_flag.write_text("stop")
+    bot.run()  # debe volver en lugar de quedarse en bucle
+    assert bot.status.paths.status.exists()
+
+
+def test_bot_deals_grouped_by_position(fake: FakeMT5) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    mt5_connector.send_market_order("EURUSD", "buy", 0.1, 1.0, 2.0, 20250101)
+    mt5_connector.send_market_order("EURUSD", "sell", 0.2, 2.0, 1.0, 999)  # otro magic
+    assert mt5_connector.get_bot_deals(20250101) == []  # aún abierta
+    mt5_connector.close_all_positions("EURUSD", 20250101)
+    deals = mt5_connector.get_bot_deals(20250101)
+    assert len(deals) == 1
+    assert deals[0]["side"] == "BUY" and deals[0]["profit"] == pytest.approx(4.0)
+
+
+def test_global_position_limit_across_profiles(fake: FakeMT5, config_file) -> None:
+    # Otro perfil (magic 777) ya tiene 1 posición abierta en otro símbolo.
+    bot_common.save_config({"magic": 777, "symbol": "GBPUSD"},
+                           bot_common.config_path_for("gbpusd", config_file.parent))
+    fake.positions.append(__import__("types").SimpleNamespace(
+        ticket=50, symbol="GBPUSD", volume=0.1, magic=777, type=0))
+    bot_common.save_config({**bot_common.load_config(config_file), "max_open_positions_total": 1},
+                           config_file)
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    assert bot.portfolio_magics() == {20250101, 777}
+    bot.step()
+    assert fake.orders == []  # bloqueado por el límite global
+    bot.config["max_open_positions_total"] = 2
+    bot.last_bar_time = None
+    bot.step()
+    assert len(fake.orders) == 1
