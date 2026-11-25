@@ -4,7 +4,9 @@ bot_common.py
 Utilidades compartidas por todos los módulos del bot:
 
 * Rutas del proyecto (relativas a este archivo, sin hardcoding).
-* Configuración centralizada en ``risk_config.json`` (carga, validación, guardado).
+* Configuración por capas: valores por defecto <- ``global_config.json`` (común a
+  todos los símbolos) <- ``risk_config*.json`` (solo lo propio de cada símbolo:
+  símbolo, timeframe, estrategia, spread máximo, magic, activo y simulación).
 * Logging estructurado con archivo rotativo en ``logs/``.
 
 Este módulo NO tiene efectos secundarios al importarse: no crea carpetas,
@@ -31,10 +33,19 @@ CONFIG_PATH: Path = BASE_DIR / "risk_config.json"
 LOG_DIR: Path = BASE_DIR / "logs"
 EVOLVED_PARAMS_PATH: Path = BASE_DIR / "evolved_params.json"
 
+GLOBAL_CONFIG_NAME: str = "global_config.json"
+GLOBAL_CONFIG_PATH: Path = BASE_DIR / GLOBAL_CONFIG_NAME
+
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
 VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura")
+VALID_EXIT_MODES: tuple[str, ...] = ("ninguna", "breakeven", "trailing")
+
+#: Claves propias de cada símbolo/perfil. Todo lo demás es configuración general.
+PROFILE_KEYS: tuple[str, ...] = (
+    "symbol", "timeframe", "strategy", "max_spread", "magic", "enabled", "simulation",
+)
 
 # ---------------------------------------------------------------------------
 # Perfiles (varias instancias del bot, cada una con su risk_config_<nombre>.json)
@@ -127,8 +138,8 @@ def now_iso() -> str:
 # ---------------------------------------------------------------------------
 # Configuración por defecto
 # ---------------------------------------------------------------------------
-# Las claves "GUI" se editan desde config_panel.py; las "avanzadas" se pueden
-# editar a mano en risk_config.json y la GUI las conserva al guardar.
+# Las claves de PROFILE_KEYS van en cada risk_config*.json; el resto, en
+# global_config.json (Configuración general del Centro de control).
 DEFAULT_CONFIG: dict[str, Any] = {
     # --- Editables desde la GUI ---
     "risk_percent": 1.0,              # % del equity arriesgado por operación
@@ -140,6 +151,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "symbol": "EURUSD",
     "timeframe": "H1",
     "require_demo": True,
+    "enabled": True,                  # el perfil participa en "Iniciar activos"
+    "simulation": True,               # True = calcula todo pero NO envía órdenes
     # --- Avanzadas: evolución / backtest ---
     "history_bars": 2000,             # velas históricas para evolucionar
     "population": 20,
@@ -154,6 +167,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "oos_pf_ratio_min": 0.80,         # PF_oos debe ser >= 0.8 * PF_is
     "min_pf_in_sample": 1.0,          # PF in-sample mínimo aceptable
     "pf_cap": 10.0,                   # tope de PF (evita infinito sin pérdidas)
+    "validation_windows": 3,          # ventanas walk-forward (1 = un solo corte 70/30)
+    "min_pf_oos": 1.0,                # PF mínimo absoluto en validación
+    "regime_filter": True,            # filtro ADX evolucionado (tendencia vs rango)
+    "trading_hours": "",              # "" = 24 h; "10-19" = solo de 10 a 19 h del servidor
+    "exit_management": "ninguna",     # ninguna | breakeven | trailing
+    "be_atr_mult": 1.0,               # break-even al avanzar N x ATR (si no se evoluciona)
+    "trail_atr_mult": 2.0,            # distancia del trailing en ATR (si no se evoluciona)
+    "max_bars_in_trade": 0,           # cierre por tiempo tras N velas (0 = desactivado)
     # --- Avanzadas: ejecución ---
     "atr_period": 14,
     "sl_atr_mult": 1.5,
@@ -167,12 +188,129 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_open_positions_total": 3,    # máx. posiciones abiertas entre TODOS los perfiles (0 = sin límite)
     "daily_loss_scope": "bots",       # "bots" = solo operaciones de los bots | "cuenta" = equity de toda la cuenta
     "terminal_path": "",              # ruta a terminal64.exe (opcional)
+    # --- Seguimiento y avisos ---
+    "auto_disable_min_trades": 10,    # operaciones reales mínimas para evaluar rendimiento
+    "auto_disable_pf": 0.7,           # pausa el símbolo si su PF real < este valor (0 = nunca)
+    "reevolve_hours": 168,            # re-evolucionar cada N horas sin posición abierta (0 = nunca)
+    "telegram_token": "",             # opcional: avisos por Telegram
+    "telegram_chat_id": "",
+    "autostart_bots": False,          # el Centro de control inicia los perfiles activos al abrirse
+    "lab_workers": 0,                 # procesos del laboratorio (0 = automático)
 }
 
 
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
+def parse_hours(spec: str) -> tuple[int, int] | None:
+    """'10-19' -> (10, 19); '' -> None. Admite rangos que cruzan medianoche ('22-6')."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", spec or "")
+    if not m:
+        return None
+    start, end = int(m.group(1)), int(m.group(2))
+    if not (0 <= start <= 23 and 0 <= end <= 24) or start == end:
+        return None
+    return start, end
+
+
+def hour_allowed(hour: int, spec: str) -> bool:
+    """True si la hora (0-23) está dentro del horario ``spec`` (vacío = siempre)."""
+    rng = parse_hours(spec) if spec and spec.strip() else None
+    if rng is None:
+        return True
+    start, end = rng
+    return start <= hour < end if start < end else (hour >= start or hour < end)
+
+
+def global_config_path(profile_path: Path | None = None) -> Path:
+    """global_config.json de la carpeta del perfil."""
+    return (Path(profile_path).parent if profile_path else BASE_DIR) / GLOBAL_CONFIG_NAME
+
+
+def _read_dict(path: Path) -> dict[str, Any]:
+    """Lee un JSON que debe ser un objeto; ValueError si es inválido."""
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON inválido en {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} debe contener un objeto JSON")
+    return data
+
+
+def load_global_config(base_dir: Path | None = None) -> dict[str, Any]:
+    """Valores por defecto + global_config.json (sin las claves propias de cada símbolo)."""
+    path = (base_dir or BASE_DIR) / GLOBAL_CONFIG_NAME
+    data = {**DEFAULT_CONFIG, **(_read_dict(path) if path.exists() else {})}
+    return data
+
+
+def save_global_config(config: dict[str, Any], base_dir: Path | None = None) -> Path:
+    """Valida y guarda la configuración general (se ignoran las claves de PROFILE_KEYS)."""
+    path = (base_dir or BASE_DIR) / GLOBAL_CONFIG_NAME
+    shared = {k: v for k, v in {**DEFAULT_CONFIG, **config}.items() if k not in PROFILE_KEYS}
+    errors = validate_config({**DEFAULT_CONFIG, **shared})
+    if errors:
+        raise ValueError("Configuración inválida:\n  - " + "\n  - ".join(errors))
+    if not write_json_atomic(path, shared):
+        raise OSError(f"No se pudo escribir {path}")
+    return path
+
+
+def save_profile(data: dict[str, Any], path: Path) -> Path:
+    """Guarda SOLO las claves propias del símbolo (PROFILE_KEYS) en su risk_config*.json."""
+    path = Path(path)
+    own = {k: data[k] for k in PROFILE_KEYS if k in data}
+    merged = {**load_global_config(path.parent), **own}
+    errors = validate_config(merged)
+    if errors:
+        raise ValueError("Configuración inválida:\n  - " + "\n  - ".join(errors))
+    if not write_json_atomic(path, {k: merged[k] for k in PROFILE_KEYS}):
+        raise OSError(f"No se pudo escribir {path}")
+    return path
+
+
+def migrate_to_global(base_dir: Path | None = None) -> bool:
+    """
+    Pasa de perfiles "completos" al esquema general + por símbolo (una sola vez).
+
+    Si no existe global_config.json y hay perfiles: la configuración general se toma
+    del perfil principal (o del primero) y cada perfil se reescribe solo con sus
+    claves propias. Antes se copia todo a logs/backup_config_<fecha>/.
+    :returns: True si se migró algo.
+    """
+    base = base_dir or BASE_DIR
+    gpath = base / GLOBAL_CONFIG_NAME
+    if gpath.exists():
+        return False
+    names = list_profiles(base)
+    if not names:
+        return False
+    backup = base / "logs" / f"backup_config_{datetime.now():%Y%m%d_%H%M%S}"
+    backup.mkdir(parents=True, exist_ok=True)
+    raw: dict[str, dict[str, Any]] = {}
+    for name in names:
+        path = config_path_for(name, base)
+        try:
+            raw[name] = _read_dict(path)
+        except (OSError, ValueError):
+            raw[name] = {}
+        (backup / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    template = raw.get(MAIN_PROFILE) or raw[names[0]]
+    shared = {k: v for k, v in {**DEFAULT_CONFIG, **template}.items() if k not in PROFILE_KEYS}
+    if validate_config({**DEFAULT_CONFIG, **shared}):
+        shared = {k: v for k, v in DEFAULT_CONFIG.items() if k not in PROFILE_KEYS}
+    write_json_atomic(gpath, shared)
+    for name, data in raw.items():
+        own = {k: data[k] for k in PROFILE_KEYS if k in data}
+        merged = {**DEFAULT_CONFIG, **shared, **own}
+        if validate_config(merged):
+            merged = {**DEFAULT_CONFIG, **shared, **{k: v for k, v in own.items() if k in ("symbol", "magic")}}
+        write_json_atomic(config_path_for(name, base), {k: merged[k] for k in PROFILE_KEYS})
+    return True
+
+
 def validate_config(config: dict[str, Any]) -> list[str]:
     """Valida la configuración y devuelve una lista de errores (vacía si es válida)."""
     errors: list[str] = []
@@ -246,6 +384,40 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if isinstance(mot, bool) or not isinstance(mot, int) or mot < 0:
         errors.append("'max_open_positions_total' debe ser un entero >= 0 (0 = sin límite)")
 
+    for key in ("enabled", "simulation", "regime_filter", "autostart_bots"):
+        if not isinstance(config.get(key), bool):
+            errors.append(f"'{key}' debe ser true/false")
+
+    vw = config.get("validation_windows")
+    if isinstance(vw, bool) or not isinstance(vw, int) or not 1 <= vw <= 8:
+        errors.append("'validation_windows' debe ser un entero entre 1 y 8")
+
+    if config.get("exit_management") not in VALID_EXIT_MODES:
+        errors.append(f"'exit_management' debe ser uno de {VALID_EXIT_MODES}")
+
+    hours = config.get("trading_hours")
+    if not isinstance(hours, str) or (hours.strip() and parse_hours(hours) is None):
+        errors.append("'trading_hours' debe estar vacío (24 h) o tener la forma 'HH-HH', p. ej. '10-19'")
+
+    for key in ("max_bars_in_trade", "auto_disable_min_trades", "reevolve_hours", "lab_workers"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"'{key}' debe ser un entero >= 0")
+
+    for key in ("min_pf_oos", "auto_disable_pf"):
+        value = _num(key)
+        if value is not None and value < 0:
+            errors.append(f"'{key}' debe ser >= 0")
+
+    for key in ("be_atr_mult", "trail_atr_mult"):
+        value = _num(key)
+        if value is not None and value <= 0:
+            errors.append(f"'{key}' debe ser > 0")
+
+    for key in ("telegram_token", "telegram_chat_id"):
+        if not isinstance(config.get(key), str):
+            errors.append(f"'{key}' debe ser texto")
+
     hb = config.get("heartbeat_seconds")
     if isinstance(hb, bool) or not isinstance(hb, int) or hb < 0:
         errors.append("'heartbeat_seconds' debe ser un entero >= 0 (0 = desactivado)")
@@ -260,32 +432,25 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
 def load_config(path: Path | None = None, *, must_exist: bool = True) -> dict[str, Any]:
     """
-    Carga ``risk_config.json`` y lo combina con los valores por defecto.
+    Carga la configuración de un perfil por capas:
+    valores por defecto <- global_config.json <- risk_config*.json del perfil.
 
-    :param path: ruta del archivo (por defecto ``CONFIG_PATH``).
+    :param path: ruta del archivo del perfil (por defecto ``CONFIG_PATH``).
     :param must_exist: si es True y el archivo no existe, lanza FileNotFoundError;
-                       si es False devuelve una copia de ``DEFAULT_CONFIG``.
-    :raises ValueError: si el JSON es inválido o la configuración no valida.
+                       si es False devuelve la configuración general.
+    :raises ValueError: si algún JSON es inválido o la configuración no valida.
     """
-    path = path or CONFIG_PATH
+    path = Path(path or CONFIG_PATH)
+    base = load_global_config(path.parent)
     if not path.exists():
         if must_exist:
             raise FileNotFoundError(
                 f"No existe el archivo de configuración: {path}. "
-                "Ejecute primero config_panel.py y pulse 'Guardar configuración'."
+                "Ejecute primero el Centro de control (o config_panel.py) y guarde la configuración."
             )
-        return dict(DEFAULT_CONFIG)
+        return base
 
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            user_cfg = json.load(fh)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"JSON inválido en {path}: {exc}") from exc
-
-    if not isinstance(user_cfg, dict):
-        raise ValueError(f"{path} debe contener un objeto JSON")
-
-    config = {**DEFAULT_CONFIG, **user_cfg}
+    config = {**base, **_read_dict(path)}
     errors = validate_config(config)
     if errors:
         raise ValueError("Configuración inválida:\n  - " + "\n  - ".join(errors))
@@ -299,8 +464,8 @@ def save_config(config: dict[str, Any], path: Path | None = None) -> Path:
     :returns: la ruta escrita.
     :raises ValueError: si la configuración no es válida.
     """
-    path = path or CONFIG_PATH
-    merged = {**DEFAULT_CONFIG, **config}
+    path = Path(path or CONFIG_PATH)
+    merged = {**load_global_config(path.parent), **config}
     errors = validate_config(merged)
     if errors:
         raise ValueError("Configuración inválida:\n  - " + "\n  - ".join(errors))

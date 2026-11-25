@@ -29,8 +29,8 @@ from typing import Any
 
 import mt5_connector as mt5c
 from bot_common import (
-    CONFIG_PATH, ProfilePaths, config_path_for, list_profiles, load_config, now_iso,
-    profile_paths, read_json, setup_logging, write_json_atomic,
+    CONFIG_PATH, ProfilePaths, config_path_for, global_config_path, list_profiles, load_config,
+    now_iso, profile_paths, read_json, setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
 from strategy_evolver import compute_signal, evolve_parameters, warmup_bars
@@ -135,15 +135,16 @@ class TradingBot:
         """
         :param config: configuración ya validada.
         :param config_path: ruta de risk_config*.json (para recarga en caliente).
-        :param dry_run: si True, no se envían órdenes reales.
+        :param dry_run: si True, fuerza la simulación (no se envían órdenes) aunque
+                        el perfil tenga ``simulation = false``.
         :param status: archivo de estado para el Centro de control (opcional).
         """
         self.config = config
         self.config_path = config_path
         self.paths = profile_paths(config_path)
-        self.dry_run = dry_run
-        self.status = status or StatusFile(self.paths, dry_run)
-        self.config_mtime = config_path.stat().st_mtime
+        self.forced_dry_run = dry_run
+        self.status = status or StatusFile(self.paths, self.dry_run)
+        self.config_mtime = self._config_stamp()
         self.risk = RiskManager(
             config["symbol"], int(config["magic"]), config, provider=mt5c.MT5DataProvider()
         )
@@ -163,6 +164,11 @@ class TradingBot:
         self.login: int | None = None
         self.day_start_server_time: int | None = None
         self.bots_pnl: tuple[float, float] | None = None  # (cerrado hoy, flotante) si scope=bots
+
+    @property
+    def dry_run(self) -> bool:
+        """Simulación: forzada por --dry-run o por ``simulation`` del perfil (en caliente)."""
+        return self.forced_dry_run or bool(self.config.get("simulation", False))
 
     # ---------------------------------------------------------------- evolución
     def evolve(self) -> bool:
@@ -230,16 +236,25 @@ class TradingBot:
             logger.exception("No se pudo escribir el historial %s", self.paths.history)
 
     # --------------------------------------------------------- recarga en caliente
+    def _config_stamp(self) -> tuple[float, float]:
+        """Fechas de modificación del perfil y de la configuración general."""
+        stamps = []
+        for path in (self.config_path, global_config_path(self.config_path)):
+            try:
+                stamps.append(path.stat().st_mtime)
+            except OSError:
+                stamps.append(0.0)
+        return stamps[0], stamps[1]
+
     def reload_config_if_changed(self) -> None:
-        """Recarga risk_config.json si cambió en disco (sin reiniciar el bot)."""
-        try:
-            mtime = self.config_path.stat().st_mtime
-        except FileNotFoundError:
-            logger.warning("risk_config.json desapareció; se mantiene la configuración actual.")
+        """Recarga la configuración (perfil o general) si cambió en disco, sin reiniciar."""
+        if not self.config_path.exists():
+            logger.warning("%s desapareció; se mantiene la configuración actual.", self.config_path.name)
             return
-        if mtime == self.config_mtime:
+        stamp = self._config_stamp()
+        if stamp == self.config_mtime:
             return
-        self.config_mtime = mtime
+        self.config_mtime = stamp
 
         try:
             new_cfg = load_config(self.config_path)
@@ -250,6 +265,10 @@ class TradingBot:
         old = self.config
         self.config = new_cfg
         self.risk.update_config(new_cfg)
+        self.status.dry_run = self.dry_run
+        if bool(old.get("simulation")) != bool(new_cfg.get("simulation")) and not self.forced_dry_run:
+            logger.warning("Modo cambiado en caliente: %s",
+                           "SIMULACIÓN (no envía órdenes)" if self.dry_run else "ENVÍO DE ÓRDENES ACTIVADO")
         logger.info("Configuración recargada en caliente desde %s", self.config_path.name)
 
         if new_cfg["require_demo"] and not old["require_demo"]:
@@ -663,7 +682,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
     logger.info("=" * 70)
-    logger.info("Iniciando MT5 Bot (perfil '%s')%s", paths.name, " [DRY-RUN]" if args.dry_run else "")
+    logger.info("Iniciando MT5 Bot (perfil '%s')", paths.name)
     status.write("iniciando", "cargando configuración")
 
     # 1) Configuración
@@ -680,6 +699,10 @@ def main(argv: list[str] | None = None) -> int:
         config["history_bars"],
         config["min_trades"], config["fitness_folds"], args.config.name,
     )
+    simulated = args.dry_run or bool(config.get("simulation"))
+    status.dry_run = simulated
+    logger.info("Modo: %s", "SIMULACIÓN (calcula todo pero NO envía órdenes) [DRY-RUN]" if simulated
+                else "ENVÍO DE ÓRDENES ACTIVADO")
 
     bot: TradingBot | None = None
     exit_code = EXIT_ERROR

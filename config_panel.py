@@ -19,7 +19,10 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any
 
-from bot_common import CONFIG_PATH, DEFAULT_CONFIG, VALID_TIMEFRAMES, load_config, save_config, setup_logging
+from bot_common import (
+    BASE_DIR, CONFIG_PATH, DEFAULT_CONFIG, VALID_TIMEFRAMES, load_config, save_global_config,
+    save_profile, setup_logging,
+)
 
 logger = logging.getLogger("config_panel")
 
@@ -172,7 +175,9 @@ class ConfigPanel(tk.Tk):
         """Valida y guarda risk_config.json; muestra confirmación."""
         try:
             data = self.collect()
-            path = save_config(data, CONFIG_PATH)
+            # Lo común va a global_config.json y lo propio del símbolo a risk_config.json.
+            save_global_config(data, BASE_DIR)
+            path = save_profile(data, CONFIG_PATH)
         except ValueError as exc:
             self.set_status(f"Error: {exc}", COLOR_ERR)
             messagebox.showerror("Configuración inválida", str(exc), parent=self)

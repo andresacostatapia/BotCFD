@@ -27,7 +27,7 @@ def fake(monkeypatch: pytest.MonkeyPatch, synthetic_ohlc: pd.DataFrame) -> FakeM
 @pytest.fixture
 def config_file(tmp_path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "risk_config.json"
-    bot_common.save_config({"max_spread": 0.0005}, path)
+    bot_common.save_config({"max_spread": 0.0005, "simulation": False}, path)
     return path
 
 
@@ -123,7 +123,7 @@ def test_hot_reload(fake: FakeMT5, config_file) -> None:
     import os
     bot = _bot_at_signal(fake, config_file, dry_run=True)
     bot_common.save_config({**bot.config, "risk_percent": 0.5}, config_file)
-    os.utime(config_file, (bot.config_mtime + 5, bot.config_mtime + 5))
+    os.utime(config_file, (bot.config_mtime[0] + 5, bot.config_mtime[0] + 5))
     bot.reload_config_if_changed()
     assert bot.risk.risk_percent == 0.5
 
