@@ -414,16 +414,19 @@ def get_positions(symbol: str, magic: int) -> list[Any]:
     return [p for p in positions if p.magic == magic]
 
 
-def get_bot_deals(magic: int, days: int = 7, limit: int = 50) -> list[dict[str, Any]]:
+def get_bot_deals(magic: int | set[int], days: int = 7, limit: int | None = 50) -> list[dict[str, Any]]:
     """
-    Operaciones CERRADAS del bot (identificadas por magic) en los últimos ``days`` días.
+    Operaciones CERRADAS del bot (identificadas por su magic o un conjunto de magics)
+    en los últimos ``days`` días.
 
     Agrupa los deals por posición: la entrada debe llevar el magic del bot y la
     salida puede ser manual, por SL o por TP. El resultado incluye comisión y swap.
 
-    :returns: lista de dicts (más reciente primero) con ticket, symbol, side,
-              volume, open_time, open_price, close_time, close_price, profit.
+    :returns: lista de dicts (más reciente primero) con ticket, magic, symbol, side,
+              volume, open_time, open_price, close_time, close_price, profit y
+              open_ts / close_ts (epoch en hora del servidor).
     """
+    magics = {magic} if isinstance(magic, int) else set(magic)
     m = _require_mt5()
     date_to = datetime.now() + timedelta(days=2)  # margen por la zona horaria del servidor
     date_from = datetime.now() - timedelta(days=days)
@@ -433,7 +436,7 @@ def get_bot_deals(magic: int, days: int = 7, limit: int = 50) -> list[dict[str, 
 
     entry_in = getattr(m, "DEAL_ENTRY_IN", 0)
     exits = {getattr(m, "DEAL_ENTRY_OUT", 1), getattr(m, "DEAL_ENTRY_OUT_BY", 3)}
-    entries = {d.position_id: d for d in deals if d.magic == magic and d.entry == entry_in}
+    entries = {d.position_id: d for d in deals if d.magic in magics and d.entry == entry_in}
     by_position: dict[int, list[Any]] = {}
     for d in deals:
         if d.position_id in entries:
@@ -452,6 +455,9 @@ def get_bot_deals(magic: int, days: int = 7, limit: int = 50) -> list[dict[str, 
         total = sum(float(d.profit) + float(d.commission) + float(d.swap) for d in pos_deals)
         out.append({
             "ticket": int(pos_id),
+            "magic": int(entry.magic),
+            "open_ts": int(entry.time),
+            "close_ts": int(last.time),
             "symbol": entry.symbol,
             "side": "BUY" if entry.type == getattr(m, "DEAL_TYPE_BUY", 0) else "SELL",
             "volume": float(entry.volume),
@@ -465,7 +471,58 @@ def get_bot_deals(magic: int, days: int = 7, limit: int = 50) -> list[dict[str, 
     out.sort(key=lambda r: r["_sort"], reverse=True)
     for row in out:
         row.pop("_sort")
-    return out[:limit]
+    return out if limit is None else out[:limit]
+
+
+def get_position_result(ticket: int) -> float | None:
+    """Resultado total (beneficio + comisión + swap) de una posición ya cerrada."""
+    m = _require_mt5()
+    try:
+        deals = m.history_deals_get(position=int(ticket))
+    except TypeError:  # versiones antiguas sin el argumento 'position'
+        deals = None
+    if not deals:
+        return None
+    exits = {getattr(m, "DEAL_ENTRY_OUT", 1), getattr(m, "DEAL_ENTRY_OUT_BY", 3)}
+    if not any(d.entry in exits for d in deals):
+        return None
+    return round(sum(float(d.profit) + float(d.commission) + float(d.swap) for d in deals), 2)
+
+
+def modify_position_sl(position: Any, new_sl: float) -> bool:
+    """Mueve el stop loss de una posición (mantiene su take profit)."""
+    m = _require_mt5()
+    request: dict[str, Any] = {
+        "action": m.TRADE_ACTION_SLTP,
+        "symbol": position.symbol,
+        "position": int(position.ticket),
+        "sl": _round_price(position.symbol, new_sl),
+        "tp": float(getattr(position, "tp", 0.0) or 0.0),
+        "magic": int(position.magic),
+    }
+    result = m.order_send(request)
+    if result is not None and result.retcode in SUCCESS_RETCODES:
+        logger.info("SL de #%s movido a %.6g", position.ticket, request["sl"])
+        return True
+    logger.warning("No se pudo mover el SL de #%s: %s", position.ticket,
+                   result.comment if result is not None else m.last_error())
+    return False
+
+
+def close_positions_by_magics(magics: set[int], deviation: int = 20) -> tuple[int, int]:
+    """
+    Cierre de emergencia: cierra TODAS las posiciones abiertas con esos magics
+    (en cualquier símbolo). Devuelve (cerradas, fallidas).
+    """
+    m = _require_mt5()
+    closed = failed = 0
+    for pos in m.positions_get() or ():
+        if pos.magic in magics:
+            if close_position(pos, deviation):
+                closed += 1
+            else:
+                failed += 1
+    return closed, failed
 
 
 class MT5DataProvider:

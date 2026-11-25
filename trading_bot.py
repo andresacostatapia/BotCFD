@@ -22,15 +22,18 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import mt5_connector as mt5c
 from bot_common import (
-    CONFIG_PATH, ProfilePaths, config_path_for, global_config_path, list_profiles, load_config,
-    now_iso, profile_paths, read_json, setup_logging, write_json_atomic,
+    CONFIG_PATH, ProfilePaths, config_path_for, global_config_path, hour_allowed, list_profiles,
+    load_config, now_iso, profile_paths, read_json, setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
 from strategy_evolver import compute_signal, evolve_parameters, warmup_bars
@@ -122,6 +125,57 @@ class DayState:
         write_json_atomic(self.path, data)
 
 
+class Notifier:
+    """Avisos opcionales por Telegram (si hay token y chat_id). Nunca bloquea ni falla."""
+
+    def __init__(self, get_config: Any, prefix: Any) -> None:
+        self._get_config = get_config
+        self._prefix = prefix
+
+    def send(self, text: str) -> None:
+        """Envía el aviso en segundo plano."""
+        cfg = self._get_config()
+        token, chat = str(cfg.get("telegram_token") or ""), str(cfg.get("telegram_chat_id") or "")
+        if not token or not chat:
+            return
+        message = f"{self._prefix()} {text}"
+
+        def _post() -> None:
+            try:
+                data = urllib.parse.urlencode({"chat_id": chat, "text": message}).encode()
+                req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+                with urllib.request.urlopen(req, timeout=10):  # noqa: S310 - URL fija de Telegram
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("No se pudo enviar el aviso de Telegram: %s", exc)
+
+        threading.Thread(target=_post, daemon=True).start()
+
+
+class TradeRegistry:
+    """Datos de cada posición abierta por el bot (ATR de entrada y mejor precio) en disco."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _load(self) -> dict[str, Any]:
+        data = read_json(self.path)
+        return data if isinstance(data, dict) else {}
+
+    def get(self, ticket: int) -> dict[str, Any]:
+        return dict(self._load().get(str(ticket)) or {})
+
+    def set(self, ticket: int, record: dict[str, Any]) -> None:
+        data = self._load()
+        data[str(ticket)] = record
+        write_json_atomic(self.path, data)
+
+    def remove(self, ticket: int) -> None:
+        data = self._load()
+        if data.pop(str(ticket), None) is not None:
+            write_json_atomic(self.path, data)
+
+
 class TradingBot:
     """Bot de trading: mantiene estado, parámetros evolucionados y el bucle principal."""
 
@@ -164,6 +218,18 @@ class TradingBot:
         self.login: int | None = None
         self.day_start_server_time: int | None = None
         self.bots_pnl: tuple[float, float] | None = None  # (cerrado hoy, flotante) si scope=bots
+        self.registry = TradeRegistry(config_path.parent / "logs" / f"trades_{self.paths.name}.json")
+        self.notifier = Notifier(lambda: self.config, self._notify_prefix)
+        self.known_tickets: set[int] | None = None
+        self.paused_reason = ""
+        self.params_since_ts: int = 0          # hora servidor desde la que rigen los parámetros
+        self.last_evolution_mono: float = time.monotonic()
+        self.last_evolution_iso: str = ""
+        self.halt_notified = False
+
+    def _notify_prefix(self) -> str:
+        sim = " SIM" if self.dry_run else ""
+        return f"[MT5Bot {self.paths.name} {self.config['symbol']} {self.config['timeframe']}{sim}]"
 
     @property
     def dry_run(self) -> bool:
@@ -188,6 +254,10 @@ class TradingBot:
         )
         self.evolution = result
         self._save_evolution(result)
+        self.last_evolution_mono = time.monotonic()
+        self.last_evolution_iso = now_iso()
+        self.params_since_ts = mt5c.get_server_time(cfg["symbol"]) or int(time.time())
+        self.paused_reason = ""  # parámetros nuevos: se vuelve a evaluar el rendimiento desde cero
         if not result["accepted"]:
             logger.error("Parámetros DESCARTADOS por la validación: %s", result["reason"])
             self.params = None
@@ -437,16 +507,22 @@ class TradingBot:
         cfg = self.config
         symbol, magic = cfg["symbol"], int(cfg["magic"])
 
-        if not self.check_daily_loss():
-            if not self.halt_logged:
-                logger.error("Trading detenido hasta el próximo día: %s",
-                             self.risk.halt_reason or self.risk.last_rejection)
-                self.halt_logged = True
-            self.heartbeat(f"trading detenido por pérdida diaria | {self._day_text()}")
-            return
+        positions = mt5c.get_positions(symbol, magic)
+        self.last_positions = positions
+        self.track_closed_positions(positions)
 
+        halted = not self.check_daily_loss()
+        if halted and not self.halt_logged:
+            logger.error("Trading detenido hasta el próximo día: %s",
+                         self.risk.halt_reason or self.risk.last_rejection)
+            self.halt_logged = True
+            self.notifier.send(f"TRADING DETENIDO por pérdida diaria: {self.risk.halt_reason}")
+
+        self.maybe_reevolve(positions)
         if self.params is None:
-            self.heartbeat("sin parámetros válidos: el bot no abre operaciones")
+            hours = int(cfg.get("reevolve_hours", 0) or 0)
+            retry = f"; se reintentará en la re-evolución periódica ({hours} h)" if hours else ""
+            self.heartbeat(f"sin parámetros válidos: el bot no abre operaciones{retry}")
             return
 
         spread_ok = self.risk.check_spread()
@@ -460,9 +536,11 @@ class TradingBot:
 
         sig = compute_signal(df, self.params, int(cfg["atr_period"]))
         bar_time = sig["bar_time"]
-        positions = mt5c.get_positions(symbol, magic)
         self.last_sig = sig
-        self.last_positions = positions
+        tick = mt5c.get_tick(symbol)
+        self.last_tick = tick
+        if positions:
+            self.manage_positions(positions, sig, tick)
         signal_txt = {1: "COMPRA", -1: "VENTA"}.get(sig["signal"], "ninguna")
 
         if bar_time != self.logged_bar_time:
@@ -476,6 +554,14 @@ class TradingBot:
             )
             self.last_heartbeat = time.monotonic()  # el mensaje de vela cuenta como latido
 
+        if halted:
+            self.heartbeat(f"trading detenido por pérdida diaria | {self._day_text()}")
+            return
+        if self.paused_reason:
+            self.heartbeat(f"PAUSADO por rendimiento ({self.paused_reason}) | {self._day_text()}")
+            return
+        session_open = self.session_open_for(bar_time)
+
         if bar_time != self.last_bar_time:
             if sig["signal"] == 0:
                 self.last_bar_time = bar_time
@@ -483,6 +569,10 @@ class TradingBot:
                 self.last_bar_time = bar_time
                 logger.info("Señal de %s ignorada: ya hay %d posición(es) con magic %d.",
                             signal_txt, len(positions), magic)
+            elif not session_open:
+                self.last_bar_time = bar_time
+                logger.info("Señal de %s ignorada: fuera del horario de operación (%s, hora servidor).",
+                            signal_txt, cfg.get("trading_hours"))
             elif not spread_ok:
                 # No se marca la vela: se reintenta en el próximo ciclo si el spread baja.
                 self.heartbeat(f"señal de {signal_txt} pendiente: spread "
@@ -494,14 +584,14 @@ class TradingBot:
                 self.last_heartbeat = time.monotonic()
                 return
 
-        tick = mt5c.get_tick(symbol)
-        self.last_tick = tick
         price_txt = (f"{symbol} {tick.bid:.6g}/{tick.ask:.6g} spread {tick.ask - tick.bid:.6g}"
                      if tick is not None else f"{symbol} sin cotización")
         if not spread_ok:
             state = f"spread alto (máx {self.risk.max_spread:.6g}): no se abrirán operaciones"
         elif positions:
             state = self._positions_text(positions)
+        elif not session_open:
+            state = f"fuera del horario de operación ({cfg.get('trading_hours')} h servidor)"
         else:
             state = self._waiting_text(sig)
         self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
@@ -549,12 +639,137 @@ class TradingBot:
                 "[DRY-RUN] %s %.2f %s @ %.5f | SL %.5f | TP %.5f (no se envía)",
                 side.upper(), lot, symbol, price, sl, tp,
             )
+            self.notifier.send(f"Señal {side.upper()} {lot:.2f} @ {price:.6g} (simulación, no se envía)")
             return
 
-        mt5c.send_market_order(
+        result = mt5c.send_market_order(
             symbol, side, lot, sl, tp, int(cfg["magic"]),
             deviation=int(cfg["deviation"]), comment="MT5Bot evo",
         )
+        if result is not None:
+            ticket = int(getattr(result, "order", 0) or 0)
+            if ticket:
+                self.registry.set(ticket, {"atr": atr_value, "entry": price, "best": price,
+                                           "side": 1 if side == "buy" else -1, "opened": now_iso()})
+            self.notifier.send(f"ORDEN {side.upper()} {lot:.2f} @ {price:.6g} | SL {sl:.6g} | TP {tp:.6g}")
+
+    # ------------------------------------------------------------ horario
+    def session_open_for(self, bar_time: Any) -> bool:
+        """¿La vela en curso (la siguiente a ``bar_time``) está dentro del horario?"""
+        spec = str(self.config.get("trading_hours") or "")
+        if not spec.strip() or not hasattr(bar_time, "hour"):
+            return True
+        nxt = bar_time + timedelta(seconds=mt5c.timeframe_seconds(self.config["timeframe"]))
+        return hour_allowed(int(nxt.hour), spec)
+
+    # ------------------------------------------------- gestión de posiciones
+    def manage_positions(self, positions: list[Any], sig: dict[str, Any], tick: Any) -> None:
+        """Break-even, trailing y cierre por tiempo sobre las posiciones abiertas del bot."""
+        cfg = self.config
+        mode = str(cfg.get("exit_management", "ninguna"))
+        max_bars = int(cfg.get("max_bars_in_trade", 0) or 0)
+        if mode == "ninguna" and not max_bars:
+            return
+        params = self.params or {}
+        tf_sec = mt5c.timeframe_seconds(cfg["timeframe"])
+        server_now = int(tick.time) if tick is not None and getattr(tick, "time", 0) else None
+        spec = mt5c.get_symbol_spec(cfg["symbol"])
+        step = spec.tick_size if spec else 0.0
+        min_stop = mt5c.get_min_stop_distance(cfg["symbol"])
+        for pos in positions:
+            side = 1 if getattr(pos, "type", 0) == 0 else -1
+            rec = self.registry.get(pos.ticket)
+            atr_e = float(rec.get("atr") or sig.get("atr") or 0.0)
+            opened = int(getattr(pos, "time", 0) or 0)
+            if max_bars and server_now and opened and (server_now - opened) // tf_sec >= max_bars:
+                if self.dry_run:
+                    logger.info("[DRY-RUN] cerraría #%s por tiempo (%d velas)", pos.ticket, max_bars)
+                else:
+                    logger.info("Cierre por tiempo de #%s (%d velas abiertas).", pos.ticket, max_bars)
+                    mt5c.close_position(pos, int(cfg["deviation"]))
+                continue
+            if tick is None or atr_e <= 0 or mode == "ninguna":
+                continue
+            price = tick.bid if side == 1 else tick.ask
+            entry = float(pos.price_open)
+            best = float(rec.get("best", entry))
+            best = max(best, price) if side == 1 else min(best, price)
+            if best != rec.get("best"):
+                rec.setdefault("atr", atr_e)
+                rec["best"] = best
+                self.registry.set(pos.ticket, rec)
+            target = None
+            if mode == "breakeven":
+                be = float(params.get("be_mult", cfg["be_atr_mult"]))
+                if (best - entry) * side >= be * atr_e:
+                    target = entry
+            elif mode == "trailing":
+                trail = float(params.get("trail_mult", cfg["trail_atr_mult"]))
+                target = best - side * trail * atr_e
+            if target is None:
+                continue
+            current = float(getattr(pos, "sl", 0.0) or 0.0)
+            improves = current == 0.0 or (target - current) * side > max(step, 1e-12)
+            room = (price - target) * side >= max(min_stop, step)
+            if improves and room:
+                if self.dry_run:
+                    logger.info("[DRY-RUN] movería el SL de #%s a %.6g (%s)", pos.ticket, target, mode)
+                else:
+                    mt5c.modify_position_sl(pos, target)
+
+    def track_closed_positions(self, positions: list[Any]) -> None:
+        """Detecta posiciones cerradas desde la última revisión (por SL, TP o a mano)."""
+        current = {int(p.ticket) for p in positions}
+        if self.known_tickets is None:
+            self.known_tickets = current
+            return
+        closed = self.known_tickets - current
+        self.known_tickets = current
+        for ticket in closed:
+            result = mt5c.get_position_result(ticket)
+            txt = f"{result:+.2f}" if result is not None else "desconocido"
+            logger.info("Posición cerrada #%s (%s): resultado %s", ticket, self.config["symbol"], txt)
+            self.notifier.send(f"Posición cerrada #{ticket}: resultado {txt}")
+            self.registry.remove(ticket)
+        if closed:
+            self.evaluate_performance()
+
+    def evaluate_performance(self) -> None:
+        """Pausa el símbolo si su rendimiento REAL con los parámetros actuales es malo."""
+        threshold = float(self.config.get("auto_disable_pf", 0) or 0)
+        needed = int(self.config.get("auto_disable_min_trades", 0) or 0)
+        if threshold <= 0 or needed <= 0:
+            return
+        try:
+            trades = mt5c.get_bot_deals(int(self.config["magic"]), days=120, limit=None)
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo evaluar el rendimiento real")
+            return
+        recent = [t for t in trades if int(t.get("open_ts", 0)) >= self.params_since_ts]
+        if len(recent) < needed:
+            return
+        sample = recent[: max(needed, 20)]
+        gains = sum(t["profit"] for t in sample if t["profit"] > 0)
+        losses = -sum(t["profit"] for t in sample if t["profit"] <= 0)
+        pf = gains / losses if losses > 0 else float("inf")
+        if pf < threshold and not self.paused_reason:
+            self.paused_reason = (f"rendimiento real bajo: PF {pf:.2f} en las últimas {len(sample)} "
+                                  f"operaciones (mínimo {threshold:g})")
+            logger.error("PAUSADO por rendimiento: %s. No abrirá nuevas operaciones hasta la "
+                         "próxima re-evolución.", self.paused_reason)
+            self.notifier.send(f"PAUSADO por rendimiento: {self.paused_reason}")
+
+    def maybe_reevolve(self, positions: list[Any]) -> None:
+        """Re-evolución periódica (cada ``reevolve_hours``) cuando no hay posición abierta."""
+        hours = int(self.config.get("reevolve_hours", 0) or 0)
+        if hours <= 0 or positions:
+            return
+        if time.monotonic() - self.last_evolution_mono < hours * 3600:
+            return
+        logger.info("Re-evolución periódica (cada %d h)…", hours)
+        ok = self.evolve()
+        self.notifier.send("Re-evolución: parámetros " + ("ACEPTADOS" if ok else
+                           f"DESCARTADOS ({(self.evolution or {}).get('reason', '')})"))
 
     def portfolio_magics(self) -> set[int]:
         """Magic numbers de TODOS los perfiles de la carpeta (para el límite global)."""
@@ -608,6 +823,8 @@ class TradingBot:
         try:
             if self.risk.trading_halted:
                 phase = "detenido_perdida"
+            elif self.paused_reason:
+                phase = "pausado_rendimiento"
             elif self.params is None:
                 phase = "sin_parametros"
             else:
@@ -640,6 +857,9 @@ class TradingBot:
                 bots_pnl=({"realized": self.bots_pnl[0], "floating": self.bots_pnl[1]}
                           if self.bots_pnl else None),
                 halt_reason=st["halt_reason"],
+                paused_reason=self.paused_reason,
+                last_evolution=self.last_evolution_iso,
+                dry_run=self.dry_run,
                 price={"bid": tick.bid, "ask": tick.ask} if tick is not None else None,
                 spread=st["last_spread"],
                 max_spread=st["max_spread"],
@@ -731,11 +951,16 @@ def main(argv: list[str] | None = None) -> int:
         status.write("evolucionando", "buscando y validando parámetros")
         if not bot.evolve():
             reason = (bot.evolution or {}).get("reason", "sin datos")
+            bot.notifier.send(f"Parámetros DESCARTADOS, el bot no opera: {reason}")
             logger.error("Abortando: la validación walk-forward no fue superada. Ver %s",
                          paths.evolved.name)
             exit_code, final_message = EXIT_VALIDATION, f"parámetros descartados: {reason}"
             return exit_code
 
+        ev = bot.evolution or {}
+        bot.notifier.send(
+            f"Bot iniciado ({'simulación' if bot.dry_run else 'ÓRDENES REALES'}). Parámetros aceptados: "
+            f"PF validación {(ev.get('out_of_sample') or {}).get('profit_factor', 0):.2f}")
         # 6) Bucle principal (termina con Ctrl+C o con la parada del Centro de control)
         bot.run()
         exit_code, final_message = EXIT_OK, "detenido por el usuario"
@@ -762,6 +987,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             logger.warning("Fail-safe: las posiciones abiertas se mantienen (con su SL/TP).")
         exit_code, final_message = EXIT_ERROR, f"error inesperado: {exc}"
+        if bot is not None:
+            bot.notifier.send(f"ERROR: el bot se detuvo ({exc})")
         return exit_code
     finally:
         mt5c.safe_shutdown()

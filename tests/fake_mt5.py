@@ -11,6 +11,7 @@ import pandas as pd
 TIMEFRAME_M1, TIMEFRAME_M5, TIMEFRAME_M15, TIMEFRAME_H1, TIMEFRAME_H4 = 1, 5, 15, 16385, 16388
 ACCOUNT_TRADE_MODE_DEMO, ACCOUNT_TRADE_MODE_CONTEST, ACCOUNT_TRADE_MODE_REAL = 0, 1, 2
 TRADE_ACTION_DEAL = 1
+TRADE_ACTION_SLTP = 6
 ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
 POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
 ORDER_TIME_GTC = 0
@@ -107,13 +108,20 @@ class FakeMT5:
         return out
 
     # --- trading
-    def history_deals_get(self, date_from: Any, date_to: Any) -> tuple[SimpleNamespace, ...]:
-        return tuple(self.deals)
+    def history_deals_get(self, date_from: Any = None, date_to: Any = None,
+                          position: int | None = None) -> tuple[SimpleNamespace, ...]:
+        return tuple(d for d in self.deals if position is None or d.position_id == position)
 
     def positions_get(self, symbol: str | None = None) -> tuple[SimpleNamespace, ...]:
         return tuple(p for p in self.positions if symbol is None or p.symbol == symbol)
 
     def order_send(self, request: dict[str, Any]) -> SimpleNamespace:
+        if request["action"] == TRADE_ACTION_SLTP:
+            self.orders.append(dict(request))
+            for p in self.positions:
+                if p.ticket == request["position"]:
+                    p.sl, p.tp = request["sl"], request["tp"]
+            return SimpleNamespace(retcode=10009, comment="done", order=0, deal=0, price=0.0)
         if request["type_filling"] != self.supported_filling:
             return SimpleNamespace(retcode=10030, comment="Unsupported filling mode",
                                    order=0, deal=0, price=0.0)
@@ -130,7 +138,7 @@ class FakeMT5:
             self.positions.append(SimpleNamespace(
                 ticket=ticket, symbol=request["symbol"], volume=request["volume"],
                 magic=request["magic"], price_open=request["price"], sl=request["sl"],
-                tp=request["tp"], profit=0.0,
+                tp=request["tp"], profit=0.0, time=now,
                 type=POSITION_TYPE_BUY if request["type"] == ORDER_TYPE_BUY else POSITION_TYPE_SELL))
             self.deals.append(SimpleNamespace(
                 position_id=ticket, magic=request["magic"], entry=0, type=request["type"],

@@ -386,3 +386,172 @@ def test_list_symbols_for_browser(fake: FakeMT5) -> None:
     assert us500["category"] == "Indices" and us500["description"] == "US 500 Index"
     assert us500["spread"] == pytest.approx(10 * 0.00001) and us500["tradable"]
     assert names.index("EURUSD") < names.index("US500")  # ordenados por categoría
+
+
+# ------------------------------------------------------------------ Fase 3
+from types import SimpleNamespace  # noqa: E402
+
+
+def _position(ticket: int = 900, side: int = 0, entry: float = 1.1000, sl: float = 1.0980,
+              tp: float = 1.1050, opened: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(ticket=ticket, symbol="EURUSD", volume=0.1, magic=20250101, type=side,
+                           price_open=entry, sl=sl, tp=tp, profit=0.0, time=opened)
+
+
+def test_profile_simulation_blocks_real_orders(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    bot.config["simulation"] = True
+    assert bot.dry_run
+    bot.step()
+    assert fake.orders == []
+
+
+def test_session_filter_ignores_signal_outside_hours(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    closed_bar = fake.df["time"].iloc[-2]
+    forming_hour = (closed_bar.hour + 1) % 24
+    start = (forming_hour + 1) % 24
+    bot.config["trading_hours"] = f"{start}-{(start + 2) % 24 or 24}"
+    bot.step()
+    assert fake.orders == []
+    bot.config["trading_hours"] = ""
+    bot.last_bar_time = None
+    bot.step()
+    assert len(fake.orders) == 1
+
+
+def test_breakeven_moves_stop_to_entry(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.config.update(exit_management="breakeven", be_atr_mult=1.0)
+    bot.params = dict(PARAMS)
+    pos = _position()
+    fake.positions.append(pos)
+    bot.registry.set(900, {"atr": 0.0010, "best": 1.1000})
+    bot.manage_positions([pos], {"atr": 0.0010}, SimpleNamespace(bid=1.1005, ask=1.1006, time=0))
+    assert pos.sl == 1.0980  # aún no avanzó 1 ATR
+    bot.manage_positions([pos], {"atr": 0.0010}, SimpleNamespace(bid=1.1012, ask=1.1013, time=0))
+    assert pos.sl == pytest.approx(1.1000)
+    assert bot.registry.get(900)["best"] == pytest.approx(1.1012)
+
+
+def test_trailing_follows_best_price_for_sell(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.config.update(exit_management="trailing")
+    bot.params = {**PARAMS, "trail_mult": 1.5}
+    pos = _position(side=1, entry=1.1000, sl=1.1030, tp=1.0950)
+    fake.positions.append(pos)
+    bot.registry.set(900, {"atr": 0.0010, "best": 1.1000})
+    bot.manage_positions([pos], {"atr": 0.0010}, SimpleNamespace(bid=1.0979, ask=1.0980, time=0))
+    assert pos.sl == pytest.approx(1.0980 + 0.0015)
+    previous = pos.sl
+    bot.manage_positions([pos], {"atr": 0.0010}, SimpleNamespace(bid=1.0989, ask=1.0990, time=0))
+    assert pos.sl == pytest.approx(previous)  # nunca retrocede
+
+
+def test_time_stop_closes_old_position(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.config.update(max_bars_in_trade=3, timeframe="H1")
+    bot.params = dict(PARAMS)
+    now = 1_700_000_000
+    old, fresh = _position(901, opened=now - 4 * 3600), _position(902, opened=now - 3600)
+    fake.positions += [old, fresh]
+    bot.manage_positions([old, fresh], {"atr": 0.001}, SimpleNamespace(bid=1.1, ask=1.1001, time=now))
+    assert [p.ticket for p in fake.positions] == [902]
+
+
+def test_closed_position_detection_and_auto_pause(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.config.update(auto_disable_min_trades=5, auto_disable_pf=0.7)
+    bot.params_since_ts = 0
+    bot.known_tickets = {1000}
+    for k in range(6):  # 1 ganadora y 5 perdedoras -> PF bajo
+        pid = 1000 + k
+        fake.deals.append(SimpleNamespace(position_id=pid, magic=20250101, entry=0, type=0,
+                                          symbol="EURUSD", volume=0.1, price=1.1, time=10 + k,
+                                          profit=0.0, commission=0.0, swap=0.0))
+        fake.deals.append(SimpleNamespace(position_id=pid, magic=0, entry=1, type=1, symbol="EURUSD",
+                                          volume=0.1, price=1.1, time=20 + k,
+                                          profit=10.0 if k == 0 else -20.0, commission=0.0, swap=0.0))
+    bot.track_closed_positions([])
+    assert "rendimiento real bajo" in bot.paused_reason
+    assert mt5_connector.get_position_result(1000) == pytest.approx(10.0)
+
+
+def test_auto_pause_only_counts_trades_with_current_params(fake: FakeMT5, config_file) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=False)
+    bot.config.update(auto_disable_min_trades=3, auto_disable_pf=0.7)
+    for k in range(5):
+        fake.deals += [SimpleNamespace(position_id=k, magic=20250101, entry=0, type=0, symbol="EURUSD",
+                                       volume=0.1, price=1.1, time=100 + k, profit=0.0, commission=0.0, swap=0.0),
+                       SimpleNamespace(position_id=k, magic=0, entry=1, type=1, symbol="EURUSD", volume=0.1,
+                                       price=1.1, time=200 + k, profit=-5.0, commission=0.0, swap=0.0)]
+    bot.params_since_ts = 10_000  # parámetros nuevos, posteriores a esas pérdidas
+    bot.evaluate_performance()
+    assert bot.paused_reason == ""
+
+
+def test_periodic_reevolution(fake: FakeMT5, config_file, monkeypatch) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=True)
+    calls = []
+    monkeypatch.setattr(bot, "evolve", lambda: calls.append(1) or True)
+    bot.config["reevolve_hours"] = 1
+    bot.last_evolution_mono -= 3000
+    bot.maybe_reevolve([])
+    assert calls == []                      # aún no pasó 1 hora
+    bot.last_evolution_mono -= 1000
+    bot.maybe_reevolve([_position()])
+    assert calls == []                      # espera a no tener posición
+    bot.maybe_reevolve([])
+    assert calls == [1]
+
+
+def test_telegram_notifier(monkeypatch) -> None:
+    import threading as th
+
+    sent = []
+    done = th.Event()
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=10):
+        sent.append((req.full_url, req.data))
+        done.set()
+        return _Resp()
+
+    monkeypatch.setattr(trading_bot.urllib.request, "urlopen", fake_urlopen)
+    cfg = {"telegram_token": "", "telegram_chat_id": "42"}
+    notifier = trading_bot.Notifier(lambda: cfg, lambda: "[X]")
+    notifier.send("sin token")
+    cfg["telegram_token"] = "ABC"
+    notifier.send("hola")
+    assert done.wait(5)
+    assert sent[0][0] == "https://api.telegram.org/botABC/sendMessage"
+    assert b"hola" in sent[0][1] and b"chat_id=42" in sent[0][1] and len(sent) == 1
+
+
+def test_emergency_close_by_magics(fake: FakeMT5) -> None:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    fake.positions += [_position(1, ), SimpleNamespace(**{**vars(_position(2)), "magic": 555}),
+                       SimpleNamespace(**{**vars(_position(3)), "magic": 0})]
+    closed, failed = mt5_connector.close_positions_by_magics({20250101, 555})
+    assert (closed, failed) == (2, 0)
+    assert [p.magic for p in fake.positions] == [0]   # la manual queda intacta
+
+
+def test_order_registered_for_management(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    bot.step()
+    ticket = fake.positions[-1].ticket
+    rec = bot.registry.get(ticket)
+    assert rec["atr"] > 0 and rec["side"] in (1, -1)
