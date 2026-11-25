@@ -45,7 +45,7 @@ from bot_common import (
     BASE_DIR, DEFAULT_CONFIG, LOG_DIR, MAIN_PROFILE, PROFILE_KEYS, PROFILE_NAME_RE,
     VALID_EXIT_MODES, VALID_STRATEGIES, VALID_TIMEFRAMES, config_path_for, list_profiles,
     load_config, load_global_config, migrate_to_global, profile_paths, read_json,
-    save_global_config, save_profile, setup_logging, validate_config,
+    save_global_config, save_profile, setup_logging, validate_config, write_json_atomic,
 )
 
 logger = logging.getLogger("bot_gui")
@@ -118,6 +118,10 @@ STOP_TIMEOUT_SECONDS = 20
 MAX_LOG_LINES = 3000
 LAB_RESULTS_PATH = LOG_DIR / "lab_results.json"
 LAB_STOP_FLAG = LOG_DIR / "stop_lab.flag"
+SCOUT_STATE_PATH = LOG_DIR / "scout_state.json"
+SCOUT_DECISIONS_PATH = LOG_DIR / "scout_decisions.json"
+SCOUT_NOW_FLAG = LOG_DIR / "scout_now.flag"
+SCOUT_STOP_FLAG = LOG_DIR / "stop_scout.flag"
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +488,8 @@ class Toast(tk.Toplevel):
                  wraplength=300).pack(fill="x")
         for w in (self, frame, body):
             w.bind("<Button-1>", lambda _e: self.close())
+        while len(Toast.active) >= 4:  # como máximo 4 avisos visibles
+            Toast.active[0].close()
         Toast.active.append(self)
         self.update_idletasks()
         width, height = 340, max(64, self.winfo_reqheight())
@@ -911,6 +917,8 @@ class ControlCenter(tk.Tk):
 
         self.procs: dict[str, BotProcess] = {}
         self.lab_proc: BotProcess | None = None
+        self.scout_proc: BotProcess | None = None
+        self._scout_stamp: tuple[float, float, int] | None = None
         self.selected = tk.StringVar(value="")
         self.gvars: dict[str, tk.Variable] = {}
         self.gdirty = False
@@ -926,6 +934,7 @@ class ControlCenter(tk.Tk):
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(8, 12))
         self._build_operation_tab()
         self._build_lab_tab()
+        self._build_scout_tab()
         self._build_stats_tab()
         self._build_config_tab()
 
@@ -935,6 +944,9 @@ class ControlCenter(tk.Tk):
         if names:
             self.select_profile(names[0])
         self._load_lab_results()
+        self._load_scout_form()
+        if self._gcfg().get("scout_enabled"):
+            self.after(4000, self.scout_start_loop)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(250, self._poll_processes)
         self.after(800, self._refresh_live)
@@ -1157,6 +1169,95 @@ class ControlCenter(tk.Tk):
                               "con PF ≥ 1. PF = Profit Factor (ganancias / pérdidas). Ninguna combinación "
                               "garantiza resultados futuros.", style="Muted.TLabel", wraplength=780).pack(
             fill="x", pady=(4, 0))
+
+    # ===================================================== pestaña Explorador
+    def _build_scout_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.tab_scout = tab
+        self.notebook.add(tab, text="  Explorador  ")
+        ttk.Label(tab, text="Revisa periódicamente los símbolos de las categorías elegidas y PROPONE los que "
+                            "superan una validación más exigente en varias exploraciones seguidas. Usted decide "
+                            "cuáles activar (se crean en simulación).", style="Muted.TLabel",
+                  wraplength=1200).pack(fill="x", pady=(0, 8))
+        body = ttk.Frame(tab)
+        body.pack(fill="both", expand=True)
+
+        left = ttk.LabelFrame(body, text=" Qué explorar ", padding=10)
+        left.pack(side="left", fill="y")
+        crow = ttk.Frame(left)
+        crow.pack(fill="x")
+        ttk.Label(crow, text="Categorías del bróker:", font=F_BOLD).pack(side="left")
+        ttk.Button(crow, text="Cargar", command=self.scout_load_categories).pack(side="right")
+        self.scout_cats = tk.Listbox(left, height=7, selectmode="multiple", font=F_BASE, width=28,
+                                     activestyle="none", exportselection=False)
+        self.scout_cats.pack(fill="x", pady=(4, 2))
+        ttk.Label(left, text="Clic para marcar/desmarcar. 'Cargar' lee las categorías de MT5.",
+                  style="Muted.TLabel", wraplength=240).pack(fill="x")
+        ttk.Label(left, text="Timeframes:", font=F_BOLD).pack(anchor="w", pady=(8, 0))
+        tfrow = ttk.Frame(left)
+        tfrow.pack(fill="x")
+        self.scout_tfs = {tf: tk.BooleanVar() for tf in ("M5", "M15", "H1", "H4")}
+        for tf, var in self.scout_tfs.items():
+            ttk.Checkbutton(tfrow, text=tf, variable=var).pack(side="left", padx=(0, 6))
+        ttk.Label(left, text="Estrategias:", font=F_BOLD).pack(anchor="w", pady=(8, 0))
+        self.scout_strats = {st: tk.BooleanVar() for st in VALID_STRATEGIES}
+        for st, var in self.scout_strats.items():
+            ttk.Checkbutton(left, text=STRATEGY_NAMES[st], variable=var).pack(anchor="w")
+        grid = ttk.Frame(left)
+        grid.pack(fill="x", pady=(8, 0))
+        self.scout_vars: dict[str, tk.StringVar] = {}
+        rows = [("scout_interval_minutes", "Explorar cada (min)", "Intervalo entre exploraciones automáticas"),
+                ("scout_max_symbols", "Máx. símbolos", "Se exploran los de menor spread relativo al ATR"),
+                ("scout_max_spread_atr", "Spread máx. / ATR", "0.15 = descarta símbolos cuyo spread supera el 15% "
+                                                             "del movimiento medio de una vela H1"),
+                ("scout_min_pf_oos", "PF validación mín.", "Más exigente que el bot (por defecto 1.2)"),
+                ("scout_min_trades_oos", "Op. validación mín.", "Operaciones mínimas en la validación"),
+                ("scout_confirmations", "Confirmaciones", "Exploraciones SEGUIDAS aceptada antes de proponer")]
+        for r, (key, label, help_text) in enumerate(rows):
+            lbl = ttk.Label(grid, text=label)
+            lbl.grid(row=r, column=0, sticky="w", pady=2)
+            Tooltip(lbl, help_text)
+            var = tk.StringVar()
+            ttk.Entry(grid, textvariable=var, width=8).grid(row=r, column=1, sticky="e", padx=(8, 0), pady=2)
+            self.scout_vars[key] = var
+        self.scout_enabled = tk.BooleanVar()
+        ttk.Checkbutton(left, text="Explorar automáticamente", variable=self.scout_enabled).pack(
+            anchor="w", pady=(8, 0))
+        ttk.Button(left, text="Guardar", command=self.scout_save).pack(fill="x", pady=(8, 2))
+        self.btn_scout_now = ttk.Button(left, text="Explorar ahora", style="Accent.TButton",
+                                        command=self.scout_now)
+        self.btn_scout_now.pack(fill="x", pady=2)
+        self.btn_scout_stop = ttk.Button(left, text="Detener explorador", command=self.scout_stop)
+        self.btn_scout_stop.pack(fill="x", pady=2)
+        self.scout_progress = ttk.Progressbar(left, mode="determinate", length=200)
+        self.scout_progress.pack(fill="x", pady=(10, 2))
+        self.scout_status = ttk.Label(left, text="", style="Muted.TLabel", wraplength=240)
+        self.scout_status.pack(fill="x")
+
+        right = ttk.Frame(body, padding=(10, 0, 0, 0))
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(right, text="Propuestas (confirmadas)", font=F_SUB).pack(anchor="w")
+        self.scout_tree = make_tree(right, [
+            ("symbol", "Símbolo", 90, "w"), ("tf", "TF", 45, "center"), ("strategy", "Estrategia", 100, "w"),
+            ("pf_oos", "PF valid.", 70, "e"), ("trades", "Op. valid.", 70, "e"),
+            ("windows", "Ventanas +", 75, "center"), ("pf_is", "PF entreno", 75, "e"),
+            ("streak", "Confirmada", 80, "center"), ("since", "Desde", 120, "w")], height=8)
+        self.scout_tree.configure(selectmode="extended")
+        self.scout_tree.frame.pack(fill="both", expand=True, pady=(4, 0))
+        prow = ttk.Frame(right)
+        prow.pack(fill="x", pady=(6, 10))
+        ttk.Button(prow, text="Activar seleccionadas (en simulación)", style="Accent.TButton",
+                   command=self.scout_activate).pack(side="left")
+        ttk.Button(prow, text="Descartar", command=self.scout_dismiss).pack(side="left", padx=6)
+        ttk.Button(prow, text="Restablecer descartes", command=self.scout_reset_dismissed).pack(side="left")
+        ttk.Label(right, text="En observación (aceptadas, esperando confirmación)", font=F_BOLD).pack(anchor="w")
+        self.scout_watch = make_tree(right, [
+            ("symbol", "Símbolo", 90, "w"), ("tf", "TF", 45, "center"), ("strategy", "Estrategia", 100, "w"),
+            ("pf_oos", "PF valid.", 70, "e"), ("trades", "Op. valid.", 70, "e"),
+            ("streak", "Confirmaciones", 100, "center"), ("seen", "Última vez", 120, "w")], height=5)
+        self.scout_watch.frame.pack(fill="both", expand=True, pady=(4, 0))
+        self.scout_summary = ttk.Label(right, text="", style="Muted.TLabel", wraplength=900)
+        self.scout_summary.pack(fill="x", pady=(6, 0))
 
     # =================================================== pestaña Estadísticas
     def _build_stats_tab(self) -> None:
@@ -1579,8 +1680,9 @@ class ControlCenter(tk.Tk):
                            f"{len(statuses)} símbolos · {enabled} activos",
                            (f"{real} en modo REAL", C_RED) if real else "todos en simulación")
         lab = "laboratorio analizando…" if self.lab_proc and self.lab_proc.running else ""
+        scout = "explorador activo" if self.scout_proc and self.scout_proc.running else ""
         text = f"{running} bot(s) en marcha" if running else ""
-        self.header_status.configure(text=" · ".join(t for t in (text, lab) if t), fg="#a5d6a7")
+        self.header_status.configure(text=" · ".join(t for t in (text, lab, scout) if t), fg="#a5d6a7")
 
     # ================================================================ acciones
     def add_symbols(self) -> None:
@@ -1896,10 +1998,16 @@ class ControlCenter(tk.Tk):
                 changed = True
         if self.lab_proc is not None:
             self._poll_lab()
+        if self.scout_proc is not None:
+            self._poll_scout()
+        for aux in (self.lab_proc, self.scout_proc):  # no respondió a la parada: terminar
+            if aux and aux.running and aux.stop_requested_at and time.monotonic() - aux.stop_requested_at > 30:
+                aux.kill()
         if changed:
             self._refresh_table()
         if self._closing and not any(p.running for p in self.procs.values()) and \
-                not (self.lab_proc and self.lab_proc.running):
+                not (self.lab_proc and self.lab_proc.running) and \
+                not (self.scout_proc and self.scout_proc.running):
             self.destroy()
             return
         self.after(250, self._poll_processes)
@@ -1909,6 +2017,7 @@ class ControlCenter(tk.Tk):
             self._refresh_table()
             self._render_cards()
             self._render_detail()
+            self._render_scout()
             name = self.selected.get()
             bp = self.procs.get(name)
             running = bool(bp and bp.running)
@@ -2068,6 +2177,232 @@ class ControlCenter(tk.Tk):
                                        "simulation": True} for r in chosen])
         self.notebook.select(self.tab_operation)
         self._report_created(lines)
+
+    # ============================================================= explorador
+    def _load_scout_form(self) -> None:
+        g = self._gcfg()
+        self.scout_cats.delete(0, "end")
+        for cat in g.get("scout_categories") or []:
+            self.scout_cats.insert("end", cat)
+            self.scout_cats.selection_set("end")
+        for tf, var in self.scout_tfs.items():
+            var.set(tf in (g.get("scout_timeframes") or []))
+        for st, var in self.scout_strats.items():
+            var.set(st in (g.get("scout_strategies") or []))
+        for key, var in self.scout_vars.items():
+            value = g.get(key, DEFAULT_CONFIG[key])
+            var.set(f"{value:g}" if isinstance(value, float) else str(value))
+        self.scout_enabled.set(bool(g.get("scout_enabled")))
+        self._render_scout(force=True)
+
+    def scout_load_categories(self) -> None:
+        """Rellena la lista de categorías con las del bróker (y cuántos símbolos tiene cada una)."""
+        chosen = {self.scout_cats.get(i).split("  (")[0] for i in self.scout_cats.curselection()}
+
+        def fill(symbols: list[dict[str, Any]]) -> None:
+            counts: dict[str, int] = {}
+            for d in symbols:
+                if d.get("tradable", True):
+                    counts[d["category"]] = counts.get(d["category"], 0) + 1
+            self.scout_cats.delete(0, "end")
+            for cat in sorted(counts, key=str.lower):
+                self.scout_cats.insert("end", f"{cat}  ({counts[cat]})")
+                if cat in chosen:
+                    self.scout_cats.selection_set("end")
+
+        self.with_symbol_list(fill)
+
+    def _scout_values(self) -> dict[str, Any]:
+        """Lee el formulario del explorador; ValueError si algo es inválido."""
+        values: dict[str, Any] = {
+            "scout_categories": [self.scout_cats.get(i).split("  (")[0] for i in self.scout_cats.curselection()],
+            "scout_timeframes": [tf for tf, v in self.scout_tfs.items() if v.get()],
+            "scout_strategies": [st for st, v in self.scout_strats.items() if v.get()],
+            "scout_enabled": bool(self.scout_enabled.get()),
+        }
+        for key, var in self.scout_vars.items():
+            raw = var.get().strip().replace(",", ".")
+            try:
+                values[key] = float(raw) if isinstance(DEFAULT_CONFIG[key], float) else int(raw)
+            except ValueError as exc:
+                raise ValueError(f"Valor inválido en {key}: {raw!r}") from exc
+        errors = validate_config({**self._gcfg(), **values})
+        if errors:
+            raise ValueError("\n".join(f"• {e}" for e in errors))
+        if not values["scout_categories"]:
+            raise ValueError("Marque al menos una categoría (pulse 'Cargar' para ver las del bróker).")
+        return values
+
+    def scout_save(self, quiet: bool = False) -> bool:
+        """Guarda la configuración del explorador y arranca/detiene el modo automático."""
+        try:
+            values = self._scout_values()
+            save_global_config({**self._gcfg(), **values}, BASE_DIR)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Explorador", str(exc), parent=self)
+            return False
+        running = bool(self.scout_proc and self.scout_proc.running)
+        if values["scout_enabled"] and not running:
+            self.scout_start_loop()
+        elif not values["scout_enabled"] and running:
+            self.scout_stop()
+        elif not quiet:
+            Toast(self, "Explorador", "Configuración guardada.", C_GREEN)
+        return True
+
+    def _start_scout(self, args: list[str]) -> bool:
+        if self.scout_proc and self.scout_proc.running:
+            return True
+        cmd = [python_for_children(), "-u", str(BASE_DIR / "scout.py")] + args
+        bp = BotProcess("explorador", BASE_DIR / "scout.py", cmd=cmd, stop_flag_path=SCOUT_STOP_FLAG)
+        try:
+            bp.start()
+        except OSError as exc:
+            messagebox.showerror("Explorador", str(exc), parent=self)
+            return False
+        self.scout_proc = bp
+        return True
+
+    def scout_start_loop(self) -> None:
+        """Arranca el explorador automático (explora ya y luego cada N minutos)."""
+        if self._start_scout(["--loop"]):
+            self.scout_status.configure(text="Explorador automático en marcha…")
+
+    def scout_now(self) -> None:
+        """Explora ahora (si el automático está en marcha, le pide una exploración inmediata)."""
+        if not self.scout_save(quiet=True):
+            return
+        if self.scout_proc and self.scout_proc.running:
+            SCOUT_NOW_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            SCOUT_NOW_FLAG.write_text(datetime.now().isoformat(), encoding="utf-8")
+            self.scout_status.configure(text="Exploración solicitada…")
+        elif self._start_scout(["--once"]):
+            self.scout_status.configure(text="Explorando…")
+
+    def scout_stop(self) -> None:
+        if self.scout_proc and self.scout_proc.running:
+            self.scout_proc.request_stop()
+            self.scout_status.configure(text="Deteniendo el explorador…")
+
+    def _poll_scout(self) -> None:
+        bp = self.scout_proc
+        if bp is None:
+            return
+        proposals: list[dict[str, Any]] = []
+        try:
+            while True:
+                line = bp.lines.get_nowait()
+                if line.startswith("SCOUT_PROGRESS "):
+                    info = read_json_line(line[len("SCOUT_PROGRESS "):]) or {}
+                    if info.get("total"):
+                        self.scout_progress.configure(maximum=info["total"], value=info.get("done", 0))
+                    self.scout_status.configure(text=info.get("message", ""))
+                elif line.startswith("SCOUT_PROPOSAL "):
+                    proposals.append(read_json_line(line[len("SCOUT_PROPOSAL "):]) or {})
+                elif "[ERROR]" in line or "Traceback" in line:
+                    self.scout_status.configure(text=line[-200:])
+        except queue.Empty:
+            pass
+        if len(proposals) == 1:
+            p = proposals[0]
+            Toast(self, "Nueva propuesta del explorador",
+                  f"{p.get('symbol')} {p.get('timeframe')} · {STRATEGY_SHORT.get(p.get('strategy', ''), '')} "
+                  f"· PF validación {fmt(p.get('pf_oos'))} ({p.get('trades_oos')} op.). "
+                  "Revísela en la pestaña Explorador.", C_GREEN, 15)
+        elif proposals:
+            names = ", ".join(f"{p.get('symbol')} {p.get('timeframe')}" for p in proposals[:6])
+            Toast(self, f"{len(proposals)} propuestas nuevas del explorador",
+                  f"{names}{'…' if len(proposals) > 6 else ''}. Revíselas en la pestaña Explorador.", C_GREEN, 15)
+        if not bp.running and bp.lines.empty() and not bp.reported:
+            bp.reported = True
+            if bp.exit_code not in (0, None):
+                self.scout_status.configure(text=f"El explorador terminó con error (código {bp.exit_code}). "
+                                                 "Vea logs/scout.log.")
+            elif not self._closing:
+                self.scout_status.configure(text="Explorador detenido." if bp.stop_requested_at
+                                            else self.scout_status.cget("text"))
+        running = bool(bp.running)
+        self.btn_scout_stop.configure(state="normal" if running else "disabled")
+
+    def _scout_decisions(self) -> dict[str, Any]:
+        data = read_json(SCOUT_DECISIONS_PATH) or {}
+        data.setdefault("dismissed", [])
+        return data
+
+    def _render_scout(self, force: bool = False) -> None:
+        dismissed = set(self._scout_decisions()["dismissed"])
+        existing = {f"{c['symbol']}|{c['timeframe']}|{c['strategy']}"
+                    for c in (profile_config(n) for n in list_profiles()) if c}
+        stamp = (_mtime(SCOUT_STATE_PATH), _mtime(SCOUT_DECISIONS_PATH), len(existing))
+        if stamp == self._scout_stamp and not force:
+            return
+        self._scout_stamp = stamp
+        state = read_json(SCOUT_STATE_PATH) or {}
+        need = int(self._gcfg().get("scout_confirmations", 2))
+        for tree in (self.scout_tree, self.scout_watch):
+            tree.delete(*tree.get_children())
+        for key, c in sorted((state.get("candidates") or {}).items(),
+                             key=lambda kv: -float((kv[1].get("last") or {}).get("pf_oos") or 0)):
+            if key in dismissed or key in existing:
+                continue
+            last = c.get("last") or {}
+            if c.get("proposed"):
+                self.scout_tree.insert("", "end", iid=key, tags=("ok",), values=(
+                    c["symbol"], c["timeframe"], STRATEGY_SHORT.get(c["strategy"], c["strategy"]),
+                    fmt(last.get("pf_oos")), fmt(last.get("trades_oos"), "{}"), last.get("windows") or "—",
+                    fmt(last.get("pf_is")), f"{c.get('streak')}x",
+                    str(c.get("proposed_at", "")).replace("T", " ")[:16]))
+            else:
+                self.scout_watch.insert("", "end", iid=key, tags=("info",), values=(
+                    c["symbol"], c["timeframe"], STRATEGY_SHORT.get(c["strategy"], c["strategy"]),
+                    fmt(last.get("pf_oos")), fmt(last.get("trades_oos"), "{}"),
+                    f"{c.get('streak')} de {need}", str(c.get("last_seen", "")).replace("T", " ")[:16]))
+        summ = state.get("last_summary") or {}
+        parts = []
+        if summ:
+            parts.append(f"Última exploración {str(summ.get('time', '')).replace('T', ' ')[:16]}: "
+                         f"{summ.get('symbols')} símbolos, {summ.get('combinations')} combinaciones, "
+                         f"{summ.get('accepted')} aceptadas, {summ.get('new_proposals')} propuestas nuevas "
+                         f"({summ.get('seconds')} s).")
+        if state.get("running") and state.get("next_scan"):
+            parts.append(f"Próxima: {str(state['next_scan']).replace('T', ' ')[:16]}.")
+        if dismissed:
+            parts.append(f"{len(dismissed)} descartadas.")
+        self.scout_summary.configure(text=" ".join(parts) or "Todavía no se ha explorado. Elija categorías y "
+                                                            "pulse 'Explorar ahora'.")
+
+    def scout_activate(self) -> None:
+        state = read_json(SCOUT_STATE_PATH) or {}
+        keys = self.scout_tree.selection()
+        if not keys:
+            messagebox.showinfo("Explorador", "Seleccione una o varias propuestas.", parent=self)
+            return
+        items = []
+        for key in keys:
+            c = (state.get("candidates") or {}).get(key)
+            if c:
+                items.append({"symbol": c["symbol"], "timeframe": c["timeframe"], "strategy": c["strategy"],
+                              "spread": (c.get("last") or {}).get("spread"), "simulation": True})
+        lines = self.create_profiles(items)
+        self._render_scout(force=True)
+        self.notebook.select(self.tab_operation)
+        self._report_created(lines)
+
+    def scout_dismiss(self) -> None:
+        keys = list(self.scout_tree.selection()) + list(self.scout_watch.selection())
+        if not keys:
+            messagebox.showinfo("Explorador", "Seleccione las propuestas a descartar.", parent=self)
+            return
+        data = self._scout_decisions()
+        data["dismissed"] = sorted(set(data["dismissed"]) | set(keys))
+        write_json_atomic(SCOUT_DECISIONS_PATH, data)
+        self._render_scout(force=True)
+
+    def scout_reset_dismissed(self) -> None:
+        if self._scout_decisions()["dismissed"] and messagebox.askyesno(
+                "Explorador", "¿Volver a considerar todas las combinaciones descartadas?", parent=self):
+            write_json_atomic(SCOUT_DECISIONS_PATH, {"dismissed": []})
+            self._render_scout(force=True)
 
     # ========================================================== estadísticas
     def refresh_stats(self) -> None:
@@ -2292,7 +2627,14 @@ class ControlCenter(tk.Tk):
                 return
         active = [p for p in self.procs.values() if p.running]
         lab_running = bool(self.lab_proc and self.lab_proc.running)
+        if self.scout_proc and self.scout_proc.running:
+            self.scout_proc.request_stop()
+        scout_running = bool(self.scout_proc and self.scout_proc.running)
         if not active and not lab_running:
+            if scout_running:
+                self._closing = True
+                self.title("MT5 Bot — cerrando…")
+                return
             self.destroy()
             return
         if not messagebox.askokcancel(

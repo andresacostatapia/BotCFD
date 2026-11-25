@@ -32,6 +32,7 @@ C:\MT5Bot\
 ├── bot_gui.py               # CENTRO DE CONTROL (Operación, Laboratorio, Estadísticas, Configuración)
 ├── trading_bot.py           # Bot de un símbolo: evoluciona -> valida -> opera -> gestiona
 ├── lab.py                   # Laboratorio: escáner símbolo x timeframe x estrategia (en paralelo)
+├── scout.py                 # Explorador: revisa categorías periódicamente y PROPONE símbolos nuevos
 ├── strategy_evolver.py      # Estrategias, backtest, evolución genética y walk-forward (sin MT5)
 ├── risk_manager.py          # Pérdida diaria, spread y tamaño de lote (sin MT5, testeable)
 ├── mt5_connector.py         # Conexión MT5, datos, órdenes, gestión de posiciones, historial
@@ -65,6 +66,7 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
 |---|---|
 | **Operación** (principal) | Tarjetas de **Cuenta**, **Resultado de hoy**, **Posiciones abiertas** y **Bots**. Tabla con **todos los símbolos**: clic en *Activo* (Sí/No) o en *Modo* (Simulación/REAL) para cambiarlos; estado, posición, resultado y validación de cada uno. Panel derecho con el **detalle del símbolo seleccionado**: situación (qué espera), posición, última vela, parámetros, **Log** en vivo y **Evolución** (veredicto, parámetros, métricas, ventanas, historial). Botones: *+ Añadir símbolos…* (buscador), *Iniciar activos*, *Detener todos*, *Iniciar / Detener / Editar… / Reiniciar (re-evoluciona) / Eliminar* y **Cerrar posiciones de los bots…** (emergencia) |
 | **Laboratorio** | Elija símbolos (buscador o *Mis símbolos*), timeframes y estrategias → **Analizar**. Evalúa cada combinación con la misma evolución y validación que el bot, en paralelo, y las ordena por robustez. **Activar seleccionados** crea los perfiles (en simulación) |
+| **Explorador** | Elija **categorías del bróker** (Forex, Índices, Metales…), timeframes y estrategias. Revisa automáticamente cada N minutos (por defecto 60; botón **Explorar ahora**) y **propone** las combinaciones que superan una validación más exigente en varias exploraciones seguidas. **Activar seleccionadas** crea los perfiles en simulación; **Descartar** las oculta. Muestra también las que están *en observación* |
 | **Estadísticas** | Operaciones **reales** cerradas por los bots (7/30/90/365 días): curva de resultado acumulado y, por símbolo, operaciones, % de acierto, PF real vs. PF de validación, resultado y drawdown, con una valoración |
 | **Configuración general** | Lo común a todos los símbolos: *Riesgo*, *Horario y salidas*, *Cuenta, inicio y avisos* y, plegadas, las opciones **avanzadas** (evolución, validación, ejecución, seguimiento). Probar conexión, **Iniciar con Windows**, **Probar Telegram** |
 
@@ -80,6 +82,25 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
   los bots que lanzó.
 * **Iniciar con Windows** crea un acceso en la carpeta *Inicio* que abre el Centro
   de control y arranca los símbolos activos (MT5 también debe abrirse e iniciar sesión).
+
+### Explorador (`scout.py`)
+
+1. **Universo:** símbolos operables de las categorías elegidas, ordenados por coste
+   relativo (spread / ATR de H1); se descartan los que superan `scout_max_spread_atr`
+   (0.15) y se exploran como máximo `scout_max_symbols` (20).
+2. **Evaluación:** el mismo motor que el Laboratorio y el bot, pero más exigente:
+   PF de validación ≥ `scout_min_pf_oos` (1.2) y ≥ `scout_min_trades_oos` (15) operaciones.
+3. **Confirmación:** solo se propone una combinación aceptada en
+   `scout_confirmations` (2) exploraciones **seguidas**; si una exploración la
+   rechaza, vuelve a cero. Las que ya tienen perfil o se descartaron no se proponen.
+4. **Usted decide:** el explorador nunca crea perfiles ni opera por sí mismo.
+
+> Revisar muchos símbolos aumenta la probabilidad de encontrar algo "bueno" por
+> azar; por eso los criterios son más estrictos y se exigen confirmaciones.
+> Aun así, active las propuestas en **simulación** y compruebe sus resultados reales.
+
+El modo automático (`scout_enabled`) funciona mientras el Centro de control está
+abierto. Estado en `logs/scout_state.json`; descartes en `logs/scout_decisions.json`.
 
 ---
 
@@ -191,6 +212,11 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `reevolve_hours` | 168 | Re-evolución periódica (0 = nunca) |
 | `telegram_token`, `telegram_chat_id` | "" | Avisos por Telegram (opcional) |
 | `autostart_bots`, `lab_workers` | false, 0 | Autoarranque de activos; procesos del laboratorio (0 = auto) |
+| **Explorador** | | |
+| `scout_enabled`, `scout_interval_minutes` | false, 60 | Explorar automáticamente y cada cuánto |
+| `scout_categories`, `scout_timeframes`, `scout_strategies` | [], [M15, H1], todas | Qué explorar |
+| `scout_max_symbols`, `scout_max_spread_atr` | 20, 0.15 | Tamaño del universo y coste máximo |
+| `scout_min_pf_oos`, `scout_min_trades_oos`, `scout_confirmations` | 1.2, 15, 2 | Exigencia para proponer |
 
 ---
 
@@ -203,6 +229,7 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `start_bot.bat --console [--dry-run]` | Modo consola anterior (panel simple + un bot) |
 | `python bot_gui.py [--autostart]` | Centro de control sin instalador |
 | `python lab.py --symbols EURUSD,US500 --timeframes M15,H1 --strategies all` | Laboratorio por consola |
+| `python scout.py --once` / `--loop` | Explorador por consola (usa la configuración general) |
 | `python trading_bot.py --config risk_config_us500.json [--dry-run]` | Un perfil concreto por consola |
 | `launch.ps1 [-DryRun] [-SkipPanel] [-InstallOnly]` | Equivalente en PowerShell |
 
@@ -247,7 +274,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (126 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (132 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

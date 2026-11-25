@@ -36,8 +36,8 @@ def test_fields_cover_known_config_keys() -> None:
     assert {"risk_percent", "evolve_sl_tp", "history_bars", "trading_hours", "exit_management",
             "validation_windows", "auto_disable_pf", "telegram_token"} <= keys
     # todo lo de la configuración general es editable desde la ventana
-    shared = set(DEFAULT_CONFIG) - set(PROFILE_KEYS)
-    assert shared - keys <= {"pf_cap"}
+    shared = {k for k in set(DEFAULT_CONFIG) - set(PROFILE_KEYS) if not k.startswith("scout_")}
+    assert shared - keys <= {"pf_cap"}   # las claves scout_* se editan en la pestaña Explorador
 
 
 def test_line_tags() -> None:
