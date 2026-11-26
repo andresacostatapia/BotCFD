@@ -39,7 +39,7 @@ GLOBAL_CONFIG_PATH: Path = BASE_DIR / GLOBAL_CONFIG_NAME
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
-VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura")
+VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura", "retroceso", "compresion")
 VALID_EXIT_MODES: tuple[str, ...] = ("ninguna", "breakeven", "trailing")
 VALID_ASSET_CLASSES: tuple[str, ...] = ("auto", "forex", "indice", "materia", "cripto", "accion", "otro")
 
@@ -186,6 +186,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "validation_windows": 3,          # ventanas walk-forward (1 = un solo corte 70/30)
     "min_pf_oos": 1.0,                # PF mínimo absoluto en validación
     "regime_filter": True,            # filtro ADX evolucionado (tendencia vs rango)
+    "stability_check": True,          # rechaza parámetros "frágiles" (los vecinos ±10% pierden)
     "trading_hours": "",              # "" = 24 h; "10-19" = solo de 10 a 19 h del servidor
     "exit_management": "ninguna",     # ninguna | breakeven | trailing
     "be_atr_mult": 1.0,               # break-even al avanzar N x ATR (si no se evoluciona)
@@ -196,7 +197,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
     "evolve_sl_tp": True,             # evolucionar también los multiplicadores SL/TP
-    "strategy": "cruce_medias",       # cruce_medias | reversion_media | ruptura
+    "strategy": "cruce_medias",       # cruce_medias | reversion_media | ruptura | retroceso | compresion
     "loop_seconds": 60,
     "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
@@ -217,7 +218,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scout_interval_minutes": 60,     # cada cuánto explora
     "scout_categories": [],           # categorías del bróker a revisar (p. ej. ["Forex", "Indices"])
     "scout_timeframes": ["M15", "H1"],
-    "scout_strategies": ["cruce_medias", "reversion_media", "ruptura"],
+    "scout_strategies": ["cruce_medias", "reversion_media", "ruptura", "retroceso", "compresion"],
     "scout_max_symbols": 20,          # máx. símbolos por exploración (los de menor spread/ATR)
     "scout_max_spread_atr": 0.15,     # descarta símbolos cuyo spread supera esta fracción del ATR(H1)
     "scout_min_pf_oos": 1.2,          # PF de validación mínimo (más exigente que el bot)
@@ -430,7 +431,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if isinstance(mot, bool) or not isinstance(mot, int) or mot < 0:
         errors.append("'max_open_positions_total' debe ser un entero >= 0 (0 = sin límite)")
 
-    for key in ("enabled", "simulation", "regime_filter", "autostart_bots"):
+    for key in ("enabled", "simulation", "regime_filter", "stability_check", "autostart_bots"):
         if not isinstance(config.get(key), bool):
             errors.append(f"'{key}' debe ser true/false")
 

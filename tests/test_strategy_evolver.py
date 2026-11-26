@@ -167,6 +167,8 @@ STRATEGY_PARAMS = {
     "cruce_medias": {"fast": 10, "slow": 40, "rsi_buy": 50.0, "rsi_sell": 50.0},
     "reversion_media": {"bb_period": 20, "bb_std": 2.0, "rsi_low": 35.0, "rsi_high": 65.0},
     "ruptura": {"lookback": 20, "trend": 50},
+    "retroceso": {"trend": 100, "pb_rsi": 20.0, "pb_window": 3},
+    "compresion": {"lookback": 20, "squeeze_pct": 0.3, "trend": 100, "pen": 0.1},
 }
 
 
@@ -212,7 +214,7 @@ def test_bollinger_rules(synthetic_ohlc: pd.DataFrame) -> None:
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-@pytest.mark.parametrize("name", ["reversion_media", "ruptura"])
+@pytest.mark.parametrize("name", ["reversion_media", "ruptura", "retroceso", "compresion"])
 def test_evolve_new_strategies(synthetic_ohlc: pd.DataFrame, backend: str, name: str) -> None:
     out = se.evolve_parameters(synthetic_ohlc, pop=10, gens=3, seed=3,
                                config={"strategy": name, "evolver_backend": backend})
@@ -223,10 +225,91 @@ def test_evolve_new_strategies(synthetic_ohlc: pd.DataFrame, backend: str, name:
         assert lo <= out["params"][key] <= hi
 
 
+def test_bollinger_confirmation_rules(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = {**STRATEGY_PARAMS["reversion_media"], "confirm": 1}
+    sig = se.signal_array(cache, p)
+    lower = cache.sma(20) - 2.0 * cache.rolling_std(20)
+    upper = cache.sma(20) + 2.0 * cache.rolling_std(20)
+    c, r = cache.close_np, cache.rsi
+    buys, sells = np.flatnonzero(sig == 1), np.flatnonzero(sig == -1)
+    assert len(buys) and len(sells)
+    # la vela anterior cerró fuera con RSI extremo y esta vuelve dentro
+    assert np.all(c[buys - 1] < lower[buys - 1]) and np.all(r[buys - 1] < 35.0)
+    assert np.all(c[buys] >= lower[buys])
+    assert np.all(c[sells - 1] > upper[sells - 1]) and np.all(c[sells] <= upper[sells])
+    # sin el gen (parámetros guardados por versiones anteriores) se mantiene la regla antigua
+    old = se.signal_array(cache, STRATEGY_PARAMS["reversion_media"])
+    assert not np.array_equal(old, sig)
+    assert se.normalize_params(STRATEGY_PARAMS["reversion_media"]) == STRATEGY_PARAMS["reversion_media"]
+
+
+def test_pullback_rules(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = STRATEGY_PARAMS["retroceso"]
+    sig = se.signal_array(cache, p)
+    trend, rs = cache.sma(100), cache.rsi_short
+    c, hi, lo = cache.close_np, cache.high, cache.low
+    for i in np.flatnonzero(sig == 1):
+        assert c[i] > trend[i] and trend[i] > trend[i - 5] and c[i] > hi[i - 1]
+        assert (rs[i - 3:i] <= 20.0).any()
+    for i in np.flatnonzero(sig == -1):
+        assert c[i] < trend[i] and trend[i] < trend[i - 5] and c[i] < lo[i - 1]
+        assert (rs[i - 3:i] >= 80.0).any()
+
+
+def test_squeeze_rules(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = STRATEGY_PARAMS["compresion"]
+    sig = se.signal_array(cache, p)
+    hh, ll, trend, rank, a = cache.highest(20), cache.lowest(20), cache.sma(100), cache.width_rank, cache.atr
+    c = cache.close_np
+    for i in np.flatnonzero(sig == 1):
+        assert c[i] > hh[i] + 0.1 * a[i] and c[i] > trend[i]
+        assert (rank[i - se.SQUEEZE_RECENT_BARS:i] <= 0.3).any()
+    for i in np.flatnonzero(sig == -1):
+        assert c[i] < ll[i] - 0.1 * a[i] and c[i] < trend[i]
+    assert np.nanmin(rank) > 0 and np.nanmax(rank) <= 1
+
+
+def test_adx_direction_for_new_strategies(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    for name in ("retroceso", "compresion"):
+        sig = se.signal_array(cache, {**STRATEGY_PARAMS[name], "adx": 25.0})
+        assert np.all(cache.adx[sig != 0] > 25.0)
+
+
+def test_parameter_stability_and_monte_carlo(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    p = {**STRATEGY_PARAMS["ruptura"], "sl_mult": 1.5, "tp_mult": 2.0}
+    stab = se.parameter_stability(cache, p, 0, len(cache), {}, samples=6, seed=1)
+    assert stab["samples"] == 6 and stab["min_pf"] <= stab["median_pf"]
+    assert 0.0 <= stab["profitable_share"] <= 1.0
+    assert se.parameter_stability(cache, p, 0, len(cache), {}, samples=6, seed=1) == stab
+    assert se.monte_carlo([1.0, -1.0]) is None
+    mc = se.monte_carlo([2.0, -1.0, 1.5, -1.0, -1.0, 3.0, -1.0, 1.0], runs=500, seed=3)
+    assert mc["trades"] == 8 and 0.0 <= mc["p_loss"] <= 1.0
+    assert 0.0 <= mc["dd50_losses"] <= mc["dd95_losses"]
+    losers = se.monte_carlo([-1.0] * 6, runs=200)
+    assert losers["p_loss"] == 1.0 and losers["dd50_losses"] == 6.0
+
+
+def test_stability_check_rejects_fragile(synthetic_ohlc: pd.DataFrame, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(se, "parameter_stability",
+                        lambda *a, **k: {"samples": 8, "median_pf": 0.7, "min_pf": 0.5, "profitable_share": 0.1})
+    out = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, seed=2,
+                               config={"strategy": "ruptura", "stability_check": True})
+    assert not out["accepted"] and "frágiles" in out["reason"]
+    assert out["stability"]["median_pf"] == 0.7 and out["monte_carlo"] is not None
+    off = se.evolve_parameters(synthetic_ohlc, pop=8, gens=2, seed=2, config={"strategy": "ruptura"})
+    assert off["stability"] is None and "frágiles" not in off["reason"]
+
+
 def test_warmup_bars() -> None:
     assert se.warmup_bars({"fast": 10, "slow": 80}) == 81
     assert se.warmup_bars({"lookback": 20, "trend": 150}) == 151
     assert se.warmup_bars({"bb_period": 20}) == 21
+    assert se.warmup_bars(STRATEGY_PARAMS["compresion"]) == 127
 
 
 def test_unknown_strategy_rejected() -> None:

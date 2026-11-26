@@ -145,14 +145,16 @@ use 4000–8000 velas o M15.
 | Estrategia | Para qué plazo | Señal | Parámetros que evoluciona |
 |---|---|---|---|
 | `cruce_medias` | M15 / H1 (tendencia) | COMPRA si la SMA rápida cruza al alza la lenta y RSI(14) > `rsi_buy`; VENTA si cruza a la baja y RSI < `rsi_sell` | `fast` Int(5,30), `slow` Int(30,100) (`slow > fast`), `rsi_buy` Float(40,70), `rsi_sell` Float(30,60) |
-| `reversion_media` | M5 / M15 (corto plazo) | COMPRA si el cierre cae **bajo la banda inferior** de Bollinger con RSI < `rsi_low`; VENTA si supera la **banda superior** con RSI > `rsi_high` | `bb_period` Int(10,50), `bb_std` Float(1.5,3), `rsi_low` Float(15,40), `rsi_high` Float(60,85) |
+| `reversion_media` | M5 / M15 (corto plazo) | COMPRA si el cierre cae **bajo la banda inferior** de Bollinger con RSI < `rsi_low`; VENTA si supera la **banda superior** con RSI > `rsi_high`. Con `confirm` = 1 espera a que la vela siguiente **vuelva a cerrar dentro** de la banda (no compra mientras el precio sigue cayendo) | `bb_period` Int(10,50), `bb_std` Float(1.5,3), `rsi_low` Float(15,40), `rsi_high` Float(60,85), `confirm` Int(0,1) |
 | `ruptura` | M5 / M15 / H1 | COMPRA si el cierre **supera el máximo** de las `lookback` velas anteriores estando sobre la SMA `trend`; VENTA si **cae bajo el mínimo** estando bajo la SMA | `lookback` Int(10,100), `trend` Int(20,200) |
+| `retroceso` | M15 / H1 (tendencia) | **Entrar a favor de la tendencia tras un retroceso.** Tendencia: cierre sobre la SMA `trend` y la SMA subiendo. Retroceso: RSI(3) ≤ `pb_rsi` en alguna de las `pb_window` velas anteriores. Entrada: cierre por encima del máximo de la vela anterior (el precio reanuda la subida). Venta: lo simétrico (RSI(3) ≥ 100 − `pb_rsi`) | `trend` Int(50,250), `pb_rsi` Float(5,40), `pb_window` Int(1,6) |
+| `compresion` | M15 / H1 | **Volatilidad comprimida y luego ruptura.** Compresión: el ancho de Bollinger(20) está en el percentil ≤ `squeeze_pct` de las últimas 100 velas (en alguna de las 6 anteriores). Entrada: cierre por encima del máximo de `lookback` velas + `pen` × ATR (filtra rupturas falsas "por un pelo"), a favor de la SMA `trend` | `lookback` Int(10,60), `squeeze_pct` Float(0.05,0.5), `trend` Int(50,300), `pen` Float(0,0.5) |
 
 Opciones comunes (configuración general):
 
 | Opción | Qué añade a la búsqueda / al bot |
 |---|---|
-| `regime_filter` (sí) | **Filtro de régimen ADX**: nivel `adx` Float(15,40) evolucionado. Tendencia y ruptura solo con ADX > nivel; reversión solo con ADX < nivel |
+| `regime_filter` (sí) | **Filtro de régimen ADX**: nivel `adx` Float(15,40) evolucionado. Tendencia, ruptura, retroceso y compresión solo con ADX > nivel; reversión solo con ADX < nivel |
 | `evolve_sl_tp` (sí) | Evoluciona `sl_mult` Float(1,3) y `tp_mult` Float(1,4) (× ATR) y, según la salida, `be_mult` Float(0.5,2.5) o `trail_mult` Float(1,3.5) |
 | `exit_management` | `ninguna` (solo SL/TP), `breakeven` (SL a la entrada al avanzar `be_mult` × ATR) o `trailing` (SL a `trail_mult` × ATR del mejor precio). El bot lo aplica en vivo sobre las posiciones abiertas |
 | `max_bars_in_trade` | Cierre por tiempo tras N velas (0 = desactivado) |
@@ -178,8 +180,38 @@ Motor genético: **`strategy-genome`** (PyPI, MIT) con fallback automático a **
 
   Si se acepta, los parámetros para operar se evolucionan con **todo** el historial.
   Con `validation_windows` = 1 se usa un solo corte 70/30.
+* **Parámetros frágiles** (`stability_check`, activado): se prueban 8 variantes de
+  los parámetros elegidos, moviendo cada uno al azar hasta ±10 % de su rango. Si con
+  esos vecinos el PF mediano es < 1, el resultado era un pico de suerte y se
+  **descarta**. Una ventaja real suele formar una "meseta": funciona también con
+  valores parecidos.
+* **Monte Carlo** (informativo, no descarta): las operaciones de validación se
+  remuestrean 1000 veces. La pestaña *Evolución* muestra la probabilidad de acabar en
+  pérdidas y el drawdown típico y del peor 5 %, en "pérdidas medias" (≈ veces el
+  riesgo por operación: con riesgo 1 %, "peor 5 %: 6 pérdidas medias" ≈ −6 %).
 * El resultado completo se guarda en `evolved_params_<perfil>.json` y en
   `logs/evolution_history_<perfil>.jsonl`.
+
+**Cuánto protege la validación.** Con series de **puro ruido** (sin ventaja posible;
+8 series × 5 estrategias, configuración por defecto) se aceptaron 7 de 40
+combinaciones; el control de parámetros frágiles frenó otras 2. Casi todos esos
+falsos positivos tenían **pocas operaciones de validación (8-25)**. Por eso: dé más
+crédito a los resultados con ≥ 20-30 operaciones de validación, una probabilidad de
+pérdidas baja en el Monte Carlo y varias ventanas positivas. Si prefiere menos
+falsos positivos (y menos símbolos aceptados), suba `min_trades_oos` (p. ej. a 15).
+
+**Origen de las ideas.** Las estrategias `retroceso` y `compresion`, la confirmación
+de la reversión y los controles de robustez se inspiran en proyectos públicos
+(licencia MIT) que comparten sus resultados, incluidos los negativos:
+[vrd07/Quant_Trading](https://github.com/vrd07/Quant_Trading) (compresión → ruptura
+con margen mínimo y tendencia; retroceso con estocástico),
+[Mohammed-AB/forex-strategy-lab](https://github.com/Mohammed-AB/forex-strategy-lab)
+(Monte Carlo, ruptura fallida de Bollinger),
+[bek01/forex-trading-bot](https://github.com/bek01/forex-trading-bot) y
+[jjalww/algotrading-bot](https://github.com/jjalww/algotrading-bot) (qué no funcionó:
+apilar indicadores, ajustar tras cada día malo, conclusiones con 30-100 operaciones).
+No se ha copiado código: las reglas se han reescrito y se validan con el mismo
+walk-forward que el resto.
 
 ---
 
@@ -317,7 +349,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (158 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (172 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

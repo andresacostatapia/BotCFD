@@ -34,6 +34,7 @@
     "validation_windows": 3,
     "min_pf_oos": 1.0,
     "regime_filter": true,
+    "stability_check": true,
     "trading_hours": "",
     "exit_management": "ninguna",
     "be_atr_mult": 1.0,
@@ -68,7 +69,9 @@
     "scout_strategies": [
         "cruce_medias",
         "reversion_media",
-        "ruptura"
+        "ruptura",
+        "retroceso",
+        "compresion"
     ],
     "scout_max_symbols": 20,
     "scout_max_spread_atr": 0.15,

@@ -68,6 +68,9 @@ STRATEGY_SPACES: dict[str, dict[str, tuple[type, float, float]]] = {
         "bb_std": (float, 1.5, 3.0),
         "rsi_low": (float, 15.0, 40.0),
         "rsi_high": (float, 60.0, 85.0),
+        # 0 = entra al cerrar FUERA de la banda; 1 = espera a que el precio VUELVA a
+        # cerrar dentro (confirmación: evita "cazar cuchillos" en tendencias fuertes).
+        "confirm": (int, 0, 1),
     },
     # Ruptura: cierre por encima del máximo (o debajo del mínimo) de las N velas
     # anteriores, a favor de la tendencia (SMA larga).
@@ -75,12 +78,38 @@ STRATEGY_SPACES: dict[str, dict[str, tuple[type, float, float]]] = {
         "lookback": (int, 10, 100),
         "trend": (int, 20, 200),
     },
+    # Retroceso en tendencia: con la media de tendencia a favor, espera un retroceso
+    # (RSI de 3 velas en extremo) y entra cuando el precio reanuda la tendencia
+    # (cierre por encima del máximo de la vela anterior, o por debajo del mínimo).
+    "retroceso": {
+        "trend": (int, 50, 250),
+        "pb_rsi": (float, 5.0, 40.0),
+        "pb_window": (int, 1, 6),
+    },
+    # Compresión y ruptura: tras un periodo de volatilidad baja (ancho de Bollinger en
+    # el percentil bajo de las últimas 100 velas), ruptura del rango de N velas por un
+    # margen mínimo (x ATR) y a favor de la tendencia.
+    "compresion": {
+        "lookback": (int, 10, 60),
+        "squeeze_pct": (float, 0.05, 0.5),
+        "trend": (int, 50, 300),
+        "pen": (float, 0.0, 0.5),
+    },
 }
 STRATEGY_LABELS: dict[str, str] = {
     "cruce_medias": "Cruce de medias + RSI (tendencia)",
     "reversion_media": "Reversión a la media (Bandas de Bollinger + RSI)",
     "ruptura": "Ruptura de rango (máximo/mínimo de N velas + tendencia)",
+    "retroceso": "Retroceso en tendencia (media de tendencia + RSI(3) + reanudación)",
+    "compresion": "Compresión y ruptura (volatilidad baja -> ruptura a favor de tendencia)",
 }
+#: Estrategias que siguen la tendencia (el filtro ADX exige ADX > nivel); el resto, ADX < nivel.
+TREND_STRATEGIES: tuple[str, ...] = ("cruce_medias", "ruptura", "retroceso", "compresion")
+#: Periodo del RSI corto de la estrategia de retroceso y ventanas de la compresión.
+PB_RSI_PERIOD: int = 3
+SQUEEZE_BB_PERIOD: int = 20
+SQUEEZE_RANK_WINDOW: int = 100
+SQUEEZE_RECENT_BARS: int = 6
 DEFAULT_STRATEGY: str = "cruce_medias"
 
 #: Filtro de régimen: nivel de ADX (tendencia exige ADX > nivel; reversión, ADX < nivel).
@@ -135,6 +164,8 @@ _DEFAULTS: dict[str, Any] = {
     "flat_before_close_minutes": 0,
     "long_only": False,
     "commission_pct": 0.0,
+    # Robustez (desactivada en el evolucionador "suelto"; el bot la activa).
+    "stability_check": False,
 }
 
 
@@ -239,6 +270,8 @@ class IndicatorCache:
         self.bars_since_open = since
         self.bars_to_close = to_close
         self._std: dict[int, np.ndarray] = {}
+        self._rsi_short: np.ndarray | None = None
+        self._width_rank: np.ndarray | None = None
         self._highest: dict[int, np.ndarray] = {}
         self._lowest: dict[int, np.ndarray] = {}
 
@@ -259,6 +292,27 @@ class IndicatorCache:
                 lookup = np.array([hour_allowed(h, spec) for h in range(24)])
                 self._allowed[spec] = lookup[np.clip(self.hours, 0, 23)]
         return self._allowed[spec]
+
+    @property
+    def rsi_short(self) -> np.ndarray:
+        """RSI de ``PB_RSI_PERIOD`` velas (retrocesos cortos), calculado bajo demanda."""
+        if self._rsi_short is None:
+            self._rsi_short = rsi(self.close, PB_RSI_PERIOD).to_numpy()
+        return self._rsi_short
+
+    @property
+    def width_rank(self) -> np.ndarray:
+        """
+        Percentil (0-1) del ancho de Bollinger(20) de cada vela dentro de las últimas
+        ``SQUEEZE_RANK_WINDOW`` velas: valores bajos = volatilidad comprimida.
+        """
+        if self._width_rank is None:
+            mid = self.close.rolling(SQUEEZE_BB_PERIOD, min_periods=SQUEEZE_BB_PERIOD).mean()
+            sd = self.close.rolling(SQUEEZE_BB_PERIOD, min_periods=SQUEEZE_BB_PERIOD).std(ddof=0)
+            width = (sd / mid.abs().replace(0.0, np.nan))
+            self._width_rank = width.rolling(SQUEEZE_RANK_WINDOW, min_periods=SQUEEZE_RANK_WINDOW) \
+                .rank(pct=True).to_numpy()
+        return self._width_rank
 
     def rolling_std(self, period: int) -> np.ndarray:
         """Desviación típica móvil del cierre (para Bollinger), cacheada."""
@@ -303,6 +357,10 @@ def strategy_of(params: dict[str, Any]) -> str:
     """Deduce la estrategia a partir de las claves de los parámetros."""
     if "bb_period" in params:
         return "reversion_media"
+    if "squeeze_pct" in params:
+        return "compresion"
+    if "pb_rsi" in params:
+        return "retroceso"
     if "lookback" in params:
         return "ruptura"
     return "cruce_medias"
@@ -311,6 +369,8 @@ def strategy_of(params: dict[str, Any]) -> str:
 def warmup_bars(params: dict[str, Any]) -> int:
     """Velas mínimas para que los indicadores de la estrategia estén calculados."""
     periods = [int(params[k]) for k in ("fast", "slow", "bb_period", "lookback", "trend") if k in params]
+    if strategy_of(params) == "compresion":
+        periods.append(SQUEEZE_BB_PERIOD + SQUEEZE_RANK_WINDOW + SQUEEZE_RECENT_BARS)
     return max(periods + [RSI_PERIOD]) + 1
 
 
@@ -334,8 +394,10 @@ def normalize_params(
 ) -> dict[str, Any]:
     """Convierte y limita los parámetros al espacio de búsqueda."""
     if space is None:
-        space = {**STRATEGY_SPACES[strategy_of(params)],
-                 **{k: v for k, v in EXTRA_SPACE.items() if k in params}}
+        # Solo las claves presentes: parámetros guardados por versiones anteriores
+        # (sin genes añadidos después, como ``confirm``) siguen siendo válidos.
+        space = {k: v for k, v in {**STRATEGY_SPACES[strategy_of(params)], **EXTRA_SPACE}.items()
+                 if k in params}
     out: dict[str, Any] = {}
     for name, (kind, lo, hi) in space.items():
         value = float(params[name])
@@ -358,6 +420,12 @@ def _fresh(cond: np.ndarray, valid: np.ndarray) -> np.ndarray:
     valid_prev = np.roll(valid, 1)
     valid_prev[0] = False
     return cond & ~prev & valid & valid_prev
+
+
+def _recent(cond: np.ndarray, window: int) -> np.ndarray:
+    """True en la vela i si ``cond`` se cumplió en alguna de las ``window`` velas ANTERIORES."""
+    prev = pd.Series(np.asarray(cond, dtype=float)).shift(1, fill_value=0.0)
+    return prev.rolling(max(1, int(window)), min_periods=1).max().to_numpy() > 0
 
 
 def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
@@ -387,8 +455,54 @@ def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
         mid, sd = cache.sma(period), cache.rolling_std(period)
         lower, upper = mid - k * sd, mid + k * sd
         valid = ~(np.isnan(lower) | np.isnan(r))
-        sig[_fresh(c < lower, valid) & (r < float(params["rsi_low"]))] = 1
-        sig[_fresh(c > upper, valid) & (r > float(params["rsi_high"]))] = -1
+        if int(round(float(params.get("confirm", 0)))) >= 1:
+            # Confirmación: la vela anterior cerró fuera de la banda con RSI extremo
+            # y esta vuelve a cerrar dentro.
+            prev_out_low = np.roll((c < lower) & (r < float(params["rsi_low"])), 1)
+            prev_out_high = np.roll((c > upper) & (r > float(params["rsi_high"])), 1)
+            valid_prev = np.roll(valid, 1)
+            prev_out_low[0] = prev_out_high[0] = valid_prev[0] = False
+            sig[prev_out_low & valid_prev & valid & (c >= lower)] = 1
+            sig[prev_out_high & valid_prev & valid & (c <= upper)] = -1
+        else:
+            sig[_fresh(c < lower, valid) & (r < float(params["rsi_low"]))] = 1
+            sig[_fresh(c > upper, valid) & (r > float(params["rsi_high"]))] = -1
+
+    elif name == "retroceso":
+        trend = cache.sma(int(params["trend"]))
+        rs = cache.rsi_short
+        level, win = float(params["pb_rsi"]), max(1, int(params["pb_window"]))
+        n = len(cache)
+        slope_ref = np.full(n, np.nan)
+        slope_ref[5:] = trend[:-5]
+        prev_hi, prev_lo = np.full(n, np.nan), np.full(n, np.nan)
+        prev_hi[1:], prev_lo[1:] = cache.high[:-1], cache.low[:-1]
+        with np.errstate(invalid="ignore"):
+            up = (c > trend) & (trend > slope_ref)
+            dn = (c < trend) & (trend < slope_ref)
+            # ¿Hubo retroceso (RSI corto extremo) en alguna de las ``win`` velas anteriores?
+            dip = _recent(rs <= level, win)
+            pop = _recent(rs >= 100.0 - level, win)
+            long_c = up & dip & (c > prev_hi)
+            short_c = dn & pop & (c < prev_lo)
+        valid = ~(np.isnan(trend) | np.isnan(slope_ref) | np.isnan(rs) | np.isnan(prev_hi))
+        sig[_fresh(long_c, valid)] = 1
+        sig[_fresh(short_c, valid)] = -1
+
+    elif name == "compresion":
+        lb = int(params["lookback"])
+        hh, ll = cache.highest(lb), cache.lowest(lb)
+        trend = cache.sma(int(params["trend"]))
+        rank = cache.width_rank
+        pen = float(params["pen"]) * cache.atr
+        with np.errstate(invalid="ignore"):
+            squeeze = np.nan_to_num(rank, nan=1.0) <= float(params["squeeze_pct"])
+        # Compresión en alguna de las últimas velas (sin incluir la actual)
+        recent = _recent(squeeze, SQUEEZE_RECENT_BARS)
+        valid = ~(np.isnan(hh) | np.isnan(ll) | np.isnan(trend) | np.isnan(rank) | np.isnan(pen))
+        with np.errstate(invalid="ignore"):
+            sig[_fresh(c > hh + pen, valid) & recent & (c > trend)] = 1
+            sig[_fresh(c < ll - pen, valid) & recent & (c < trend)] = -1
 
     elif name == "ruptura":
         hh, ll = cache.highest(int(params["lookback"])), cache.lowest(int(params["lookback"]))
@@ -400,7 +514,7 @@ def signal_array(cache: IndicatorCache, params: dict[str, Any]) -> np.ndarray:
     if "adx" in params:  # filtro de régimen
         level = float(params["adx"])
         with np.errstate(invalid="ignore"):
-            ok = cache.adx < level if name == "reversion_media" else cache.adx > level
+            ok = cache.adx > level if name in TREND_STRATEGIES else cache.adx < level
         sig[~np.nan_to_num(ok, nan=0).astype(bool)] = 0
 
     return sig
@@ -414,7 +528,7 @@ def describe_state(cache: IndicatorCache, params: dict[str, Any], i: int) -> tup
     ind, wait = _describe_entry(cache, params, i)
     if "adx" in params:
         value, level = float(cache.adx[i]), float(params["adx"])
-        need = "<" if strategy_of(params) == "reversion_media" else ">"
+        need = ">" if strategy_of(params) in TREND_STRATEGIES else "<"
         ok = value < level if need == "<" else value > level
         ind += f" ADX {value:.1f}"
         wait += f" · ADX {value:.1f} (necesita {need} {level:.1f}{': OK' if ok else ': aún no'})"
@@ -444,6 +558,30 @@ def _describe_entry(cache: IndicatorCache, params: dict[str, Any], i: int) -> tu
         wait = (f"esperando cierre bajo {lower:.6g} con RSI < {float(params['rsi_low']):.1f} "
                 f"(compra) o sobre {upper:.6g} con RSI > {float(params['rsi_high']):.1f} "
                 f"(venta) · cierre {c:.6g} RSI {r:.1f}")
+        if int(round(float(params.get("confirm", 0)))) >= 1:
+            wait += " · y luego un cierre de vuelta dentro de la banda (confirmación)"
+        return ind, wait
+    if name == "retroceso":
+        trend = float(cache.sma(int(params["trend"]))[i])
+        rs, level = float(cache.rsi_short[i]), float(params["pb_rsi"])
+        ind = f"tendencia {trend:.6g} RSI({PB_RSI_PERIOD}) {rs:.1f}"
+        if c > trend:
+            wait = (f"tendencia alcista: esperando retroceso (RSI({PB_RSI_PERIOD}) <= {level:.1f}, "
+                    f"ahora {rs:.1f}) y luego cierre sobre el máximo de la vela anterior")
+        else:
+            wait = (f"tendencia bajista: esperando rebote (RSI({PB_RSI_PERIOD}) >= {100 - level:.1f}, "
+                    f"ahora {rs:.1f}) y luego cierre bajo el mínimo de la vela anterior")
+        return ind, wait
+    if name == "compresion":
+        lb = int(params["lookback"])
+        hh, ll = float(cache.highest(lb)[i]), float(cache.lowest(lb)[i])
+        trend = float(cache.sma(int(params["trend"]))[i])
+        rank = float(cache.width_rank[i])
+        ind = (f"máx {lb} velas {hh:.6g} mín {ll:.6g} tendencia {trend:.6g} "
+               f"volatilidad en percentil {rank:.0%}")
+        side = "ENCIMA del máximo" if c > trend else "DEBAJO del mínimo"
+        wait = (f"esperando compresión (percentil <= {float(params['squeeze_pct']):.0%}, ahora "
+                f"{rank:.0%}) y cierre por {side} + {float(params['pen']):.2f} x ATR")
         return ind, wait
     hh = float(cache.highest(int(params["lookback"]))[i])
     ll = float(cache.lowest(int(params["lookback"]))[i])
@@ -879,6 +1017,71 @@ def _run_backend(
 # ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
+def parameter_stability(
+    cache: IndicatorCache, params: dict[str, Any], start: int, end: int, config: dict[str, Any],
+    samples: int = 8, spread: float = 0.10, seed: int | None = 0,
+) -> dict[str, Any]:
+    """
+    Prueba de "meseta": evalúa ``samples`` variantes de ``params`` desplazando cada
+    parámetro al azar hasta ±``spread`` de su rango. Unos parámetros robustos siguen
+    ganando con valores vecinos; si solo funciona el valor exacto es un pico de suerte
+    (sobreajuste). Devuelve el PF mediano y mínimo de los vecinos y la fracción con PF >= 1.
+    """
+    space = build_search_space(config)
+    space.update({k: v for k, v in {**STRATEGY_SPACES[strategy_of(params)], **EXTRA_SPACE}.items()
+                  if k in params and k not in space})
+    keys = [k for k in params if k in space]
+    rng = np.random.default_rng(seed)
+    pfs: list[float] = []
+    for _ in range(max(1, int(samples))):
+        cand: dict[str, Any] = {}
+        for k in keys:
+            kind, lo, hi = space[k]
+            if kind is int and hi - lo <= 1:  # genes sí/no (p. ej. ``confirm``): se mantienen
+                cand[k] = params[k]
+            else:
+                cand[k] = float(params[k]) + float(rng.uniform(-spread, spread)) * (hi - lo)
+        p = normalize_params(cand, {k: space[k] for k in keys})
+        if params_are_valid(p):
+            pfs.append(backtest(cache, p, start, end, config).profit_factor)
+    if not pfs:
+        return {"samples": 0, "median_pf": 0.0, "min_pf": 0.0, "profitable_share": 0.0}
+    arr = np.asarray(pfs, dtype=float)
+    return {
+        "samples": len(pfs),
+        "median_pf": round(float(np.median(arr)), 4),
+        "min_pf": round(float(arr.min()), 4),
+        "profitable_share": round(float((arr >= 1.0).mean()), 3),
+    }
+
+
+def monte_carlo(pnls: list[float], runs: int = 1000, seed: int | None = 0) -> dict[str, Any] | None:
+    """
+    Remuestreo (bootstrap) de las operaciones de validación: ``runs`` secuencias de la
+    misma longitud elegidas al azar con reemplazo. Informa de la probabilidad de acabar
+    en pérdidas y del drawdown típico y del peor 5%, medidos en "pérdidas medias"
+    (con riesgo fijo por operación, 1 pérdida media ~ 1 x riesgo por operación).
+    """
+    arr = np.asarray(pnls, dtype=float)
+    if len(arr) < 5:
+        return None
+    rng = np.random.default_rng(seed)
+    sims = rng.choice(arr, size=(int(runs), len(arr)), replace=True)
+    equity = sims.cumsum(axis=1)
+    peak = np.maximum.accumulate(np.maximum(equity, 0.0), axis=1)
+    dd = (peak - equity).max(axis=1)
+    losses = arr[arr <= 0]
+    unit = float(-losses.mean()) if len(losses) and losses.mean() < 0 else float(np.abs(arr).mean())
+    unit = unit if unit > 0 else 1.0
+    return {
+        "runs": int(runs),
+        "trades": int(len(arr)),
+        "p_loss": round(float((equity[:, -1] <= 0).mean()), 3),
+        "dd50_losses": round(float(np.percentile(dd, 50)) / unit, 1),
+        "dd95_losses": round(float(np.percentile(dd, 95)) / unit, 1),
+    }
+
+
 def walk_forward_windows(n: int, train_ratio: float, k: int) -> list[tuple[int, int, int]]:
     """
     Ventanas walk-forward ancladas: [(fin_entreno, inicio_test, fin_test), ...].
@@ -918,7 +1121,9 @@ def evolve_parameters(
     PF de entrenamiento >= ``min_pf_in_sample``, PF de validación >= ``min_pf_oos``
     y >= ``oos_pf_ratio_min`` x PF de entrenamiento (con tope ``IS_PF_REFERENCE_CAP``),
     y (con K > 1) al menos el 60%
-    de las ventanas con PF >= 1.
+    de las ventanas con PF >= 1. Con ``stability_check``, además, los parámetros
+    vecinos (±10%) deben tener PF mediano >= 1 (ver ``parameter_stability``).
+    El resultado incluye un Monte Carlo informativo de la validación (``monte_carlo``).
 
     :returns: dict con ``accepted``, ``reason``, ``params``, ``in_sample``,
         ``out_of_sample``, ``in_sample_folds``, ``windows``, ``backend``,
@@ -993,6 +1198,10 @@ def evolve_parameters(
 
     is_folds = [backtest(cache, best, a, b, cfg).to_dict()
                 for a, b in fold_bounds(*fold_range, int(cfg["fitness_folds"]))]
+    stability = (parameter_stability(cache, best, fold_range[0], fold_range[1], cfg,
+                                     seed=0 if seed is None else int(seed))
+                 if cfg.get("stability_check") and params_are_valid(best) else None)
+    mc = monte_carlo(oos_m.pnls, seed=0 if seed is None else int(seed))
 
     reasons: list[str] = []
     if not params_are_valid(best):
@@ -1012,6 +1221,11 @@ def evolve_parameters(
         reasons.append(
             f"PF out-of-sample {oos_m.profit_factor:.3f} < {float(cfg['oos_pf_ratio_min']):.2f} x "
             f"PF in-sample ({threshold:.3f})"
+        )
+    if stability is not None and stability["median_pf"] < 1.0:
+        reasons.append(
+            f"parámetros frágiles: con valores vecinos (±10%) el PF mediano es "
+            f"{stability['median_pf']:.3f} < 1"
         )
     if not positive_ok:
         positives = sum(1 for wi in windows_info if wi["trades_oos"] > 0 and wi["pf_oos"] >= 1.0)
@@ -1042,6 +1256,8 @@ def evolve_parameters(
         "test_bars": n - split,
         "oos_days": oos_days,
         "trades_per_week": trades_per_week,
+        "stability": stability,
+        "monte_carlo": mc,
     }
     log = logger.info if accepted else logger.warning
     log(
@@ -1054,11 +1270,20 @@ def evolve_parameters(
         (" | ventanas: " + ", ".join(f"{w['pf_oos']:.2f}/{w['trades_oos']}" for w in windows_info))
         if windows_info else "",
     )
+    if stability is not None:
+        logger.info("Estabilidad de parámetros (vecinos ±10%%): PF mediano %.3f, mínimo %.3f, "
+                    "%.0f%% con PF >= 1", stability["median_pf"], stability["min_pf"],
+                    100 * stability["profitable_share"])
+    if mc is not None:
+        logger.info("Monte Carlo (validación, %d remuestreos): prob. de acabar en pérdidas %.0f%% | "
+                    "drawdown típico %.1f y peor 5%% %.1f pérdidas medias",
+                    mc["runs"], 100 * mc["p_loss"], mc["dd50_losses"], mc["dd95_losses"])
     return result
 
 
 __all__ = [
-    "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
+    "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "TREND_STRATEGIES", "parameter_stability",
+    "monte_carlo", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
     "strategy_of", "warmup_bars", "describe_state", "walk_forward_windows", "metrics_from_pnls",
     "REGIME_SPACE", "EXIT_SPACES", "EXTRA_SPACE", "adx", "detect_session_hours", "asset_config", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",

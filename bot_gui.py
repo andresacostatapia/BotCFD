@@ -99,8 +99,11 @@ STRATEGY_NAMES = {
     "cruce_medias": "Cruce de medias + RSI",
     "reversion_media": "Reversión a la media (Bollinger)",
     "ruptura": "Ruptura de rango",
+    "retroceso": "Retroceso en tendencia",
+    "compresion": "Compresión y ruptura",
 }
-STRATEGY_SHORT = {"cruce_medias": "Cruce", "reversion_media": "Reversión", "ruptura": "Ruptura"}
+STRATEGY_SHORT = {"cruce_medias": "Cruce", "reversion_media": "Reversión", "ruptura": "Ruptura",
+                  "retroceso": "Retroceso", "compresion": "Compresión"}
 ASSET_NAMES = {"auto": "Automático", "forex": "Forex", "indice": "Índice", "materia": "Materia prima",
                "cripto": "Cripto", "accion": "Acción", "otro": "Otro"}
 
@@ -110,6 +113,9 @@ PARAM_LABELS = {
     "bb_period": "Periodo Bollinger (velas)", "bb_std": "Ancho bandas (desv. típicas)",
     "rsi_low": "RSI máximo para comprar", "rsi_high": "RSI mínimo para vender",
     "lookback": "Rango de ruptura (velas)", "trend": "Media de tendencia (velas)",
+    "confirm": "Esperar vuelta dentro de la banda (1 = sí)",
+    "pb_rsi": "Retroceso: RSI(3) por debajo de", "pb_window": "Retroceso reciente (velas)",
+    "squeeze_pct": "Compresión: percentil de volatilidad", "pen": "Margen de ruptura (× ATR)",
     "adx": "Nivel ADX (filtro de régimen)", "sl_mult": "Stop loss (× ATR)",
     "tp_mult": "Take profit (× ATR)", "be_mult": "Break-even al avanzar (× ATR)",
     "trail_mult": "Trailing a (× ATR)",
@@ -161,7 +167,7 @@ BASIC_GROUPS: list[tuple[str, list[Field]]] = [
               "ninguna: solo SL/TP. breakeven: lleva el SL a la entrada al avanzar. trailing: el SL sigue al precio",
               VALID_EXIT_MODES),
         Field("max_bars_in_trade", "Cerrar tras N velas", "int", "Cierre por tiempo. 0 = desactivado"),
-        Field("regime_filter", "Filtro de régimen (ADX)", "bool", "Tendencia solo con ADX alto; reversión solo con ADX bajo (nivel evolucionado)"),
+        Field("regime_filter", "Filtro de régimen (ADX)", "bool", "Estrategias de tendencia solo con ADX alto; reversión solo con ADX bajo (nivel evolucionado)"),
         Field("evolve_sl_tp", "Evolucionar SL, TP y salida", "bool", "El algoritmo elige los multiplicadores de stop loss, take profit, break-even y trailing"),
     ]),
     ("Cuenta, inicio y avisos", [
@@ -191,6 +197,9 @@ ADVANCED_GROUPS: list[tuple[str, list[Field]]] = [
         Field("min_trades", "Mín. operaciones (entreno)", "int", "Menos operaciones penaliza y descarta"),
         Field("min_trades_oos", "Mín. operaciones (validación)", "int", "Mínimo de operaciones de validación"),
         Field("fitness_folds", "Tramos de fitness", "int", "Puntúa por el peor tramo del entrenamiento (1 = desactivado)"),
+        Field("stability_check", "Rechazar parámetros frágiles", "bool",
+              "Prueba valores vecinos (±10%) de los parámetros elegidos: si con ellos se pierde "
+              "dinero, era un pico de suerte y se descarta"),
         Field("commission_per_trade", "Comisión por operación (precio)", "float", "Se suma al spread histórico en el backtest"),
         Field("stock_commission_pct", "Comisión acciones (fracción)", "float",
               "Acciones: comisión estimada ida y vuelta como fracción del precio (0.001 = 0,1 %). "
@@ -281,6 +290,15 @@ def describe_params(params: dict[str, Any] | None) -> str:
         text = (f"Bollinger {params.get('bb_period')} × {fmt(params.get('bb_std'), '{:.2f}')} · "
                 f"RSI < {fmt(params.get('rsi_low'), '{:.1f}')} compra / "
                 f"> {fmt(params.get('rsi_high'), '{:.1f}')} venta")
+        if int(params.get("confirm") or 0):
+            text += " · con confirmación"
+    elif "squeeze_pct" in params:
+        text = (f"Compresión (percentil {fmt(params.get('squeeze_pct'), '{:.0%}')}) y ruptura de "
+                f"{params.get('lookback')} velas + {fmt(params.get('pen'), '{:.2f}')}× ATR · "
+                f"tendencia SMA {params.get('trend')}")
+    elif "pb_rsi" in params:
+        text = (f"Tendencia SMA {params.get('trend')} · retroceso RSI(3) < "
+                f"{fmt(params.get('pb_rsi'), '{:.0f}')} en {params.get('pb_window')} velas")
     elif "lookback" in params:
         text = f"Ruptura de {params.get('lookback')} velas · tendencia SMA {params.get('trend')}"
     else:
@@ -1215,9 +1233,9 @@ class ControlCenter(tk.Tk):
         self.params_tree = make_tree(evo_tab, [("param", "Parámetro", 200, "w"), ("value", "Valor", 80, "e")],
                                      height=5)
         self.params_tree.frame.pack(fill="x", pady=(6, 0))
-        self.metrics_tree = make_tree(evo_tab, [("metric", "Métrica", 150, "w"),
-                                                ("is", "Entrenamiento", 100, "e"),
-                                                ("oos", "Validación", 100, "e")], height=5)
+        self.metrics_tree = make_tree(evo_tab, [("metric", "Métrica", 200, "w"),
+                                                ("is", "Entrenamiento", 90, "e"),
+                                                ("oos", "Validación", 90, "e")], height=5)
         self.metrics_tree.frame.pack(fill="x", pady=(6, 0))
         self.windows_label = ttk.Label(evo_tab, text="", style="Muted.TLabel", wraplength=440)
         self.windows_label.pack(fill="x", pady=(4, 0))
@@ -1343,9 +1361,9 @@ class ControlCenter(tk.Tk):
         self.scout_strats = {st: tk.BooleanVar() for st in VALID_STRATEGIES}
         strow = ttk.Frame(left)
         strow.pack(fill="x")
-        for st, var in self.scout_strats.items():
+        for idx, (st, var) in enumerate(self.scout_strats.items()):
             cb = ttk.Checkbutton(strow, text=STRATEGY_SHORT[st], variable=var)
-            cb.pack(side="left", padx=(0, 6))
+            cb.grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 6))
             Tooltip(cb, STRATEGY_NAMES[st])
         grid = ttk.Frame(left)
         grid.pack(fill="x", pady=(8, 0))
@@ -1775,6 +1793,16 @@ class ControlCenter(tk.Tk):
                     tag = ("ok",) if oos_m[key] >= 1 else ("bad",)
                 self.metrics_tree.insert("", "end", tags=tag, values=(title, fmt(is_m.get(key), spec),
                                                                       fmt(oos_m.get(key), spec)))
+            stab = evo.get("stability") or {}
+            if stab.get("samples"):
+                self.metrics_tree.insert("", "end", tags=("ok",) if (stab.get("median_pf") or 0) >= 1 else ("bad",),
+                                         values=("Estabilidad (PF vecinos ±10%)", fmt(stab.get("median_pf")), "—"))
+            mc = evo.get("monte_carlo") or {}
+            if mc:
+                self.metrics_tree.insert("", "end", tags=("ok",) if (mc.get("p_loss") or 0) <= 0.2 else ("bad",),
+                                         values=("Monte Carlo: prob. pérdidas", "—", fmt(mc.get("p_loss"), "{:.0%}")))
+                self.metrics_tree.insert("", "end", values=(
+                    "Monte Carlo: drawdown peor 5%", "—", f"{fmt(mc.get('dd95_losses'), '{:g}')} × riesgo"))
             wins = evo.get("windows") or []
             self.windows_label.configure(text=("Ventanas de validación (PF / operaciones): " + " · ".join(
                 f"{fmt(w.get('pf_oos'))} / {w.get('trades_oos')}" for w in wins)) if wins else "")
