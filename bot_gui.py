@@ -715,6 +715,64 @@ class SymbolBrowser(tk.Toplevel):
         self.destroy()
 
 
+class TestTradeDialog(tk.Toplevel):
+    """Opciones de la operación de prueba: lado, SL/TP en ATR y cierre automático."""
+
+    def __init__(self, master: tk.Tk, cfg: dict[str, Any]) -> None:
+        super().__init__(master)
+        self.title(f"Operación de prueba — {cfg['symbol']}")
+        self.configure(bg=C_BG, padx=16, pady=14)
+        self.resizable(False, False)
+        self.transient(master)
+        self.result: dict[str, Any] | None = None
+        ttk.Label(self, text=f"Abre una operación REAL en la cuenta DEMO con el lote mínimo del bróker en "
+                             f"{cfg['symbol']}, para comprobar la ejecución sin esperar a una señal.\n"
+                             "No cuenta como operación del bot (magic de prueba).", wraplength=420,
+                  justify="left").pack(anchor="w")
+        grid = ttk.Frame(self)
+        grid.pack(fill="x", pady=(10, 0))
+        self.side = tk.StringVar(value="Compra")
+        self.sl = tk.StringVar(value="1.5")
+        self.tp = tk.StringVar(value="2.0")
+        self.minutes = tk.StringVar(value="5")
+        rows = [("Lado", self.side), ("Stop loss (× ATR)", self.sl), ("Take profit (× ATR)", self.tp),
+                ("Cerrar automáticamente tras (min, 0 = no)", self.minutes)]
+        for r, (label, var) in enumerate(rows):
+            ttk.Label(grid, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            if var is self.side:
+                w: tk.Widget = ttk.Combobox(grid, textvariable=var, values=["Compra", "Venta"], state="readonly",
+                                            width=10)
+            else:
+                w = ttk.Entry(grid, textvariable=var, width=10)
+            w.grid(row=r, column=1, sticky="w", padx=(10, 0), pady=3)
+        self.error = tk.Label(self, text="", bg=C_BG, fg=C_RED, font=F_SMALL)
+        self.error.pack(anchor="w")
+        buttons = ttk.Frame(self)
+        buttons.pack(anchor="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Abrir operación de prueba", style="Accent.TButton", command=self._ok).pack(
+            side="right", padx=8)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_reqwidth()) // 2
+        self.geometry(f"+{max(0, x)}+{master.winfo_rooty() + 150}")
+        self.grab_set()
+
+    def _ok(self) -> None:
+        try:
+            sl = float(self.sl.get().replace(",", "."))
+            tp = float(self.tp.get().replace(",", "."))
+            minutes = float(self.minutes.get().replace(",", "."))
+            if sl <= 0 or tp <= 0 or minutes < 0:
+                raise ValueError
+        except ValueError:
+            self.error.configure(text="Valores inválidos.")
+            return
+        self.result = {"side": "buy" if self.side.get() == "Compra" else "sell", "sl_mult": sl,
+                       "tp_mult": tp, "minutes": minutes}
+        self.destroy()
+
+
 class ProfileDialog(tk.Toplevel):
     """Edita lo propio de un símbolo: símbolo, timeframe, estrategia, spread, activo, simulación."""
 
@@ -1106,6 +1164,7 @@ class ControlCenter(tk.Tk):
         self.btn_stop.pack(side="left", padx=4)
         ttk.Button(row, text="Editar…", command=self.edit_profile).pack(side="left", padx=4)
         ttk.Button(row, text="Reiniciar (re-evoluciona)", command=self.restart_selected).pack(side="left", padx=4)
+        ttk.Button(row, text="Operación de prueba…", command=self.test_trade).pack(side="left", padx=4)
         ttk.Button(row, text="Eliminar", command=self.delete_profile).pack(side="right")
 
         right = ttk.Frame(paned, padding=(10, 0, 0, 0))
@@ -1962,9 +2021,70 @@ class ControlCenter(tk.Tk):
                 bp.request_stop()
                 self._append(bp, f"### {datetime.now():%H:%M:%S} Deteniendo…")
 
+    def test_trade(self) -> None:
+        """Abre una operación de PRUEBA (lote mínimo, solo DEMO) en el símbolo seleccionado."""
+        name = self.selected.get()
+        cfg = profile_config(name) if name else None
+        if not cfg:
+            messagebox.showinfo("Operación de prueba", "Seleccione un símbolo en la tabla.", parent=self)
+            return
+        dialog = TestTradeDialog(self, cfg)
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        opts = dialog.result
+        g = self._gcfg()
+        bp = self.procs.get(name)
+
+        def note(text: str) -> None:
+            if bp:
+                self._append(bp, f"### {datetime.now():%H:%M:%S} {text}")
+
+        def task(mt5c: Any) -> dict[str, Any]:
+            return mt5c.place_test_order(cfg["symbol"], opts["side"], cfg["timeframe"], opts["sl_mult"],
+                                         opts["tp_mult"], int(g.get("atr_period", 14)), int(g.get("deviation", 20)))
+
+        def done(res: dict[str, Any]) -> None:
+            if not res.get("ok"):
+                messagebox.showerror("Operación de prueba", res.get("error", "Error"), parent=self)
+                return
+            risk = f" · riesgo ≈ {res['risk']:.2f}" if res.get("risk") is not None else ""
+            msg = (f"{res['side']} {res['lot']:g} {cfg['symbol']} @ {fmt_price(res['price'])} · SL "
+                   f"{fmt_price(res['sl'])} · TP {fmt_price(res['tp'])}{risk}")
+            note(f"Operación de PRUEBA abierta #{res['ticket']}: {msg}")
+            Toast(self, "Operación de prueba abierta", msg + (f". Se cerrará en {opts['minutes']} min."
+                                                              if opts["minutes"] else "."), C_GREEN, 12)
+            if opts["minutes"]:
+                self.after(int(opts["minutes"] * 60_000), lambda: self._close_test(res["ticket"], cfg, note))
+
+        self.run_mt5(True, g.get("terminal_path") or None, task, done)
+
+    def _close_test(self, ticket: int, cfg: dict[str, Any], note: Callable[[str], None]) -> None:
+        g = self._gcfg()
+
+        def done(res: dict[str, Any]) -> None:
+            if not res.get("ok"):
+                Toast(self, "Operación de prueba", f"No se pudo cerrar #{ticket}: {res.get('error')}", C_RED, 12)
+                return
+            if res["closed"]:
+                result = res.get("result")
+                txt = f"resultado {result:+.2f}" if result is not None else "cerrada"
+                note(f"Operación de PRUEBA #{ticket} cerrada: {txt}")
+                Toast(self, "Operación de prueba cerrada", f"{cfg['symbol']} #{ticket}: {txt}",
+                      C_GREEN if (result or 0) >= 0 else C_ORANGE, 12)
+            else:
+                note(f"Operación de PRUEBA #{ticket}: ya estaba cerrada (SL/TP o manual)")
+
+        def task(mt5c: Any) -> dict[str, Any]:
+            closed, result = mt5c.close_test_position(ticket, int(g.get("deviation", 20)))
+            return {"closed": closed, "result": result}
+
+        self.run_mt5(True, g.get("terminal_path") or None, task, done)
+
     def emergency_close(self) -> None:
         """Detiene todos los bots y cierra TODAS las posiciones abiertas con magic de los bots."""
         magics = {c["magic"] for c in (profile_config(n) for n in list_profiles()) if c}
+        magics.add(20259999)  # operaciones de prueba (mt5_connector.TEST_MAGIC)
         if not magics:
             return
         if not messagebox.askyesno(

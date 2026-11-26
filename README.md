@@ -102,6 +102,20 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
 El modo automático (`scout_enabled`) funciona mientras el Centro de control está
 abierto. Estado en `logs/scout_state.json`; descartes en `logs/scout_decisions.json`.
 
+### Operación de prueba (solo cuenta demo)
+
+Para comprobar que las órdenes se ejecutan sin esperar a una señal: seleccione un
+símbolo con el mercado abierto y pulse **Operación de prueba…** (pestaña Operación).
+Elija *Compra/Venta*, el SL y el TP en múltiplos de ATR y los minutos tras los que se
+cerrará sola (0 = no se cierra; ciérrela usted o con *Cerrar posiciones de los bots…*).
+
+- Se niega si la cuenta **no es demo**, sin importar la configuración.
+- Usa el **lote mínimo** del bróker, con SL y TP en el servidor.
+- Lleva el magic `20259999` y el comentario `MT5Bot prueba`: **no cuenta** como operación
+  de ningún bot ni en sus estadísticas, pero sí la cierra *Cerrar posiciones de los bots…*.
+- El cierre automático lo hace el Centro de control: si lo cierra antes, la posición
+  sigue abierta con su SL/TP.
+
 ### Acciones (modo acciones)
 
 Las acciones CFD (p. ej. `AAPL.US`, `SAN.ES`) se detectan solas por la categoría
@@ -303,7 +317,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (151 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (158 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

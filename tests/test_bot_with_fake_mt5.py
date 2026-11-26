@@ -614,3 +614,18 @@ def test_evolution_reports_trades_per_week(synthetic_ohlc) -> None:
     out = se.evolve_parameters(synthetic_ohlc, pop=6, gens=2, seed=1)
     assert out["oos_days"] == pytest.approx(600 / 24, rel=0.01)
     assert out["trades_per_week"] == pytest.approx(out["out_of_sample"]["trades"] / (out["oos_days"] / 7), abs=0.01)
+
+
+def test_test_order_demo_only_and_close(fake: FakeMT5) -> None:
+    from tests.fake_mt5 import ACCOUNT_TRADE_MODE_REAL
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    res = mt5_connector.place_test_order("EURUSD", "buy", "H1")
+    assert res["ok"] and res["side"] == "BUY" and res["lot"] == 0.01
+    assert res["sl"] < res["price"] < res["tp"] and res["risk"] > 0
+    pos = fake.positions[-1]
+    assert pos.magic == mt5_connector.TEST_MAGIC and fake.orders[-1]["comment"] == "MT5Bot prueba"
+    closed, result = mt5_connector.close_test_position(res["ticket"])
+    assert closed == 1 and result is not None and fake.positions == []
+    fake.trade_mode = ACCOUNT_TRADE_MODE_REAL
+    assert "DEMO" in mt5_connector.place_test_order("EURUSD", "sell")["error"]
+    assert "no existe" in (fake.__setattr__("trade_mode", 0) or mt5_connector.place_test_order("XXX", "buy"))["error"]

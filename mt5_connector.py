@@ -585,6 +585,62 @@ def modify_position_sl(position: Any, new_sl: float) -> bool:
     return False
 
 
+#: Magic de las operaciones de prueba (no cuentan como operaciones de ningún bot).
+TEST_MAGIC: int = 20259999
+TEST_COMMENT: str = "MT5Bot prueba"
+
+
+def place_test_order(symbol: str, side: str, timeframe: str = "H1", sl_mult: float = 1.5,
+                     tp_mult: float = 2.0, atr_period: int = 14, deviation: int = 20) -> dict[str, Any]:
+    """
+    Operación de PRUEBA con el lote mínimo del bróker y SL/TP por ATR (solo cuentas DEMO).
+
+    Sirve para comprobar la ejecución de punta a punta sin esperar a una señal.
+    :returns: dict con ok, error, ticket, side, lot, price, sl, tp, risk (dinero en riesgo).
+    """
+    m = _require_mt5()
+    account = m.account_info()
+    if account is None or account.trade_mode != m.ACCOUNT_TRADE_MODE_DEMO:
+        return {"ok": False, "error": "Las operaciones de prueba solo se permiten en cuentas DEMO."}
+    if not ensure_symbol(symbol):
+        return {"ok": False, "error": f"El símbolo '{symbol}' no existe en el bróker."}
+    df = get_rates(symbol, timeframe, max(atr_period * 3, 60))
+    tick = get_tick(symbol)
+    spec = get_symbol_spec(symbol)
+    if df.empty or tick is None or spec is None or not getattr(tick, "bid", 0):
+        return {"ok": False, "error": f"{symbol}: sin cotización ahora (¿mercado cerrado?)."}
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr_value = float(tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().iloc[-1])
+    min_stop = get_min_stop_distance(symbol)
+    sl_dist = max(sl_mult * atr_value, 1.5 * min_stop)
+    tp_dist = max(tp_mult * atr_value, 1.5 * min_stop)
+    is_buy = side.lower() == "buy"
+    price = float(tick.ask if is_buy else tick.bid)
+    sl = price - sl_dist if is_buy else price + sl_dist
+    tp = price + tp_dist if is_buy else price - tp_dist
+    lot = float(spec.volume_min)
+    risk = sl_dist / spec.tick_size * spec.tick_value * lot if spec.tick_size > 0 else None
+    result = send_market_order(symbol, side, lot, sl, tp, TEST_MAGIC, deviation=deviation, comment=TEST_COMMENT)
+    if result is None:
+        return {"ok": False, "error": f"El bróker rechazó la orden: {m.last_error()} (vea el log)."}
+    return {"ok": True, "ticket": int(getattr(result, "order", 0) or 0), "side": "BUY" if is_buy else "SELL",
+            "lot": lot, "price": float(getattr(result, "price", 0) or price), "sl": sl, "tp": tp,
+            "risk": risk, "atr": atr_value}
+
+
+def close_test_position(ticket: int | None = None, deviation: int = 20) -> tuple[int, float | None]:
+    """Cierra la operación de prueba ``ticket`` (o todas). Devuelve (cerradas, resultado si es una)."""
+    m = _require_mt5()
+    closed = 0
+    for pos in m.positions_get() or ():
+        if pos.magic == TEST_MAGIC and (ticket is None or pos.ticket == ticket):
+            if close_position(pos, deviation):
+                closed += 1
+    result = get_position_result(ticket) if ticket and closed else None
+    return closed, result
+
+
 def close_positions_by_magics(magics: set[int], deviation: int = 20) -> tuple[int, int]:
     """
     Cierre de emergencia: cierra TODAS las posiciones abiertas con esos magics
