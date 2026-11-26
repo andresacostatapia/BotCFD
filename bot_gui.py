@@ -1051,7 +1051,7 @@ class ControlCenter(tk.Tk):
             side="left", pady=(3, 0))
         self.header_status = tk.Label(bar, text="", bg=C_HEADER, fg="#a5d6a7", font=F_BOLD)
         self.header_status.pack(side="left", padx=24)
-        tk.Label(bar, text="Framework educativo · use cuenta DEMO · no garantiza rentabilidad",
+        tk.Label(bar, text="Framework no garantiza rentabilidad",
                  bg=C_HEADER, fg="#ffcc80", font=F_SMALL).pack(side="right")
 
     # ======================================================= pestaña Operación
