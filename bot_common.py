@@ -175,6 +175,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "evolver_seed": None,             # int para reproducibilidad, o null
     "commission_per_trade": 0.00007,  # coste fijo estimado por trade (precio)
     "stock_commission_pct": 0.001,    # acciones: comisión estimada ida y vuelta (0.001 = 0,1 % del precio)
+    "stock_max_lot": 1000.0,          # acciones: lote máximo (1 lote = 1 acción); sustituye a max_lot
     "min_trades": 20,                 # mínimo de trades in-sample sin penalizar
     "min_trades_oos": 5,              # mínimo de trades out-of-sample
     "fitness_folds": 3,               # tramos del entrenamiento; fitness = peor tramo (1 = desactivado)
@@ -473,6 +474,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     co = config.get("commission_override")
     if co is not None and (isinstance(co, bool) or not isinstance(co, (int, float)) or co < 0):
         errors.append("'commission_override' debe ser null o un número >= 0")
+    sml = _num("stock_max_lot")
+    if sml is not None and sml <= 0:
+        errors.append("'stock_max_lot' debe ser > 0")
     scp = _num("stock_commission_pct")
     if scp is not None and not 0 <= scp < 0.05:
         errors.append("'stock_commission_pct' debe estar entre 0 y 0.05")

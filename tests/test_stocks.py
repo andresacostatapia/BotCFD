@@ -161,3 +161,33 @@ def test_live_long_only_ignores_sell(stock_bot, caplog) -> None:
     finally:
         trading_bot.compute_signal = original
     assert fake.orders == [] and "solo admite compras" in caplog.text
+
+
+def test_stock_max_lot_replaces_general(stock_bot) -> None:
+    bot, _fake = stock_bot
+    assert bot.rules["max_lot"] == 1000.0 and bot.risk.max_lot == 1000.0
+    fx = se.asset_config({**bot_common.DEFAULT_CONFIG}, "forex", False)
+    assert fx["max_lot"] == bot_common.DEFAULT_CONFIG["max_lot"]
+
+
+def test_default_max_spread_auto_adjusted(monkeypatch, tmp_path, stock_df) -> None:
+    fake = FakeMT5(stock_df)
+    monkeypatch.setattr(mt5_connector, "mt5", fake)
+    monkeypatch.setattr(mt5_connector, "_connected", False)
+    path = tmp_path / "risk_config_nvda.json"
+    bot_common.save_profile({"symbol": "AAPL.US", "timeframe": "H1", "strategy": "ruptura", "magic": 9,
+                             "max_spread": 0.0002}, path)
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(path), path, dry_run=True)
+    bot.resolve_asset()
+    bot.update_rules(stock_df)                      # spread habitual 0.02
+    assert bot.risk.max_spread == pytest.approx(0.05)
+    assert bot_common.load_config(path)["max_spread"] == pytest.approx(0.05)   # guardado en el perfil
+
+
+def test_custom_low_max_spread_only_warns(stock_bot, caplog, stock_df) -> None:
+    bot, _fake = stock_bot
+    bot.config["max_spread"] = 0.005               # puesto a mano, menor que el habitual 0.02
+    caplog.set_level("WARNING")
+    bot.update_rules(stock_df)
+    assert bot.risk.max_spread == pytest.approx(0.005) and "casi nunca abrirá" in caplog.text

@@ -115,6 +115,8 @@ reglas propias, iguales en el backtest, el bot, el Laboratorio y el Explorador:
 | **Cerrar antes del cierre** de la sesión: no se queda abierto de un día a otro (sin hueco nocturno ni swap) | 15 min | `flat_before_close_minutes` (0 = mantener) |
 | **Solo compras** si el bróker no permite vender esa acción | según el bróker | `long_only` |
 | **Comisión** en % del precio (ida y vuelta) | 0,1 % (`stock_commission_pct`, general) | `commission_override` (precio fijo por operación) |
+| **Lote máximo** en acciones (1 lote = 1 acción) | 1000 (`stock_max_lot`, general) | — |
+| **Spread máximo**: si quedó el valor por defecto (0.0002, de EURUSD), el bot lo ajusta a ~2,5× el spread habitual del historial y lo guarda; si es un valor propio demasiado bajo, solo avisa | automático | `max_spread` |
 
 El tipo de activo se puede fijar a mano (`asset_class`: `accion`, `indice`,
 `forex`, `materia`, `cripto`, `otro`); con `auto` lo decide el bróker. Para el
@@ -301,7 +303,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (148 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (151 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

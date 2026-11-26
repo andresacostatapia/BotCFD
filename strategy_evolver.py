@@ -538,6 +538,8 @@ def asset_config(config: dict[str, Any], asset_class: str, long_only: bool,
     if is_stock and not str(cfg.get("session_hours") or "").strip() and df is not None:
         cfg["session_hours"] = detect_session_hours(df)
     cfg["commission_pct"] = float(cfg.get("stock_commission_pct", 0.001)) if is_stock else 0.0
+    if is_stock:  # en acciones 1 lote = 1 acción: el máximo general (pensado para forex) no sirve
+        cfg["max_lot"] = float(cfg.get("stock_max_lot", 1000.0))
     if cfg.get("commission_override") is not None:
         cfg["commission_per_trade"] = float(cfg["commission_override"])
         cfg["commission_pct"] = 0.0
@@ -948,7 +950,8 @@ def evolve_parameters(
         "1 corte" if k == 1 else f"walk-forward {k} ventanas", pop, gens, int(cfg["fitness_folds"]),
         "evolucionados" if cfg.get("evolve_sl_tp") else
         f"fijos ({cfg['sl_atr_mult']}x / {cfg['tp_atr_mult']}x ATR)",
-        "sí" if cfg.get("regime_filter") else "no", cfg.get("trading_hours") or "24 h",
+        "sí" if cfg.get("regime_filter") else "no",
+        " y ".join(h for h in (cfg.get("trading_hours"), cfg.get("session_hours")) if h) or "24 h",
         cfg.get("exit_management", "ninguna"), backend_name,
     )
 

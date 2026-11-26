@@ -23,6 +23,7 @@
     "evolver_seed": null,
     "commission_per_trade": 7e-05,
     "stock_commission_pct": 0.001,
+    "stock_max_lot": 1000.0,
     "min_trades": 20,
     "min_trades_oos": 5,
     "fitness_folds": 3,

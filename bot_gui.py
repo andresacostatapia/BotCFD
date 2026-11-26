@@ -149,7 +149,9 @@ BASIC_GROUPS: list[tuple[str, list[Field]]] = [
               "cuenta: equity de toda la cuenta", ("bots", "cuenta")),
         Field("max_open_positions_total", "Máx. posiciones a la vez", "int", "Entre todos los símbolos. 0 = sin límite"),
         Field("min_lot", "Lote mínimo", "float", "Límite inferior de lote (además del del bróker)"),
-        Field("max_lot", "Lote máximo", "float", "Límite superior de lote"),
+        Field("max_lot", "Lote máximo", "float", "Límite superior de lote (forex, índices, materias…)"),
+        Field("stock_max_lot", "Lote máximo acciones", "float",
+              "En acciones 1 lote = 1 acción: límite de acciones por operación (sustituye a 'Lote máximo')"),
     ]),
     ("Horario y salidas", [
         Field("trading_hours", "Horario (hora servidor)", "combo",

@@ -32,8 +32,9 @@ from typing import Any
 
 import mt5_connector as mt5c
 from bot_common import (
-    CONFIG_PATH, ProfilePaths, config_path_for, global_config_path, hour_allowed, list_profiles,
-    load_config, now_iso, profile_paths, read_json, session_clock, setup_logging, write_json_atomic,
+    CONFIG_PATH, PROFILE_KEYS, ProfilePaths, config_path_for, global_config_path, hour_allowed,
+    list_profiles, load_config, now_iso, profile_paths, read_json, save_profile, session_clock,
+    setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
 from strategy_evolver import asset_config, compute_signal, evolve_parameters, warmup_bars
@@ -261,6 +262,38 @@ class TradingBot:
         self.rules = asset_config(cfg, self.asset_class, self.broker_long_only, df)
         if df is not None and self.asset_class == "accion" and not str(self.config.get("session_hours") or "").strip():
             self.detected_session = str(self.rules.get("session_hours") or "")
+        if df is not None:
+            self.check_max_spread(df)
+        self.risk.update_config(self.rules)  # p. ej. lote máximo de acciones
+
+    def check_max_spread(self, df: Any) -> None:
+        """
+        Avisa (y corrige si se dejó el valor por defecto) cuando el spread máximo es
+        menor que el spread habitual del símbolo: el bot nunca abriría operaciones.
+        """
+        if "spread_price" not in getattr(df, "columns", []):
+            return
+        typical = float(df["spread_price"].tail(500).median())
+        current = float(self.config.get("max_spread", 0.0))
+        if typical <= 0 or current >= 1.2 * typical:
+            return
+        suggested = float(f"{typical * 2.5:.2g}")
+        default = 0.0002
+        if abs(current - default) < 1e-12:  # se quedó el valor por defecto de EURUSD: se corrige solo
+            self.config["max_spread"] = suggested
+            self.rules["max_spread"] = suggested
+            try:
+                own = {k: self.config[k] for k in PROFILE_KEYS}
+                save_profile(own, self.config_path)
+                self.config_mtime = self._config_stamp()
+            except (ValueError, OSError):
+                logger.exception("No se pudo guardar el spread máximo ajustado")
+            logger.warning("Spread máximo ajustado automáticamente: %.6g -> %.6g (spread habitual de %s: %.6g).",
+                           current, suggested, self.config["symbol"], typical)
+        else:
+            logger.warning("El spread máximo (%.6g) es menor que el spread habitual de %s (%.6g): el bot "
+                           "casi nunca abrirá operaciones. Súbalo a ~%.6g en Editar….",
+                           current, self.config["symbol"], typical, suggested)
 
     def evolve(self) -> bool:
         """Descarga histórico, evoluciona parámetros y valida walk-forward."""
