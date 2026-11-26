@@ -555,3 +555,31 @@ def test_order_registered_for_management(fake: FakeMT5, config_file) -> None:
     ticket = fake.positions[-1].ticket
     rec = bot.registry.get(ticket)
     assert rec["atr"] > 0 and rec["side"] in (1, -1)
+
+
+def test_categories_skip_common_root_folder() -> None:
+    items = [
+        {"name": "EURUSD", "path": "Markets\\Forex\\Majors\\EURUSD", "asset_class": "forex"},
+        {"name": "EURTRY", "path": "Markets\\Forex\\Exotics\\EURTRY", "asset_class": "forex"},
+        {"name": "US500", "path": "Markets\\Indices\\US500", "asset_class": "indice"},
+        {"name": "AAPL.US", "path": "Markets\\Shares\\US\\AAPL.US", "asset_class": "accion"},
+    ]
+    mt5_connector.assign_categories(items)
+    assert [d["category"] for d in items] == ["Forex", "Forex", "Indices", "Shares"]
+    assert items[0]["subcategory"] == "Forex / Majors" and items[3]["subcategory"] == "Shares / US"
+    assert items[2]["subcategory"] == "Indices"
+
+
+def test_categories_fall_back_to_asset_class() -> None:
+    items = [{"name": "EURUSD", "path": "Markets\\EURUSD", "asset_class": "forex"},
+             {"name": "US500", "path": "Markets\\US500", "asset_class": "indice"}]
+    mt5_connector.assign_categories(items)
+    assert [d["category"] for d in items] == ["Forex", "Indices"]
+
+
+def test_scout_matches_subcategory() -> None:
+    import scout
+    symbols = [{"name": "AAPL.US", "category": "Shares", "subcategory": "Shares / US"},
+               {"name": "SAN.ES", "category": "Shares", "subcategory": "Shares / Spain"}]
+    chosen, _ = scout.select_universe(symbols, ["Shares / US"], 10, 1.0, lambda n: 0.01)
+    assert chosen == ["AAPL.US"]

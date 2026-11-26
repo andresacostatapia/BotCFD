@@ -86,7 +86,8 @@ def select_universe(symbols: list[dict[str, Any]], categories: list[str], max_sy
     """
     wanted = {c.lower() for c in categories}
     pool = [s for s in symbols if s.get("tradable", True)
-            and (not wanted or str(s.get("category", "")).lower() in wanted)]
+            and (not wanted or str(s.get("category", "")).lower() in wanted
+                 or str(s.get("subcategory", "")).lower() in wanted)]
     ranked: list[tuple[float, str]] = []
     skipped: list[str] = []
     for s in pool:

@@ -1242,7 +1242,18 @@ class ControlCenter(tk.Tk):
         ttk.Label(tab, text="Revisa periódicamente los símbolos de las categorías elegidas y PROPONE los que "
                             "superan una validación más exigente en varias exploraciones seguidas. Usted decide "
                             "cuáles activar (se crean en simulación).", style="Muted.TLabel",
-                  wraplength=1200).pack(fill="x", pady=(0, 8))
+                  wraplength=1200).pack(fill="x", pady=(0, 6))
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(0, 8))
+        self.btn_scout_now = ttk.Button(bar, text="Explorar ahora", style="Accent.TButton", command=self.scout_now)
+        self.btn_scout_now.pack(side="left")
+        self.btn_scout_stop = ttk.Button(bar, text="Detener explorador", command=self.scout_stop)
+        self.btn_scout_stop.pack(side="left", padx=6)
+        ttk.Button(bar, text="Guardar configuración", command=self.scout_save).pack(side="left")
+        self.scout_progress = ttk.Progressbar(bar, mode="determinate", length=220)
+        self.scout_progress.pack(side="left", padx=(16, 8))
+        self.scout_status = ttk.Label(bar, text="", style="Muted.TLabel", wraplength=600)
+        self.scout_status.pack(side="left", fill="x", expand=True)
         body = ttk.Frame(tab)
         body.pack(fill="both", expand=True)
 
@@ -1252,11 +1263,17 @@ class ControlCenter(tk.Tk):
         crow.pack(fill="x")
         ttk.Label(crow, text="Categorías del bróker:", font=F_BOLD).pack(side="left")
         ttk.Button(crow, text="Cargar", command=self.scout_load_categories).pack(side="right")
-        self.scout_cats = tk.Listbox(left, height=7, selectmode="multiple", font=F_BASE, width=28,
+        cat_frame = ttk.Frame(left)
+        cat_frame.pack(fill="x", pady=(4, 2))
+        self.scout_cats = tk.Listbox(cat_frame, height=9, selectmode="multiple", font=F_BASE, width=30,
                                      activestyle="none", exportselection=False)
-        self.scout_cats.pack(fill="x", pady=(4, 2))
-        ttk.Label(left, text="Clic para marcar/desmarcar. 'Cargar' lee las categorías de MT5.",
-                  style="Muted.TLabel", wraplength=240).pack(fill="x")
+        cat_scroll = ttk.Scrollbar(cat_frame, orient="vertical", command=self.scout_cats.yview)
+        self.scout_cats.configure(yscrollcommand=cat_scroll.set)
+        self.scout_cats.pack(side="left", fill="x", expand=True)
+        cat_scroll.pack(side="right", fill="y")
+        ttk.Label(left, text="Clic para marcar/desmarcar. Puede elegir una categoría entera (p. ej. "
+                             "Forex) o una subcategoría (p. ej. Shares / US).",
+                  style="Muted.TLabel", wraplength=260).pack(fill="x")
         ttk.Label(left, text="Timeframes:", font=F_BOLD).pack(anchor="w", pady=(8, 0))
         tfrow = ttk.Frame(left)
         tfrow.pack(fill="x")
@@ -1265,38 +1282,35 @@ class ControlCenter(tk.Tk):
             ttk.Checkbutton(tfrow, text=tf, variable=var).pack(side="left", padx=(0, 6))
         ttk.Label(left, text="Estrategias:", font=F_BOLD).pack(anchor="w", pady=(8, 0))
         self.scout_strats = {st: tk.BooleanVar() for st in VALID_STRATEGIES}
+        strow = ttk.Frame(left)
+        strow.pack(fill="x")
         for st, var in self.scout_strats.items():
-            ttk.Checkbutton(left, text=STRATEGY_NAMES[st], variable=var).pack(anchor="w")
+            cb = ttk.Checkbutton(strow, text=STRATEGY_SHORT[st], variable=var)
+            cb.pack(side="left", padx=(0, 6))
+            Tooltip(cb, STRATEGY_NAMES[st])
         grid = ttk.Frame(left)
         grid.pack(fill="x", pady=(8, 0))
         self.scout_vars: dict[str, tk.StringVar] = {}
-        rows = [("scout_interval_minutes", "Explorar cada (min)", "Intervalo entre exploraciones automáticas"),
-                ("scout_max_symbols", "Máx. símbolos", "Se exploran los de menor spread relativo al ATR"),
-                ("scout_max_spread_atr", "Spread máx. / ATR", "0.15 = descarta símbolos cuyo spread supera el 15% "
-                                                             "del movimiento medio de una vela H1"),
-                ("scout_min_pf_oos", "PF validación mín.", "Más exigente que el bot (por defecto 1.2)"),
-                ("scout_min_trades_oos", "Op. validación mín.", "Operaciones mínimas en la validación"),
-                ("scout_confirmations", "Confirmaciones", "Exploraciones SEGUIDAS aceptada antes de proponer")]
-        for r, (key, label, help_text) in enumerate(rows):
+        rows = [("scout_interval_minutes", "Cada (min)", "Intervalo entre exploraciones automáticas"),
+                ("scout_max_symbols", "Máx. símb.", "Se exploran los de menor spread relativo al ATR"),
+                ("scout_max_spread_atr", "Spread/ATR", "0.15 = descarta símbolos cuyo spread supera el 15% "
+                                                      "del movimiento medio de una vela H1"),
+                ("scout_min_pf_oos", "PF mín.", "PF de validación mínimo: más exigente que el bot (1.2)"),
+                ("scout_min_trades_oos", "Op. mín.", "Operaciones mínimas en la validación"),
+                ("scout_confirmations", "Confirm.", "Exploraciones SEGUIDAS aceptada antes de proponer")]
+        for idx, (key, label, help_text) in enumerate(rows):
+            r, c = divmod(idx, 2)
             lbl = ttk.Label(grid, text=label)
-            lbl.grid(row=r, column=0, sticky="w", pady=2)
+            lbl.grid(row=r, column=c * 2, sticky="w", pady=2, padx=(0 if c == 0 else 10, 0))
             Tooltip(lbl, help_text)
             var = tk.StringVar()
-            ttk.Entry(grid, textvariable=var, width=8).grid(row=r, column=1, sticky="e", padx=(8, 0), pady=2)
+            ent = ttk.Entry(grid, textvariable=var, width=6)
+            ent.grid(row=r, column=c * 2 + 1, sticky="w", padx=(6, 0), pady=2)
+            Tooltip(ent, help_text)
             self.scout_vars[key] = var
         self.scout_enabled = tk.BooleanVar()
-        ttk.Checkbutton(left, text="Explorar automáticamente", variable=self.scout_enabled).pack(
+        ttk.Checkbutton(left, text="Explorar automáticamente (al guardar)", variable=self.scout_enabled).pack(
             anchor="w", pady=(8, 0))
-        ttk.Button(left, text="Guardar", command=self.scout_save).pack(fill="x", pady=(8, 2))
-        self.btn_scout_now = ttk.Button(left, text="Explorar ahora", style="Accent.TButton",
-                                        command=self.scout_now)
-        self.btn_scout_now.pack(fill="x", pady=2)
-        self.btn_scout_stop = ttk.Button(left, text="Detener explorador", command=self.scout_stop)
-        self.btn_scout_stop.pack(fill="x", pady=2)
-        self.scout_progress = ttk.Progressbar(left, mode="determinate", length=200)
-        self.scout_progress.pack(fill="x", pady=(10, 2))
-        self.scout_status = ttk.Label(left, text="", style="Muted.TLabel", wraplength=240)
-        self.scout_status.pack(fill="x")
 
         right = ttk.Frame(body, padding=(10, 0, 0, 0))
         right.pack(side="left", fill="both", expand=True)
@@ -2275,25 +2289,36 @@ class ControlCenter(tk.Tk):
 
     def scout_load_categories(self) -> None:
         """Rellena la lista de categorías con las del bróker (y cuántos símbolos tiene cada una)."""
-        chosen = {self.scout_cats.get(i).split("  (")[0] for i in self.scout_cats.curselection()}
+        chosen = {self.scout_cats.get(i).strip().split("  (")[0] for i in self.scout_cats.curselection()}
 
         def fill(symbols: list[dict[str, Any]]) -> None:
             counts: dict[str, int] = {}
+            subs: dict[str, dict[str, int]] = {}
             for d in symbols:
                 if d.get("tradable", True):
-                    counts[d["category"]] = counts.get(d["category"], 0) + 1
+                    cat = d["category"]
+                    sub = d.get("subcategory") or cat
+                    counts[cat] = counts.get(cat, 0) + 1
+                    if sub != cat:
+                        subs.setdefault(cat, {})[sub] = subs.get(cat, {}).get(sub, 0) + 1
             self.scout_cats.delete(0, "end")
             for cat in sorted(counts, key=str.lower):
                 self.scout_cats.insert("end", f"{cat}  ({counts[cat]})")
                 if cat in chosen:
                     self.scout_cats.selection_set("end")
+                if len(subs.get(cat, {})) > 1:
+                    for sub in sorted(subs[cat], key=str.lower):
+                        self.scout_cats.insert("end", f"      {sub}  ({subs[cat][sub]})")
+                        if sub in chosen:
+                            self.scout_cats.selection_set("end")
 
         self.with_symbol_list(fill)
 
     def _scout_values(self) -> dict[str, Any]:
         """Lee el formulario del explorador; ValueError si algo es inválido."""
         values: dict[str, Any] = {
-            "scout_categories": [self.scout_cats.get(i).split("  (")[0] for i in self.scout_cats.curselection()],
+            "scout_categories": [self.scout_cats.get(i).strip().split("  (")[0]
+                                 for i in self.scout_cats.curselection()],
             "scout_timeframes": [tf for tf, v in self.scout_tfs.items() if v.get()],
             "scout_strategies": [st for st, v in self.scout_strats.items() if v.get()],
             "scout_enabled": bool(self.scout_enabled.get()),
@@ -2375,6 +2400,8 @@ class ControlCenter(tk.Tk):
                     if info.get("total"):
                         self.scout_progress.configure(maximum=info["total"], value=info.get("done", 0))
                     self.scout_status.configure(text=info.get("message", ""))
+                    if info.get("stage") == "fin":
+                        self._render_scout(force=True)
                 elif line.startswith("SCOUT_PROPOSAL "):
                     proposals.append(read_json_line(line[len("SCOUT_PROPOSAL "):]) or {})
                 elif "[ERROR]" in line or "Traceback" in line:
@@ -2393,6 +2420,7 @@ class ControlCenter(tk.Tk):
                   f"{names}{'…' if len(proposals) > 6 else ''}. Revíselas en la pestaña Explorador.", C_GREEN, 15)
         if not bp.running and bp.lines.empty() and not bp.reported:
             bp.reported = True
+            self._render_scout(force=True)
             if bp.exit_code not in (0, None):
                 self.scout_status.configure(text=f"El explorador terminó con error (código {bp.exit_code}). "
                                                  "Vea logs/scout.log.")
@@ -2568,7 +2596,9 @@ class ControlCenter(tk.Tk):
         for fld in ALL_FIELDS:
             value = cfg.get(fld.key, DEFAULT_CONFIG.get(fld.key))
             var = self.gvars[fld.key]
-            if fld.kind == "bool":
+            if value is None and fld.kind in ("float", "int"):
+                var.set("")
+            elif fld.kind == "bool":
                 var.set(bool(value))
             elif fld.kind == "optint":
                 var.set("" if value is None else str(value))

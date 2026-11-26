@@ -266,13 +266,51 @@ def symbol_asset_info(symbol: str) -> tuple[str, bool]:
     return asset, bool(long_only)
 
 
+_ASSET_LABELS = {"forex": "Forex", "indice": "Indices", "materia": "Commodities", "cripto": "Crypto",
+                 "accion": "Shares", "otro": "Otros"}
+
+
+def path_segments(path: str, name: str) -> list[str]:
+    """Carpetas de la ruta del símbolo en MT5 (sin el propio nombre del símbolo)."""
+    segs = [p.strip() for p in path.replace("/", "\\").split("\\") if p.strip()]
+    if segs and segs[-1].lower() == name.lower():
+        segs = segs[:-1]
+    return segs
+
+
+def assign_categories(items: list[dict[str, Any]]) -> None:
+    """
+    Calcula ``category`` y ``subcategory`` de cada símbolo.
+
+    Se ignoran las carpetas raíz comunes a TODOS los símbolos (p. ej. Pepperstone
+    agrupa todo en 'Markets\\...'), de modo que la categoría sea el primer nivel que
+    distingue (Forex, Indices, Shares...). Si aun así no hay al menos dos categorías,
+    se usa el tipo de activo detectado.
+    """
+    seg_lists = [path_segments(d.get("path", ""), d["name"]) for d in items]
+    non_empty = [s for s in seg_lists if s]
+    k = 0
+    if non_empty:
+        while all(len(s) > k + 1 and s[k] == non_empty[0][k] for s in non_empty):
+            k += 1
+    for d, segs in zip(items, seg_lists):
+        rest = segs[k:] if len(segs) > k else segs[-1:]
+        d["category"] = rest[0] if rest else "Otros"
+        d["subcategory"] = " / ".join(rest[:2]) if len(rest) > 1 else d["category"]
+    if len({d["category"] for d in items}) < 2:
+        for d in items:
+            d["category"] = _ASSET_LABELS.get(d.get("asset_class", "otro"), "Otros")
+            d["subcategory"] = d["category"]
+
+
 def list_symbols() -> list[dict[str, Any]]:
     """
     Todos los símbolos del bróker para el buscador del Centro de control.
 
-    :returns: lista de dicts con name, description, category (primer nivel de la
-              ruta, p. ej. 'Forex' o 'Indices'), path, spread (precio actual, None si
-              no hay cotización), digits, volume_min, visible y tradable.
+    :returns: lista de dicts con name, description, category / subcategory (niveles
+              de la ruta que distinguen, p. ej. 'Forex' y 'Forex / Majors'), path,
+              spread (precio actual, None si no hay cotización), digits, volume_min,
+              visible, tradable, long_only y asset_class.
     """
     m = _require_mt5()
     symbols = m.symbols_get() or ()
@@ -286,7 +324,6 @@ def list_symbols() -> list[dict[str, Any]]:
             "name": s.name,
             "description": str(getattr(s, "description", "") or ""),
             "path": path,
-            "category": path.replace("/", "\\").split("\\")[0] if path else "Otros",
             "spread": spread_pts * point if spread_pts > 0 and point > 0 else None,
             "digits": int(getattr(s, "digits", 5) or 5),
             "volume_min": float(getattr(s, "volume_min", 0.0) or 0.0),
@@ -296,6 +333,7 @@ def list_symbols() -> list[dict[str, Any]]:
             "asset_class": classify_symbol(s.name, path, str(getattr(s, "description", "") or ""),
                                            getattr(s, "trade_calc_mode", None)),
         })
+    assign_categories(out)
     out.sort(key=lambda d: (d["category"].lower(), d["name"].lower()))
     return out
 
