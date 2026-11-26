@@ -41,11 +41,18 @@ LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
 VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura")
 VALID_EXIT_MODES: tuple[str, ...] = ("ninguna", "breakeven", "trailing")
+VALID_ASSET_CLASSES: tuple[str, ...] = ("auto", "forex", "indice", "materia", "cripto", "accion", "otro")
 
 #: Claves propias de cada símbolo/perfil. Todo lo demás es configuración general.
 PROFILE_KEYS: tuple[str, ...] = (
     "symbol", "timeframe", "strategy", "max_spread", "magic", "enabled", "simulation",
+    "asset_class", "session_hours", "avoid_open_minutes", "flat_before_close_minutes",
+    "long_only", "commission_override",
 )
+
+#: Valores que el modo acciones usa cuando el perfil los deja en automático (-1).
+STOCK_DEFAULT_AVOID_OPEN_MINUTES: int = 15
+STOCK_DEFAULT_FLAT_BEFORE_CLOSE_MINUTES: int = 15
 
 # ---------------------------------------------------------------------------
 # Perfiles (varias instancias del bot, cada una con su risk_config_<nombre>.json)
@@ -153,6 +160,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "require_demo": True,
     "enabled": True,                  # el perfil participa en "Iniciar activos"
     "simulation": True,               # True = calcula todo pero NO envía órdenes
+    # --- Por símbolo: tipo de activo y horario (modo acciones) ---
+    "asset_class": "auto",            # auto | forex | indice | materia | cripto | accion | otro
+    "session_hours": "",              # horario propio del símbolo (servidor); "" = automático para acciones
+    "avoid_open_minutes": -1,         # no entrar en los primeros N min de la sesión (-1 = auto: 15 en acciones)
+    "flat_before_close_minutes": -1,  # cerrar N min antes del cierre de la sesión (-1 = auto: 15 en acciones)
+    "long_only": False,               # solo compras (se activa solo si el bróker no permite vender)
+    "commission_override": None,      # comisión por operación de ESTE símbolo (precio); null = la general
     # --- Avanzadas: evolución / backtest ---
     "history_bars": 2000,             # velas históricas para evolucionar
     "population": 20,
@@ -160,6 +174,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "evolver_backend": "auto",        # "auto" | "strategy-genome" | "deap"
     "evolver_seed": None,             # int para reproducibilidad, o null
     "commission_per_trade": 0.00007,  # coste fijo estimado por trade (precio)
+    "stock_commission_pct": 0.001,    # acciones: comisión estimada ida y vuelta (0.001 = 0,1 % del precio)
     "min_trades": 20,                 # mínimo de trades in-sample sin penalizar
     "min_trades_oos": 5,              # mínimo de trades out-of-sample
     "fitness_folds": 3,               # tramos del entrenamiento; fitness = peor tramo (1 = desactivado)
@@ -231,6 +246,25 @@ def hour_allowed(hour: int, spec: str) -> bool:
         return True
     start, end = rng
     return start <= hour < end if start < end else (hour >= start or hour < end)
+
+
+def session_clock(hour: int, minute: int, spec: str) -> tuple[bool, int, int]:
+    """
+    Posición dentro de una sesión 'HH-HH' (hora del servidor).
+
+    :returns: (dentro de la sesión, minutos desde la apertura, minutos hasta el cierre).
+              Fuera de la sesión o con ``spec`` vacío devuelve minutos = -1 cuando no aplica.
+    """
+    rng = parse_hours(spec) if spec and spec.strip() else None
+    if rng is None:
+        return True, -1, -1
+    start, end = rng
+    now = hour * 60 + minute
+    length = ((end - start) % 24 or 24) * 60
+    since = (now - start * 60) % (24 * 60)
+    if since >= length:
+        return False, -1, -1
+    return True, since, length - since
 
 
 def global_config_path(profile_path: Path | None = None) -> Path:
@@ -424,6 +458,24 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         value = _num(key)
         if value is not None and value <= 0:
             errors.append(f"'{key}' debe ser > 0")
+
+    if config.get("asset_class") not in VALID_ASSET_CLASSES:
+        errors.append(f"'asset_class' debe ser uno de {VALID_ASSET_CLASSES}")
+    sh = config.get("session_hours")
+    if not isinstance(sh, str) or (sh.strip() and parse_hours(sh) is None):
+        errors.append("'session_hours' debe estar vacío o tener la forma 'HH-HH'")
+    for key in ("avoid_open_minutes", "flat_before_close_minutes"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < -1:
+            errors.append(f"'{key}' debe ser un entero >= -1 (-1 = automático)")
+    if not isinstance(config.get("long_only"), bool):
+        errors.append("'long_only' debe ser true/false")
+    co = config.get("commission_override")
+    if co is not None and (isinstance(co, bool) or not isinstance(co, (int, float)) or co < 0):
+        errors.append("'commission_override' debe ser null o un número >= 0")
+    scp = _num("stock_commission_pct")
+    if scp is not None and not 0 <= scp < 0.05:
+        errors.append("'stock_commission_pct' debe estar entre 0 y 0.05")
 
     if not isinstance(config.get("scout_enabled"), bool):
         errors.append("'scout_enabled' debe ser true/false")

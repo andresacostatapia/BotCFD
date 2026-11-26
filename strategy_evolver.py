@@ -38,7 +38,9 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from bot_common import hour_allowed
+from bot_common import (
+    STOCK_DEFAULT_AVOID_OPEN_MINUTES, STOCK_DEFAULT_FLAT_BEFORE_CLOSE_MINUTES, hour_allowed,
+)
 
 logger = logging.getLogger("strategy_evolver")
 
@@ -127,6 +129,12 @@ _DEFAULTS: dict[str, Any] = {
     "be_atr_mult": 1.0,
     "trail_atr_mult": 2.0,
     "max_bars_in_trade": 0,
+    # Modo acciones (desactivado por defecto; ver asset_config()).
+    "session_hours": "",
+    "avoid_open_minutes": 0,
+    "flat_before_close_minutes": 0,
+    "long_only": False,
+    "commission_pct": 0.0,
 }
 
 
@@ -201,10 +209,35 @@ class IndicatorCache:
         self._sma: dict[int, np.ndarray] = {}
         self._adx: np.ndarray | None = None
         self._allowed: dict[str, np.ndarray] = {}
+        n = len(self.df)
         if "time" in self.df.columns:
-            self.hours = pd.to_datetime(self.df["time"]).dt.hour.to_numpy()
+            times = pd.to_datetime(self.df["time"])
+            self.hours = times.dt.hour.to_numpy()
+            secs = ((times - pd.Timestamp("1970-01-01", tz=times.dt.tz)) // pd.Timedelta(seconds=1)).to_numpy()
+            diffs = np.diff(secs)
+            self.bar_seconds = float(np.median(diffs)) if len(diffs) else 0.0
+            # Hueco después de la vela j (cierre de sesión / fin de semana)
+            gap = np.zeros(n, dtype=bool)
+            if self.bar_seconds > 0 and n > 1:
+                gap[:-1] = diffs > 1.5 * self.bar_seconds
         else:
-            self.hours = np.full(len(self.df), -1)
+            self.hours = np.full(n, -1)
+            self.bar_seconds = 0.0
+            gap = np.zeros(n, dtype=bool)
+        self.gap_after = gap
+        # Velas desde la apertura de la sesión (0 = primera vela tras un hueco) y hasta el cierre
+        since = np.zeros(n, dtype=int)
+        to_close = np.full(n, 10**9, dtype=int)
+        for j in range(1, n):
+            since[j] = 0 if gap[j - 1] else since[j - 1] + 1
+        last_gap = None
+        for j in range(n - 1, -1, -1):
+            if gap[j]:
+                last_gap = j
+            if last_gap is not None:
+                to_close[j] = last_gap - j
+        self.bars_since_open = since
+        self.bars_to_close = to_close
         self._std: dict[int, np.ndarray] = {}
         self._highest: dict[int, np.ndarray] = {}
         self._lowest: dict[int, np.ndarray] = {}
@@ -451,6 +484,67 @@ def compute_signal(df: pd.DataFrame, params: dict[str, Any], atr_period: int = 1
 
 
 # ---------------------------------------------------------------------------
+# Modo acciones
+# ---------------------------------------------------------------------------
+def detect_session_hours(df: pd.DataFrame, min_share: float = 0.6) -> str:
+    """
+    Deduce el horario de negociación (hora del servidor) a partir de las velas.
+
+    Devuelve '' si el mercado cotiza (casi) 24 h; si no, 'HH-HH' con las horas en las
+    que hay velas en al menos ``min_share`` de los días con datos.
+    """
+    if df is None or "time" not in df.columns or len(df) < 50:
+        return ""
+    times = pd.to_datetime(df["time"])
+    days = times.dt.normalize()
+    n_days = days.nunique()
+    if n_days < 3:
+        return ""
+    per_hour = times.dt.hour.groupby(times.dt.hour).apply(lambda h: days[h.index].nunique())
+    active = sorted(int(h) for h, d in per_hour.items() if d >= min_share * n_days)
+    if not active or len(active) >= 22:
+        return ""
+    # Ventana contigua más larga (puede cruzar medianoche)
+    hours = set(active)
+    best_start, best_len = active[0], 0
+    for h in active:
+        if (h - 1) % 24 in hours:
+            continue
+        length = 0
+        while (h + length) % 24 in hours and length < 24:
+            length += 1
+        if length > best_len:
+            best_start, best_len = h, length
+    return f"{best_start}-{(best_start + best_len) % 24 or 24}"
+
+
+def asset_config(config: dict[str, Any], asset_class: str, long_only: bool,
+                 df: pd.DataFrame | None = None) -> dict[str, Any]:
+    """
+    Configuración efectiva según el tipo de activo (bot, laboratorio y explorador).
+
+    Para acciones: horario de sesión (el del perfil o el detectado en ``df``),
+    evitar la apertura y cerrar antes del cierre (-1 = 15 min), solo compras si el
+    bróker no permite vender y comisión en % del precio (``stock_commission_pct``),
+    salvo que el perfil fije ``commission_override``. Para el resto, -1 = desactivado.
+    """
+    cfg = dict(config)
+    is_stock = asset_class == "accion"
+    for key, default in (("avoid_open_minutes", STOCK_DEFAULT_AVOID_OPEN_MINUTES),
+                         ("flat_before_close_minutes", STOCK_DEFAULT_FLAT_BEFORE_CLOSE_MINUTES)):
+        value = int(cfg.get(key, -1) if cfg.get(key) is not None else -1)
+        cfg[key] = (default if is_stock else 0) if value < 0 else value
+    cfg["long_only"] = bool(cfg.get("long_only")) or bool(long_only)
+    if is_stock and not str(cfg.get("session_hours") or "").strip() and df is not None:
+        cfg["session_hours"] = detect_session_hours(df)
+    cfg["commission_pct"] = float(cfg.get("stock_commission_pct", 0.001)) if is_stock else 0.0
+    if cfg.get("commission_override") is not None:
+        cfg["commission_per_trade"] = float(cfg["commission_override"])
+        cfg["commission_pct"] = 0.0
+    return cfg
+
+
+# ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
 @dataclass
@@ -467,11 +561,13 @@ class BacktestMetrics:
     win_rate: float = 0.0
     max_drawdown: float = 0.0
     pnls: list[float] = field(default_factory=list, repr=False)
+    #: (vela de entrada, vela de salida, lado) de cada operación
+    log: list[tuple[int, int, int]] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Representación serializable (redondeada, sin la lista de operaciones)."""
         return {k: (round(v, 6) if isinstance(v, float) else v)
-                for k, v in asdict(self).items() if k != "pnls"}
+                for k, v in asdict(self).items() if k not in ("pnls", "log")}
 
 
 def metrics_from_pnls(pnls: list[float], pf_cap: float = 10.0) -> BacktestMetrics:
@@ -514,7 +610,11 @@ def backtest(
       ``trailing`` arrastra el SL a ``trail_mult`` x ATR del mejor precio.
     * ``max_bars_in_trade`` > 0: cierre al cierre de la vela N.
     * Posición abierta al final del rango -> se cierra al último cierre.
-    * Coste: ``commission_per_trade`` + spread histórico de la vela de entrada.
+    * Coste: ``commission_per_trade`` + spread histórico de la vela de entrada
+      + ``commission_pct`` x precio de entrada (acciones).
+    * Modo acciones: solo entra dentro de ``session_hours``, no en las primeras
+      velas de la sesión (``avoid_open_minutes``) ni justo antes del cierre, cierra al
+      final de la sesión (``flat_before_close_minutes``) y, con ``long_only``, solo compra.
     """
     cfg = {**_DEFAULTS, **(config or {})}
     commission = float(cfg["commission_per_trade"])
@@ -526,16 +626,29 @@ def backtest(
     max_bars = int(cfg.get("max_bars_in_trade", 0) or 0)
 
     sig = signal_array(cache, params)
-    allowed = cache.session_allowed(str(cfg.get("trading_hours", "")))
+    allowed = (cache.session_allowed(str(cfg.get("trading_hours", "")))
+               & cache.session_allowed(str(cfg.get("session_hours", ""))))
+    bar_min = cache.bar_seconds / 60.0 if cache.bar_seconds else 0.0
+    avoid = int(cfg.get("avoid_open_minutes", 0) or 0)
+    if avoid > 0 and bar_min > 0:
+        allowed = allowed & (cache.bars_since_open >= math.ceil(avoid / bar_min))
+    flat = int(cfg.get("flat_before_close_minutes", 0) or 0)
+    flat_bars = max(1, math.ceil(flat / bar_min)) if flat > 0 and bar_min > 0 else 0
+    if flat_bars:
+        allowed = allowed & (cache.bars_to_close >= flat_bars)  # no entrar justo antes del cierre
+    long_only = bool(cfg.get("long_only", False))
+    pct = float(cfg.get("commission_pct", 0.0) or 0.0)
     o, hi, lo, c, a = cache.open_, cache.high, cache.low, cache.close_np, cache.atr
     end = min(end, len(cache))
 
     pnls: list[float] = []
+    log: list[tuple[int, int, int]] = []
     i = max(start, 1)
     while i < end - 1:
         side = sig[i]
         atr_i = a[i]
-        if side == 0 or not allowed[i + 1] or not math.isfinite(atr_i) or atr_i <= 0:
+        if side == 0 or not allowed[i + 1] or not math.isfinite(atr_i) or atr_i <= 0 \
+                or (long_only and side == -1):
             i += 1
             continue
         entry = o[i + 1]
@@ -565,6 +678,9 @@ def backtest(
             if max_bars and (j - i) >= max_bars:
                 exit_price, exit_idx = c[j], j
                 break
+            if flat_bars and cache.bars_to_close[j] < flat_bars:  # cierre antes del fin de sesión
+                exit_price, exit_idx = c[j], j
+                break
             # Gestión de la salida con la información de la vela j (vale desde la j+1).
             if side == 1:
                 best = max(best, hi[j])
@@ -579,11 +695,14 @@ def backtest(
                 elif mode == "trailing":
                     sl = min(sl, best + trail_mult * atr_i)
 
-        pnl = (exit_price - entry) * side - commission - cache.spread[i + 1]
+        pnl = (exit_price - entry) * side - commission - cache.spread[i + 1] - pct * entry
         pnls.append(float(pnl))
+        log.append((i + 1, exit_idx, int(side)))
         i = max(exit_idx, i + 1)  # tras salir se pueden buscar nuevas señales
 
-    return metrics_from_pnls(pnls, float(cfg["pf_cap"]))
+    metrics = metrics_from_pnls(pnls, float(cfg["pf_cap"]))
+    metrics.log = log
+    return metrics
 
 
 def fitness_from_metrics(metrics: BacktestMetrics, min_trades: int) -> float:
@@ -931,7 +1050,7 @@ def evolve_parameters(
 __all__ = [
     "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
     "strategy_of", "warmup_bars", "describe_state", "walk_forward_windows", "metrics_from_pnls",
-    "REGIME_SPACE", "EXIT_SPACES", "EXTRA_SPACE", "adx", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
+    "REGIME_SPACE", "EXIT_SPACES", "EXTRA_SPACE", "adx", "detect_session_hours", "asset_config", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",
     "normalize_params", "params_are_valid", "fold_bounds", "sma", "rsi", "atr",
 ]

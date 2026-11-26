@@ -122,7 +122,8 @@ def update_state(state: dict[str, Any], results: list[dict[str, Any]], confirmat
             c.update(symbol=r["symbol"], timeframe=r["timeframe"], strategy=r["strategy"],
                      streak=int(c.get("streak", 0)) + 1, last_seen=now,
                      last={k: r.get(k) for k in ("pf_oos", "trades_oos", "pf_is", "windows",
-                                                 "win_rate_oos", "spread", "params", "reason")})
+                                                 "win_rate_oos", "spread", "params", "reason",
+                                                 "asset_class", "long_only", "session_hours")})
             candidates[key] = c
         else:
             candidates.pop(key, None)
@@ -182,7 +183,8 @@ def scan_once(config: dict[str, Any], base_dir: Path = BASE_DIR,
                                             float(config["scout_max_spread_atr"]), cost_ratio)
         _emit("SCOUT_PROGRESS", {"stage": "datos", "message": f"Descargando historial de {len(universe)} "
                                                               f"símbolos ({len(skipped)} omitidos)…"})
-        data, spreads, problems = lab.load_data(universe, timeframes, int(config["history_bars"]))
+        meta: dict[str, dict[str, Any]] = {}
+        data, spreads, problems = lab.load_data(universe, timeframes, int(config["history_bars"]), meta)
     finally:
         mt5c.safe_shutdown()
 
@@ -201,7 +203,7 @@ def scan_once(config: dict[str, Any], base_dir: Path = BASE_DIR,
 
     _emit("SCOUT_PROGRESS", {"stage": "evaluando", "done": 0, "total": total,
                              "message": f"Evaluando {total} combinaciones…"})
-    results = lab.run_lab(jobs, data, strict, spreads, workers, on_result, stop)
+    results = lab.run_lab(jobs, data, strict, spreads, workers, on_result, stop, meta)
 
     now = now_iso()
     state = read_json(state_path) or {}

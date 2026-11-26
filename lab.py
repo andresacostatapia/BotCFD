@@ -40,7 +40,7 @@ from bot_common import (
     BASE_DIR, LOG_DIR, VALID_STRATEGIES, VALID_TIMEFRAMES, load_global_config, now_iso,
     setup_logging, write_json_atomic,
 )
-from strategy_evolver import evolve_parameters
+from strategy_evolver import asset_config, evolve_parameters
 
 logger = logging.getLogger("lab")
 
@@ -58,10 +58,18 @@ def _worker_init() -> None:
     logging.getLogger().setLevel(logging.CRITICAL)
 
 
-def evaluate_job(job: Job, df: pd.DataFrame, config: dict[str, Any], spread: float | None) -> dict[str, Any]:
-    """Evoluciona y valida una combinación; devuelve un resumen serializable."""
+def evaluate_job(job: Job, df: pd.DataFrame, config: dict[str, Any], spread: float | None,
+                 meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Evoluciona y valida una combinación; devuelve un resumen serializable.
+
+    ``meta`` = {"asset_class", "long_only"} del símbolo: con acciones se aplican
+    el horario de la sesión, la comisión en % y las demás reglas (``asset_config``).
+    """
     symbol, timeframe, strategy = job
-    cfg = {**config, "symbol": symbol, "timeframe": timeframe, "strategy": strategy}
+    meta = meta or {}
+    asset = str(meta.get("asset_class") or "otro")
+    cfg = asset_config({**config, "symbol": symbol, "timeframe": timeframe, "strategy": strategy},
+                       asset, bool(meta.get("long_only")), df)
     started = time.monotonic()
     try:
         res = evolve_parameters(df, pop=int(cfg["population"]), gens=int(cfg["generations"]), config=cfg)
@@ -89,6 +97,9 @@ def evaluate_job(job: Job, df: pd.DataFrame, config: dict[str, Any], spread: flo
         "windows": f"{positives}/{len(windows)}" if windows else "",
         "bars": len(df),
         "spread": spread,
+        "asset_class": asset,
+        "long_only": bool(cfg.get("long_only")),
+        "session_hours": cfg.get("session_hours") or "",
         "seconds": round(time.monotonic() - started, 1),
     }
 
@@ -111,6 +122,7 @@ def run_lab(
     workers: int = 1,
     on_result: Callable[[dict[str, Any], int, int], None] | None = None,
     should_stop: Callable[[], bool] = lambda: False,
+    meta: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Evalúa las combinaciones (en paralelo si ``workers`` > 1) y las devuelve ordenadas.
@@ -120,6 +132,7 @@ def run_lab(
     :param should_stop: si devuelve True, se cancela lo pendiente.
     """
     spreads = spreads or {}
+    meta = meta or {}
     runnable = [j for j in jobs if (j[0], j[1]) in data]
     total = len(runnable)
     results: list[dict[str, Any]] = []
@@ -133,11 +146,12 @@ def run_lab(
         for job in runnable:
             if should_stop():
                 break
-            _done(evaluate_job(job, data[(job[0], job[1])], config, spreads.get(job[0])))
+            _done(evaluate_job(job, data[(job[0], job[1])], config, spreads.get(job[0]), meta.get(job[0])))
     else:
         with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as pool:
             pending: dict[Future[dict[str, Any]], Job] = {
-                pool.submit(evaluate_job, job, data[(job[0], job[1])], config, spreads.get(job[0])): job
+                pool.submit(evaluate_job, job, data[(job[0], job[1])], config, spreads.get(job[0]),
+                            meta.get(job[0])): job
                 for job in runnable
             }
             while pending:
@@ -154,8 +168,12 @@ def run_lab(
 
 
 def load_data(symbols: list[str], timeframes: list[str], bars: int,
+              meta: dict[str, dict[str, Any]] | None = None,
               ) -> tuple[dict[tuple[str, str], pd.DataFrame], dict[str, float | None], list[str]]:
-    """Descarga de MT5 las velas cerradas de cada símbolo y timeframe (y el spread actual)."""
+    """
+    Descarga de MT5 las velas cerradas de cada símbolo y timeframe (y el spread actual).
+    Si se pasa ``meta``, lo rellena con el tipo de activo y si solo admite compras.
+    """
     import mt5_connector as mt5c
 
     data: dict[tuple[str, str], pd.DataFrame] = {}
@@ -167,6 +185,9 @@ def load_data(symbols: list[str], timeframes: list[str], bars: int,
             continue
         sp = mt5c.get_spread(symbol)
         spreads[symbol] = None if sp != sp else sp
+        if meta is not None:
+            asset, long_only = mt5c.symbol_asset_info(symbol)
+            meta[symbol] = {"asset_class": asset, "long_only": long_only}
         for tf in timeframes:
             df = mt5c.get_rates(symbol, tf, bars + 1)
             if df.empty or len(df) < 400:
@@ -223,7 +244,8 @@ def main(argv: list[str] | None = None) -> int:
                                            terminal_path=config.get("terminal_path") or None):
             _emit("LAB_PROGRESS", {"stage": "error", "message": "No se pudo conectar con MetaTrader 5"})
             return 3
-        data, spreads, problems = load_data(symbols, timeframes, bars)
+        meta: dict[str, dict[str, Any]] = {}
+        data, spreads, problems = load_data(symbols, timeframes, bars, meta)
     except SystemExit as exc:
         _emit("LAB_PROGRESS", {"stage": "error", "message": str(exc)})
         return 3
@@ -250,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
                                           f"{result['strategy']} -> "
                                           f"{'ACEPTADA' if result['accepted'] else 'descartada'}"})
 
-    results = run_lab(jobs, data, config, spreads, workers, on_result, STOP_FLAG.exists)
+    results = run_lab(jobs, data, config, spreads, workers, on_result, STOP_FLAG.exists, meta)
     payload["results"] = results
     payload["finished"] = now_iso()
     payload["stopped"] = STOP_FLAG.exists()

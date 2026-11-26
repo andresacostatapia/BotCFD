@@ -231,6 +231,41 @@ def find_similar_symbols(symbol: str, limit: int = 8) -> list[str]:
     return ranked[:limit]
 
 
+_STOCK_SUFFIX = re.compile(r"\.(US|UK|DE|FR|ES|IT|NL|AU|HK|JP|CH|SE|NO|DK|PT|BE|AT|IE|FI|CA)$", re.I)
+
+
+def classify_symbol(name: str, path: str = "", description: str = "", calc_mode: int | None = None) -> str:
+    """
+    Tipo de activo a partir del nombre, la ruta y la descripción del bróker:
+    'accion', 'indice', 'materia', 'cripto', 'forex' u 'otro'.
+    """
+    text = f"{path} {description}".lower()
+    if (calc_mode in (32, 38) or _STOCK_SUFFIX.search(name)
+            or any(k in text for k in ("share", "stock", "equit", "acción", "accion", "acciones"))):
+        return "accion"
+    if any(k in text for k in ("crypto", "bitcoin", "ethereum")):
+        return "cripto"
+    if any(k in text for k in ("indic", "index", "indices")):
+        return "indice"
+    if any(k in text for k in ("metal", "gold", "silver", "commod", "energ", "oil", "agri", "softs")):
+        return "materia"
+    if any(k in text for k in ("forex", "fx", "currenc")) or re.fullmatch(r"[A-Z]{6}([._-]\w+)?", name):
+        return "forex"
+    return "otro"
+
+
+def symbol_asset_info(symbol: str) -> tuple[str, bool]:
+    """(tipo de activo, solo compras) de un símbolo según el bróker."""
+    m = _require_mt5()
+    info = m.symbol_info(symbol)
+    if info is None:
+        return "otro", False
+    asset = classify_symbol(symbol, str(getattr(info, "path", "") or ""),
+                            str(getattr(info, "description", "") or ""), getattr(info, "trade_calc_mode", None))
+    long_only = getattr(info, "trade_mode", None) == getattr(m, "SYMBOL_TRADE_MODE_LONGONLY", 1)
+    return asset, bool(long_only)
+
+
 def list_symbols() -> list[dict[str, Any]]:
     """
     Todos los símbolos del bróker para el buscador del Centro de control.
@@ -257,6 +292,9 @@ def list_symbols() -> list[dict[str, Any]]:
             "volume_min": float(getattr(s, "volume_min", 0.0) or 0.0),
             "visible": bool(getattr(s, "visible", False)),
             "tradable": getattr(s, "trade_mode", 4) != disabled,
+            "long_only": getattr(s, "trade_mode", 4) == getattr(m, "SYMBOL_TRADE_MODE_LONGONLY", 1),
+            "asset_class": classify_symbol(s.name, path, str(getattr(s, "description", "") or ""),
+                                           getattr(s, "trade_calc_mode", None)),
         })
     out.sort(key=lambda d: (d["category"].lower(), d["name"].lower()))
     return out

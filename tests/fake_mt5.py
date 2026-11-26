@@ -64,7 +64,8 @@ class FakeMT5:
         return SimpleNamespace(trade_allowed=True) if self.initialized else None
 
     # --- símbolos
-    symbols: tuple[str, ...] = ("EURUSD", "GBPUSD", "US500", "US30", "USDJPY")
+    symbols: tuple[str, ...] = ("EURUSD", "GBPUSD", "US500", "US30", "USDJPY", "AAPL.US")
+    long_only_symbols: tuple[str, ...] = ("AAPL.US",)
 
     symbol_meta: dict[str, tuple[str, str]] = {
         "EURUSD": ("Euro vs US Dollar", "Forex\\Majors"),
@@ -72,18 +73,23 @@ class FakeMT5:
         "USDJPY": ("US Dollar vs Japanese Yen", "Forex\\Majors"),
         "US500": ("US 500 Index", "Indices\\US"),
         "US30": ("Wall Street 30 Index", "Indices\\US"),
+        "AAPL.US": ("Apple Inc", "Shares\\US"),
     }
 
     def symbols_get(self) -> tuple[SimpleNamespace, ...]:
         return tuple(SimpleNamespace(
             name=n, description=self.symbol_meta.get(n, ("", ""))[0],
             path=self.symbol_meta.get(n, ("", "Otros"))[1], spread=10, point=0.00001, digits=5,
-            volume_min=0.01, visible=n == "EURUSD", trade_mode=4) for n in self.symbols)
+            volume_min=0.01, visible=n == "EURUSD",
+            trade_mode=1 if n in self.long_only_symbols else 4) for n in self.symbols)
 
     def symbol_info(self, symbol: str) -> SimpleNamespace | None:
         if symbol not in self.symbols:
             return None
-        return SimpleNamespace(visible=True, trade_tick_size=0.00001, trade_tick_value=1.0,
+        meta = self.symbol_meta.get(symbol, ("", ""))
+        return SimpleNamespace(description=meta[0], path=meta[1],
+                               trade_mode=1 if symbol in self.long_only_symbols else 4,
+                               visible=True, trade_tick_size=0.00001, trade_tick_value=1.0,
                                volume_min=0.01, volume_max=100.0, volume_step=0.01,
                                digits=5, point=0.00001, trade_stops_level=10)
 

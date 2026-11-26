@@ -33,10 +33,10 @@ from typing import Any
 import mt5_connector as mt5c
 from bot_common import (
     CONFIG_PATH, ProfilePaths, config_path_for, global_config_path, hour_allowed, list_profiles,
-    load_config, now_iso, profile_paths, read_json, setup_logging, write_json_atomic,
+    load_config, now_iso, profile_paths, read_json, session_clock, setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
-from strategy_evolver import compute_signal, evolve_parameters, warmup_bars
+from strategy_evolver import asset_config, compute_signal, evolve_parameters, warmup_bars
 
 logger = logging.getLogger("trading_bot")
 
@@ -226,6 +226,12 @@ class TradingBot:
         self.last_evolution_mono: float = time.monotonic()
         self.last_evolution_iso: str = ""
         self.halt_notified = False
+        # Modo acciones: tipo de activo, sesión detectada y reglas efectivas
+        self.asset_class = "otro"
+        self.broker_long_only = False
+        self.detected_session = ""
+        self.rules: dict[str, Any] = asset_config(config, "otro", False)
+        self.flat_done_day: str = ""
 
     def _notify_prefix(self) -> str:
         sim = " SIM" if self.dry_run else ""
@@ -237,15 +243,46 @@ class TradingBot:
         return self.forced_dry_run or bool(self.config.get("simulation", False))
 
     # ---------------------------------------------------------------- evolución
+    def resolve_asset(self) -> None:
+        """Tipo de activo (del perfil o detectado en el bróker) y si solo admite compras."""
+        cfg = self.config
+        try:
+            detected, long_only = mt5c.symbol_asset_info(cfg["symbol"])
+        except Exception:  # noqa: BLE001 - informativo
+            detected, long_only = "otro", False
+        self.asset_class = detected if cfg.get("asset_class", "auto") == "auto" else cfg["asset_class"]
+        self.broker_long_only = long_only
+
+    def update_rules(self, df: Any = None) -> None:
+        """Recalcula las reglas efectivas (horario, comisión, solo compras...) del activo."""
+        cfg = dict(self.config)
+        if not str(cfg.get("session_hours") or "").strip() and self.detected_session:
+            cfg["session_hours"] = self.detected_session
+        self.rules = asset_config(cfg, self.asset_class, self.broker_long_only, df)
+        if df is not None and self.asset_class == "accion" and not str(self.config.get("session_hours") or "").strip():
+            self.detected_session = str(self.rules.get("session_hours") or "")
+
     def evolve(self) -> bool:
         """Descarga histórico, evoluciona parámetros y valida walk-forward."""
-        cfg = self.config
-        df = mt5c.get_rates(cfg["symbol"], cfg["timeframe"], int(cfg["history_bars"]) + 1)
+        df = mt5c.get_rates(self.config["symbol"], self.config["timeframe"], int(self.config["history_bars"]) + 1)
         if df.empty:
-            logger.error("Sin datos históricos para %s %s.", cfg["symbol"], cfg["timeframe"])
+            logger.error("Sin datos históricos para %s %s.", self.config["symbol"], self.config["timeframe"])
             self.params = None
             return False
         df = df.iloc[:-1]  # descartar la vela en formación
+        self.resolve_asset()
+        self.update_rules(df)
+        cfg = self.rules
+        if self.asset_class == "accion":
+            logger.info(
+                "Modo ACCIONES: sesión %s (servidor) | sin entrar los primeros %d min | cerrar %d min antes "
+                "del cierre | %s | comisión %s",
+                cfg.get("session_hours") or "24 h", cfg["avoid_open_minutes"], cfg["flat_before_close_minutes"],
+                "solo compras" if cfg["long_only"] else "compras y ventas",
+                f"{cfg['commission_per_trade']:g} por operación" if self.config.get("commission_override") is not None
+                else f"{cfg['commission_pct']:.2%} del precio")
+        elif cfg.get("long_only"):
+            logger.info("Este símbolo solo admite compras: se ignorarán las señales de venta.")
 
         logger.info("Datos para evolución: %s %s | %d velas cerradas desde %s hasta %s (hora servidor)",
                     cfg["symbol"], cfg["timeframe"], len(df), df["time"].iloc[0], df["time"].iloc[-1])
@@ -335,6 +372,9 @@ class TradingBot:
         old = self.config
         self.config = new_cfg
         self.risk.update_config(new_cfg)
+        if new_cfg.get("asset_class") != old.get("asset_class"):
+            self.resolve_asset()
+        self.update_rules()
         self.status.dry_run = self.dry_run
         if bool(old.get("simulation")) != bool(new_cfg.get("simulation")) and not self.forced_dry_run:
             logger.warning("Modo cambiado en caliente: %s",
@@ -561,6 +601,9 @@ class TradingBot:
             self.heartbeat(f"PAUSADO por rendimiento ({self.paused_reason}) | {self._day_text()}")
             return
         session_open = self.session_open_for(bar_time)
+        stock_block = self.stock_session_block(tick, positions)
+        if stock_block:
+            session_open = False
 
         if bar_time != self.last_bar_time:
             if sig["signal"] == 0:
@@ -571,8 +614,11 @@ class TradingBot:
                             signal_txt, len(positions), magic)
             elif not session_open:
                 self.last_bar_time = bar_time
-                logger.info("Señal de %s ignorada: fuera del horario de operación (%s, hora servidor).",
-                            signal_txt, cfg.get("trading_hours"))
+                logger.info("Señal de %s ignorada: %s.", signal_txt,
+                            stock_block or f"fuera del horario de operación ({cfg.get('trading_hours')}, hora servidor)")
+            elif sig["signal"] == -1 and self.rules.get("long_only"):
+                self.last_bar_time = bar_time
+                logger.info("Señal de VENTA ignorada: este símbolo solo admite compras.")
             elif not spread_ok:
                 # No se marca la vela: se reintenta en el próximo ciclo si el spread baja.
                 self.heartbeat(f"señal de {signal_txt} pendiente: spread "
@@ -591,7 +637,7 @@ class TradingBot:
         elif positions:
             state = self._positions_text(positions)
         elif not session_open:
-            state = f"fuera del horario de operación ({cfg.get('trading_hours')} h servidor)"
+            state = stock_block or f"fuera del horario de operación ({cfg.get('trading_hours')} h servidor)"
         else:
             state = self._waiting_text(sig)
         self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
@@ -654,6 +700,37 @@ class TradingBot:
             self.notifier.send(f"ORDEN {side.upper()} {lot:.2f} @ {price:.6g} | SL {sl:.6g} | TP {tp:.6g}")
 
     # ------------------------------------------------------------ horario
+    def stock_session_block(self, tick: Any, positions: list[Any]) -> str:
+        """
+        Reglas de sesión del símbolo (acciones): devuelve el motivo por el que NO se
+        puede abrir ahora ('' si se puede) y cierra las posiciones antes del cierre.
+        """
+        spec = str(self.rules.get("session_hours") or "")
+        if not spec.strip() or tick is None or not getattr(tick, "time", 0):
+            return ""
+        now = datetime.fromtimestamp(int(tick.time), tz=timezone.utc)  # hora del servidor
+        inside, since_open, to_close = session_clock(now.hour, now.minute, spec)
+        if not inside:
+            return f"mercado cerrado (sesión {spec} h servidor)"
+        flat = int(self.rules.get("flat_before_close_minutes", 0) or 0)
+        if flat > 0 and to_close <= flat:
+            day = now.strftime("%Y-%m-%d")
+            if positions and self.flat_done_day != day:
+                self.flat_done_day = day
+                if self.dry_run:
+                    logger.info("[DRY-RUN] cerraría %d posición(es): faltan %d min para el cierre de la sesión.",
+                                len(positions), to_close)
+                else:
+                    logger.info("Cierre antes del fin de sesión (faltan %d min): cerrando %d posición(es).",
+                                to_close, len(positions))
+                    for pos in positions:
+                        mt5c.close_position(pos, int(self.config["deviation"]))
+            return f"faltan {to_close} min para el cierre de la sesión ({spec} h servidor)"
+        avoid = int(self.rules.get("avoid_open_minutes", 0) or 0)
+        if avoid > 0 and since_open < avoid:
+            return f"primeros {avoid} min de la sesión ({since_open} min desde la apertura)"
+        return ""
+
     def session_open_for(self, bar_time: Any) -> bool:
         """¿La vela en curso (la siguiente a ``bar_time``) está dentro del horario?"""
         spec = str(self.config.get("trading_hours") or "")
@@ -858,6 +935,9 @@ class TradingBot:
                           if self.bots_pnl else None),
                 halt_reason=st["halt_reason"],
                 paused_reason=self.paused_reason,
+                asset_class=self.asset_class,
+                session_hours=self.rules.get("session_hours") or "",
+                long_only=bool(self.rules.get("long_only")),
                 last_evolution=self.last_evolution_iso,
                 dry_run=self.dry_run,
                 price={"bid": tick.bid, "ask": tick.ask} if tick is not None else None,
