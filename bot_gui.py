@@ -100,7 +100,7 @@ STRATEGY_NAMES = {
     "reversion_media": "Reversión a la media (Bollinger)",
     "ruptura": "Ruptura de rango",
 }
-STRATEGY_SHORT = {"cruce_medias": "Cruce medias", "reversion_media": "Reversión", "ruptura": "Ruptura"}
+STRATEGY_SHORT = {"cruce_medias": "Cruce", "reversion_media": "Reversión", "ruptura": "Ruptura"}
 ASSET_NAMES = {"auto": "Automático", "forex": "Forex", "indice": "Índice", "materia": "Materia prima",
                "cripto": "Cripto", "accion": "Acción", "otro": "Otro"}
 
@@ -1089,7 +1089,7 @@ class ControlCenter(tk.Tk):
             ("on", "Activo", 50, "center"), ("symbol", "Símbolo", 80, "w"), ("type", "Tipo", 60, "w"),
             ("tf", "TF", 40, "center"), ("strategy", "Estrategia", 90, "w"), ("mode", "Modo", 85, "center"),
             ("state", "Estado", 145, "w"), ("position", "Posición", 90, "w"),
-            ("pnl", "Resultado", 70, "e"), ("validation", "Validación", 90, "e")], height=16)
+            ("pnl", "Result.", 70, "e"), ("validation", "Validación", 90, "e")], height=16)
         self.table.configure(selectmode="browse")
         self.table.frame.pack(fill="both", expand=True)
         self.table.bind("<<TreeviewSelect>>", self._on_table_select)
@@ -1114,7 +1114,8 @@ class ControlCenter(tk.Tk):
         self.detail_title.pack(fill="x")
         box = tk.Frame(right, bg=C_CARD, highlightbackground="#d5dbe3", highlightthickness=1, padx=10, pady=8)
         box.pack(fill="x", pady=(6, 6))
-        self.d_state = tk.Label(box, text="", bg=C_CARD, fg=C_TEXT, font=F_BOLD, anchor="w", justify="left")
+        self.d_state = tk.Label(box, text="", bg=C_CARD, fg=C_TEXT, font=F_BOLD, anchor="w", justify="left",
+                                wraplength=440)
         self.d_state.pack(fill="x")
         self.d_situation = tk.Label(box, text="", bg=C_CARD, fg=C_TEXT, font=F_SMALL, anchor="w",
                                     justify="left", wraplength=440)
@@ -1129,7 +1130,7 @@ class ControlCenter(tk.Tk):
                                    justify="left", wraplength=440)
         self.d_strategy.pack(fill="x")
         box.bind("<Configure>", lambda e: [lbl.configure(wraplength=max(200, e.width - 24)) for lbl in (
-            self.d_situation, self.d_position, self.d_bar, self.d_strategy)])
+            self.d_state, self.d_situation, self.d_position, self.d_bar, self.d_strategy)])
 
         sub = ttk.Notebook(right)
         sub.pack(fill="both", expand=True)
