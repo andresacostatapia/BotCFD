@@ -43,7 +43,7 @@ from typing import Any, Callable
 
 from bot_common import (
     BASE_DIR, DEFAULT_CONFIG, LOG_DIR, MAIN_PROFILE, PROFILE_KEYS, PROFILE_NAME_RE,
-    VALID_EXIT_MODES, VALID_STRATEGIES, VALID_TIMEFRAMES, config_path_for, list_profiles,
+    VALID_ASSET_CLASSES, VALID_EXIT_MODES, VALID_STRATEGIES, VALID_TIMEFRAMES, config_path_for, list_profiles,
     load_config, load_global_config, migrate_to_global, profile_paths, read_json,
     save_global_config, save_profile, setup_logging, validate_config, write_json_atomic,
 )
@@ -101,6 +101,8 @@ STRATEGY_NAMES = {
     "ruptura": "Ruptura de rango",
 }
 STRATEGY_SHORT = {"cruce_medias": "Cruce medias", "reversion_media": "Reversión", "ruptura": "Ruptura"}
+ASSET_NAMES = {"auto": "Automático", "forex": "Forex", "indice": "Índice", "materia": "Materia prima",
+               "cripto": "Cripto", "accion": "Acción", "otro": "Otro"}
 
 PARAM_LABELS = {
     "fast": "Media rápida (velas)", "slow": "Media lenta (velas)",
@@ -188,6 +190,9 @@ ADVANCED_GROUPS: list[tuple[str, list[Field]]] = [
         Field("min_trades_oos", "Mín. operaciones (validación)", "int", "Mínimo de operaciones de validación"),
         Field("fitness_folds", "Tramos de fitness", "int", "Puntúa por el peor tramo del entrenamiento (1 = desactivado)"),
         Field("commission_per_trade", "Comisión por operación (precio)", "float", "Se suma al spread histórico en el backtest"),
+        Field("stock_commission_pct", "Comisión acciones (fracción)", "float",
+              "Acciones: comisión estimada ida y vuelta como fracción del precio (0.001 = 0,1 %). "
+              "Cada símbolo puede fijar la suya en Editar…"),
     ]),
     ("Ejecución", [
         Field("sl_atr_mult", "Stop loss fijo (× ATR)", "float", "Solo si no se evolucionan SL/TP"),
@@ -599,6 +604,11 @@ class SymbolBrowser(tk.Toplevel):
         self.category = tk.StringVar(value="Todas")
         ttk.Combobox(top, textvariable=self.category, values=["Todas"] + cats, state="readonly",
                      width=18).pack(side="left", padx=6)
+        ttk.Label(top, text="Tipo:").pack(side="left", padx=(8, 0))
+        self.asset = tk.StringVar(value="Todos")
+        ttk.Combobox(top, textvariable=self.asset, state="readonly", width=12,
+                     values=["Todos"] + [ASSET_NAMES[a] for a in VALID_ASSET_CLASSES if a != "auto"]).pack(
+            side="left", padx=6)
         self.only_tradable = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text="Solo operables", variable=self.only_tradable).pack(side="left", padx=8)
         ttk.Label(self, text="Escriba parte del nombre o la descripción, en inglés o español: eur, jpy, "
@@ -607,9 +617,9 @@ class SymbolBrowser(tk.Toplevel):
                   style="Muted.TLabel").pack(fill="x", pady=(6, 6))
 
         self.tree = make_tree(self, [
-            ("name", "Símbolo", 120, "w"), ("desc", "Descripción", 330, "w"),
-            ("cat", "Categoría", 120, "w"), ("spread", "Spread actual", 100, "e"),
-            ("lot", "Lote mín.", 70, "e"), ("note", "", 120, "w")], height=14)
+            ("name", "Símbolo", 110, "w"), ("desc", "Descripción", 300, "w"),
+            ("cat", "Categoría", 110, "w"), ("type", "Tipo", 90, "w"), ("spread", "Spread actual", 95, "e"),
+            ("lot", "Lote mín.", 65, "e"), ("note", "", 130, "w")], height=14)
         self.tree.configure(selectmode="extended" if multi else "browse")
         self.tree.frame.pack(fill="both", expand=True)
         self.tree.tag_configure("existing", foreground=C_GREY)
@@ -638,7 +648,7 @@ class SymbolBrowser(tk.Toplevel):
         self.ok_button.pack(side="right", padx=8)
         self._label = label
 
-        for var in (self.query, self.category, self.only_tradable):
+        for var in (self.query, self.category, self.only_tradable, self.asset):
             var.trace_add("write", lambda *_a: self._schedule_filter())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.bind("<Return>", lambda _e: self._ok())
@@ -657,6 +667,7 @@ class SymbolBrowser(tk.Toplevel):
     def _apply_filter(self) -> None:
         self._after_id = None
         query, cat = self.query.get().strip(), self.category.get()
+        asset_filter = self.asset.get()
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
         shown = 0
@@ -665,13 +676,16 @@ class SymbolBrowser(tk.Toplevel):
                 continue
             if self.only_tradable.get() and not d.get("tradable", True):
                 continue
+            if asset_filter != "Todos" and ASSET_NAMES.get(d.get("asset_class", "otro")) != asset_filter:
+                continue
             if query and not symbol_matches(d, query):
                 continue
             has = d["name"] in self.existing
-            note = "ya está en la lista" if has else ("en Observación" if d.get("visible") else "")
+            note = "ya está en la lista" if has else ("solo compras" if d.get("long_only") else
+                                                     ("en Observación" if d.get("visible") else ""))
             tag = "existing" if has else ("visible" if d.get("visible") else "")
             self.tree.insert("", "end", iid=d["name"], tags=(tag,) if tag else (), values=(
-                d["name"], d["description"], d["category"],
+                d["name"], d["description"], d["category"], ASSET_NAMES.get(d.get("asset_class", "otro"), ""),
                 fmt(d.get("spread"), "{:.6g}", "sin cotización"), fmt(d.get("volume_min"), "{:g}"), note))
             shown += 1
         keep = [i for i in selected if self.tree.exists(i)]
@@ -720,6 +734,13 @@ class ProfileDialog(tk.Toplevel):
             "magic": tk.StringVar(value=str(cfg.get("magic", ""))),
             "enabled": tk.BooleanVar(value=bool(cfg.get("enabled", True))),
             "simulation": tk.BooleanVar(value=bool(cfg.get("simulation", True))),
+            "asset_class": tk.StringVar(value=ASSET_NAMES.get(cfg.get("asset_class", "auto"), "Automático")),
+            "session_hours": tk.StringVar(value=str(cfg.get("session_hours") or "")),
+            "avoid_open_minutes": tk.StringVar(value=str(cfg.get("avoid_open_minutes", -1))),
+            "flat_before_close_minutes": tk.StringVar(value=str(cfg.get("flat_before_close_minutes", -1))),
+            "long_only": tk.BooleanVar(value=bool(cfg.get("long_only", False))),
+            "commission_override": tk.StringVar(value="" if cfg.get("commission_override") is None
+                                                else f"{cfg['commission_override']:g}"),
         }
         grid = ttk.Frame(self)
         grid.pack(fill="x")
@@ -745,6 +766,35 @@ class ProfileDialog(tk.Toplevel):
                         variable=self.vars["enabled"]).pack(anchor="w", pady=(10, 2))
         ttk.Checkbutton(self, text="Simulación (calcula todo pero NO envía órdenes)",
                         variable=self.vars["simulation"]).pack(anchor="w")
+
+        stock = ttk.LabelFrame(self, text=" Tipo de activo y horario (acciones) ", padding=(10, 6))
+        stock.pack(fill="x", pady=(10, 0))
+        stock.columnconfigure(1, weight=1)
+        srows = [
+            ("Tipo de activo", "asset_class", "Automático = lo detecta según el bróker (Acción, Índice…)"),
+            ("Horario del símbolo (servidor)", "session_hours", "Vacío = automático (para acciones se deduce "
+                                                                "del historial, p. ej. 16-23)"),
+            ("No entrar los primeros (min)", "avoid_open_minutes", "-1 = automático (15 en acciones, 0 en el resto)"),
+            ("Cerrar antes del cierre (min)", "flat_before_close_minutes",
+             "-1 = automático (15 en acciones). 0 = mantener posiciones de un día a otro"),
+            ("Comisión de este símbolo (precio)", "commission_override",
+             "Vacío = la general (para acciones, el % de la configuración general). "
+             "Ej. acciones EE. UU. con 0,02 por acción y lado: 0.04"),
+        ]
+        for r, (label, key, help_text) in enumerate(srows):
+            lbl = ttk.Label(stock, text=label)
+            lbl.grid(row=r, column=0, sticky="w", pady=3)
+            Tooltip(lbl, help_text)
+            if key == "asset_class":
+                w2: tk.Widget = ttk.Combobox(stock, textvariable=self.vars[key], state="readonly", width=16,
+                                             values=[ASSET_NAMES[a] for a in VALID_ASSET_CLASSES])
+            else:
+                w2 = ttk.Entry(stock, textvariable=self.vars[key], width=18)
+            w2.grid(row=r, column=1, sticky="ew", padx=(10, 0), pady=3)
+            Tooltip(w2, help_text)
+        ttk.Checkbutton(stock, text="Solo compras (se activa solo si el bróker no permite vender)",
+                        variable=self.vars["long_only"]).grid(row=len(srows), column=0, columnspan=2,
+                                                             sticky="w", pady=(4, 0))
         self.status = tk.Label(self, text="", bg=C_BG, fg=C_MUTED, font=F_SMALL, anchor="w",
                                justify="left", wraplength=420)
         self.status.pack(fill="x", pady=(6, 0))
@@ -769,6 +819,10 @@ class ProfileDialog(tk.Toplevel):
         if dialog.result and self.winfo_exists():
             item = dialog.result["symbols"][0]
             self.vars["symbol"].set(item["name"])
+            if item.get("asset_class") == "accion":
+                self.vars["asset_class"].set(ASSET_NAMES["accion"])
+            if item.get("long_only"):
+                self.vars["long_only"].set(True)
             if item.get("spread"):
                 self.vars["max_spread"].set(f"{round_sig(item['spread'] * 2.5):g}")
                 self.status.configure(text=f"{item['name']}: spread actual {item['spread']:g} -> "
@@ -809,9 +863,16 @@ class ProfileDialog(tk.Toplevel):
                 "magic": int(self.vars["magic"].get()),
                 "enabled": bool(self.vars["enabled"].get()),
                 "simulation": bool(self.vars["simulation"].get()),
+                "asset_class": {v: k for k, v in ASSET_NAMES.items()}.get(self.vars["asset_class"].get(), "auto"),
+                "session_hours": str(self.vars["session_hours"].get()).strip(),
+                "avoid_open_minutes": int(self.vars["avoid_open_minutes"].get()),
+                "flat_before_close_minutes": int(self.vars["flat_before_close_minutes"].get()),
+                "long_only": bool(self.vars["long_only"].get()),
+                "commission_override": (float(str(self.vars["commission_override"].get()).replace(",", "."))
+                                        if str(self.vars["commission_override"].get()).strip() else None),
             }
         except ValueError:
-            self.status.configure(text="Spread máximo y magic deben ser números.", fg=C_RED)
+            self.status.configure(text="Spread, magic, minutos y comisión deben ser números.", fg=C_RED)
             return
         clash = [n for n in list_profiles() if n != self.name
                  and (read_json(config_path_for(n)) or {}).get("magic") == data["magic"]]
@@ -1023,8 +1084,8 @@ class ControlCenter(tk.Tk):
         left = ttk.Frame(paned)
         paned.add(left, weight=3)
         self.table = make_tree(left, [
-            ("on", "Activo", 50, "center"), ("symbol", "Símbolo", 80, "w"), ("tf", "TF", 40, "center"),
-            ("strategy", "Estrategia", 90, "w"), ("mode", "Modo", 85, "center"),
+            ("on", "Activo", 50, "center"), ("symbol", "Símbolo", 80, "w"), ("type", "Tipo", 60, "w"),
+            ("tf", "TF", 40, "center"), ("strategy", "Estrategia", 90, "w"), ("mode", "Modo", 85, "center"),
             ("state", "Estado", 145, "w"), ("position", "Posición", 90, "w"),
             ("pnl", "Resultado", 70, "e"), ("validation", "Validación", 90, "e")], height=16)
         self.table.configure(selectmode="browse")
@@ -1457,7 +1518,10 @@ class ControlCenter(tk.Tk):
                     evo = {"accepted": ev.get("accepted"),
                            "pf_oos": (ev.get("out_of_sample") or {}).get("profit_factor")}
             val = "—" if not evo else f"{'Acept.' if evo.get('accepted') else 'Desc.'} {fmt(evo.get('pf_oos'))}"
-            values = ("Sí" if cfg.get("enabled", True) else "No", cfg.get("symbol", "?"), cfg.get("timeframe", "?"),
+            asset = st.get("asset_class") if live else None
+            asset = asset or (cfg.get("asset_class") if cfg.get("asset_class") != "auto" else None)
+            values = ("Sí" if cfg.get("enabled", True) else "No", cfg.get("symbol", "?"),
+                      ASSET_NAMES.get(asset, "—") if asset else "—", cfg.get("timeframe", "?"),
                       STRATEGY_SHORT.get(cfg.get("strategy", ""), "?"),
                       "Simulación" if cfg.get("simulation", True) else "REAL", label, pos_txt,
                       fmt(pnl, "{:+.2f}") if positions else "—", val)
@@ -1501,7 +1565,7 @@ class ControlCenter(tk.Tk):
         if col == "#1":
             self.toggle_profile_key(row, "enabled")
             return "break"
-        if col == "#5":
+        if col == "#6":
             self.toggle_profile_key(row, "simulation")
             return "break"
         return None
@@ -1554,6 +1618,11 @@ class ControlCenter(tk.Tk):
         code = st.get("exit_code")
         extra = f" · último cierre: {EXIT_MEANING.get(code, '')}" if (code is not None and not live) else ""
         self.d_state.configure(text=f"{label} · {mode} · perfil '{name}'{extra}", fg=color)
+        if live and st.get("asset_class") == "accion":
+            sess = st.get("session_hours") or "24 h"
+            extra_stock = (f"Acción · sesión {sess} (hora servidor) · "
+                           f"{'solo compras' if st.get('long_only') else 'compras y ventas'}")
+            self.detail_title.configure(text=self.detail_title.cget("text") + f"  ·  {extra_stock}")
         if live:
             message = " | ".join(p for p in str(st.get("message") or "").split(" | ")
                                  if not p.startswith("posición abierta"))
@@ -1696,7 +1765,8 @@ class ControlCenter(tk.Tk):
                 created = self.create_profiles([
                     {"symbol": d["name"], "timeframe": dialog.result["timeframe"],
                      "strategy": dialog.result["strategy"], "spread": d.get("spread"),
-                     "simulation": dialog.result["simulation"]} for d in dialog.result["symbols"]])
+                     "simulation": dialog.result["simulation"], "asset_class": d.get("asset_class"),
+                     "long_only": d.get("long_only")} for d in dialog.result["symbols"]])
                 self._report_created(created)
 
         self.with_symbol_list(open_browser)
@@ -1720,7 +1790,8 @@ class ControlCenter(tk.Tk):
             spread = it.get("spread")
             data = {"symbol": it["symbol"], "timeframe": it["timeframe"], "strategy": it["strategy"],
                     "max_spread": round_sig(spread * 2.5) if spread else DEFAULT_CONFIG["max_spread"],
-                    "magic": magic, "enabled": True, "simulation": bool(it.get("simulation", True))}
+                    "magic": magic, "enabled": True, "simulation": bool(it.get("simulation", True)),
+                    "asset_class": it.get("asset_class") or "auto", "long_only": bool(it.get("long_only"))}
             try:
                 save_profile(data, config_path_for(name))
             except (ValueError, OSError) as exc:
@@ -1730,7 +1801,8 @@ class ControlCenter(tk.Tk):
             combos.add(key)
             note = (f"spread máx {data['max_spread']:g}" if spread
                     else "sin cotización: revise el spread máximo con Editar")
-            out.append(f"+ {it['symbol']} {it['timeframe']} · {STRATEGY_SHORT[it['strategy']]} · "
+            out.append(f"+ {it['symbol']}{' (acción)' if it.get('asset_class') == 'accion' else ''} "
+                       f"{it['timeframe']} · {STRATEGY_SHORT[it['strategy']]} · "
                        f"{'simulación' if data['simulation'] else 'REAL'} · {note}")
             magic += 1
         self._refresh_table()
@@ -2141,7 +2213,9 @@ class ControlCenter(tk.Tk):
                 continue
             ok = r.get("accepted")
             tree.insert("", "end", iid=iid, tags=("ok",) if ok else ("idle",), values=(
-                "Sí" if ok else "No", r["symbol"], r["timeframe"], STRATEGY_SHORT.get(r["strategy"], r["strategy"]),
+                "Sí" if ok else "No",
+                r["symbol"] + (" (acción)" if r.get("asset_class") == "accion" else ""),
+                r["timeframe"], STRATEGY_SHORT.get(r["strategy"], r["strategy"]),
                 fmt(r.get("pf_oos")), fmt(r.get("trades_oos"), "{}"), r.get("windows") or "—",
                 fmt(r.get("pf_is")), fmt(r.get("win_rate_oos"), "{:.0%}"),
                 "" if ok else str(r.get("reason", ""))[:120]))
@@ -2174,7 +2248,8 @@ class ControlCenter(tk.Tk):
             return
         lines = self.create_profiles([{"symbol": r["symbol"], "timeframe": r["timeframe"],
                                        "strategy": r["strategy"], "spread": r.get("spread"),
-                                       "simulation": True} for r in chosen])
+                                       "simulation": True, "asset_class": r.get("asset_class"),
+                                       "long_only": r.get("long_only")} for r in chosen])
         self.notebook.select(self.tab_operation)
         self._report_created(lines)
 
@@ -2348,7 +2423,7 @@ class ControlCenter(tk.Tk):
             last = c.get("last") or {}
             if c.get("proposed"):
                 self.scout_tree.insert("", "end", iid=key, tags=("ok",), values=(
-                    c["symbol"], c["timeframe"], STRATEGY_SHORT.get(c["strategy"], c["strategy"]),
+                    c["symbol"] + (" (acción)" if last.get("asset_class") == "accion" else ""), c["timeframe"], STRATEGY_SHORT.get(c["strategy"], c["strategy"]),
                     fmt(last.get("pf_oos")), fmt(last.get("trades_oos"), "{}"), last.get("windows") or "—",
                     fmt(last.get("pf_is")), f"{c.get('streak')}x",
                     str(c.get("proposed_at", "")).replace("T", " ")[:16]))
@@ -2381,8 +2456,10 @@ class ControlCenter(tk.Tk):
         for key in keys:
             c = (state.get("candidates") or {}).get(key)
             if c:
+                last = c.get("last") or {}
                 items.append({"symbol": c["symbol"], "timeframe": c["timeframe"], "strategy": c["strategy"],
-                              "spread": (c.get("last") or {}).get("spread"), "simulation": True})
+                              "spread": last.get("spread"), "simulation": True,
+                              "asset_class": last.get("asset_class"), "long_only": last.get("long_only")})
         lines = self.create_profiles(items)
         self._render_scout(force=True)
         self.notebook.select(self.tab_operation)

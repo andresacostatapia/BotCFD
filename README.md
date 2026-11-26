@@ -102,6 +102,26 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
 El modo automático (`scout_enabled`) funciona mientras el Centro de control está
 abierto. Estado en `logs/scout_state.json`; descartes en `logs/scout_decisions.json`.
 
+### Acciones (modo acciones)
+
+Las acciones CFD (p. ej. `AAPL.US`, `SAN.ES`) se detectan solas por la categoría
+o el nombre del bróker (columna/filtro **Tipo** en el buscador) y se operan con
+reglas propias, iguales en el backtest, el bot, el Laboratorio y el Explorador:
+
+| Regla | Por defecto en acciones | Clave del símbolo (Editar…) |
+|---|---|---|
+| Solo operar dentro de la **sesión de bolsa** (hora del servidor), deducida del historial (p. ej. EE. UU. ≈ `16-23` en Pepperstone) | automático | `session_hours` (vacío = automático) |
+| No entrar en los **primeros minutos** de la sesión (los más volátiles) | 15 min | `avoid_open_minutes` (-1 = automático) |
+| **Cerrar antes del cierre** de la sesión: no se queda abierto de un día a otro (sin hueco nocturno ni swap) | 15 min | `flat_before_close_minutes` (0 = mantener) |
+| **Solo compras** si el bróker no permite vender esa acción | según el bróker | `long_only` |
+| **Comisión** en % del precio (ida y vuelta) | 0,1 % (`stock_commission_pct`, general) | `commission_override` (precio fijo por operación) |
+
+El tipo de activo se puede fijar a mano (`asset_class`: `accion`, `indice`,
+`forex`, `materia`, `cripto`, `otro`); con `auto` lo decide el bróker. Para el
+resto de activos las reglas de sesión están desactivadas salvo que se configuren.
+Tenga en cuenta que el historial H1 de una acción tiene solo ~7 velas por día:
+use 4000–8000 velas o M15.
+
 ---
 
 ## Estrategias
@@ -192,6 +212,9 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `max_spread` | 0.0002 | Spread máximo (precio). Depende del activo |
 | `magic` | — | Único por perfil (lo asigna la ventana) |
 | `enabled` / `simulation` | true / true | Se inicia con "Iniciar activos" / no envía órdenes |
+| `asset_class`, `session_hours` | auto, "" | Tipo de activo y horario propio (acciones) |
+| `avoid_open_minutes`, `flat_before_close_minutes` | -1, -1 | Minutos sin entrar tras la apertura / cierre antes del fin (-1 = auto) |
+| `long_only`, `commission_override` | false, null | Solo compras / comisión propia por operación |
 | **Riesgo** | | |
 | `risk_percent` | 1.0 | % del equity por operación (de cada símbolo) |
 | `max_daily_loss_percent` / `daily_loss_scope` | 3.0 / bots | Límite diario y qué mide |
@@ -207,6 +230,7 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `min_pf_oos`, `oos_pf_ratio_min`, `min_pf_in_sample` | 1.0, 0.8, 1.0 | Criterios de aceptación |
 | `min_trades`, `min_trades_oos`, `fitness_folds` | 20, 5, 3 | Mínimos de operaciones y tramos |
 | `commission_per_trade`, `evolver_seed`, `evolver_backend` | 0.00007, null, auto | Coste, semilla (número = reproducible), motor |
+| `stock_commission_pct` | 0.001 | Comisión de las acciones (fracción del precio, ida y vuelta) |
 | **Seguimiento y avisos** | | |
 | `auto_disable_pf`, `auto_disable_min_trades` | 0.7, 10 | Pausa por rendimiento real (0 = nunca) |
 | `reevolve_hours` | 168 | Re-evolución periódica (0 = nunca) |
@@ -267,14 +291,17 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
 3. **Métrica única (Profit Factor).** → Optimización multiobjetivo (PF, drawdown,
    nº de operaciones) con NSGA-II, que `strategy-genome` ya soporta.
 4. **Sin control de correlación entre símbolos** más allá del límite global de
-   posiciones. → Límite de exposición por divisa.
+   posiciones. → Límite de exposición por divisa / sector.
+   Acciones: no se tienen en cuenta dividendos (ajustes del CFD), resultados
+   trimestrales ni subastas de apertura/cierre; la sesión se deduce del historial
+   (revísela en el detalle del símbolo, sobre todo con cambios de horario de verano).
 5. **El "día" empieza a las 00:00 del PC**, no del servidor del bróker; el horario de
    operación (`trading_hours`) sí usa la hora del servidor.
 6. **La pérdida diaria solo detiene nuevas entradas**; no cierra posiciones abiertas
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (132 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (148 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 
