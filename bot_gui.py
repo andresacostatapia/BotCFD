@@ -167,6 +167,10 @@ BASIC_GROUPS: list[tuple[str, list[Field]]] = [
               "ninguna: solo SL/TP. breakeven: lleva el SL a la entrada al avanzar. trailing: el SL sigue al precio",
               VALID_EXIT_MODES),
         Field("max_bars_in_trade", "Cerrar tras N velas", "int", "Cierre por tiempo. 0 = desactivado"),
+        Field("min_trades_per_week", "Op. por semana deseadas", "float",
+              "La evolución prefiere combinaciones que operen al menos estas veces por semana "
+              "(penaliza las que operan menos). Más alto = más operaciones, pero cada una con menos "
+              "ventaja. 0 = sin preferencia"),
         Field("regime_filter", "Filtro de régimen (ADX)", "bool", "Estrategias de tendencia solo con ADX alto; reversión solo con ADX bajo (nivel evolucionado)"),
         Field("evolve_sl_tp", "Evolucionar SL, TP y salida", "bool", "El algoritmo elige los multiplicadores de stop loss, take profit, break-even y trailing"),
     ]),
@@ -1065,6 +1069,7 @@ class ControlCenter(tk.Tk):
         self._closing = False
         self._symbol_list: list[dict[str, Any]] | None = None
         self._results_stamp: tuple[str, float, float] | None = None
+        self._weekly_cache: dict[str, tuple[float, float]] = {}
         self.last_account: dict[str, Any] | None = None
         self.lab_results: list[dict[str, Any]] = []
 
@@ -1143,7 +1148,7 @@ class ControlCenter(tk.Tk):
         self.card_account = Card(cards, "Cuenta")
         self.card_day = Card(cards, "Resultado de hoy")
         self.card_positions = Card(cards, "Posiciones abiertas")
-        self.card_bots = Card(cards, "Bots")
+        self.card_bots = Card(cards, "Bots", lines=3)
         for i, card in enumerate((self.card_account, self.card_day, self.card_positions, self.card_bots)):
             card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 8, 0))
 
@@ -1304,6 +1309,13 @@ class ControlCenter(tk.Tk):
         rrow.pack(fill="x", pady=(6, 0))
         ttk.Button(rrow, text="Activar seleccionados (en simulación)", style="Accent.TButton",
                    command=self.lab_activate).pack(side="left")
+        ttk.Label(rrow, text="Ordenar por:").pack(side="left", padx=(16, 4))
+        self.lab_sort = tk.StringVar(value="Calidad")
+        sort_box = ttk.Combobox(rrow, textvariable=self.lab_sort, values=("Calidad", "Frecuencia"),
+                                state="readonly", width=11)
+        sort_box.pack(side="left")
+        sort_box.bind("<<ComboboxSelected>>", lambda _e: self._render_lab_results())
+        Tooltip(sort_box, "Frecuencia: primero las válidas que más operan por semana")
         self.lab_summary = ttk.Label(rrow, text="", style="Muted.TLabel")
         self.lab_summary.pack(side="left", padx=12)
         ttk.Label(right, text="Válida = superó la validación walk-forward. Ventanas + = ventanas de validación "
@@ -1374,7 +1386,9 @@ class ControlCenter(tk.Tk):
                                                       "del movimiento medio de una vela H1"),
                 ("scout_min_pf_oos", "PF mín.", "PF de validación mínimo: más exigente que el bot (1.2)"),
                 ("scout_min_trades_oos", "Op. mín.", "Operaciones mínimas en la validación"),
-                ("scout_confirmations", "Confirm.", "Exploraciones SEGUIDAS aceptada antes de proponer")]
+                ("scout_confirmations", "Confirm.", "Exploraciones SEGUIDAS aceptada antes de proponer"),
+                ("scout_min_trades_week", "Op./sem.", "Solo propone combinaciones que operaron al menos "
+                                                      "estas veces por semana en la validación (0 = sin mínimo)")]
         for idx, (key, label, help_text) in enumerate(rows):
             r, c = divmod(idx, 2)
             lbl = ttk.Label(grid, text=label)
@@ -1396,7 +1410,8 @@ class ControlCenter(tk.Tk):
             ("symbol", "Símbolo", 90, "w"), ("tf", "TF", 45, "center"), ("strategy", "Estrategia", 100, "w"),
             ("pf_oos", "PF valid.", 70, "e"), ("trades", "Op. valid.", 70, "e"),
             ("windows", "Ventanas +", 75, "center"), ("pf_is", "PF entreno", 75, "e"),
-            ("streak", "Confirmada", 80, "center"), ("since", "Desde", 120, "w")], height=8)
+            ("freq", "Op./sem.", 65, "e"), ("streak", "Confirmada", 80, "center"),
+            ("since", "Desde", 120, "w")], height=8)
         self.scout_tree.configure(selectmode="extended")
         self.scout_tree.frame.pack(fill="both", expand=True, pady=(4, 0))
         prow = ttk.Frame(right)
@@ -1866,9 +1881,13 @@ class ControlCenter(tk.Tk):
         cfgs = [profile_config(n) or {} for n in list_profiles()]
         enabled = sum(1 for c in cfgs if c.get("enabled", True))
         real = sum(1 for c in cfgs if not c.get("simulation", True))
+        weekly = self._expected_weekly_trades()
         self.card_bots.set(f"{running} en marcha", C_GREEN if running else C_MUTED,
                            f"{len(statuses)} símbolos · {enabled} activos",
-                           (f"{real} en modo REAL", C_RED) if real else "todos en simulación")
+                           (f"{real} en modo REAL", C_RED) if real else "todos en simulación",
+                           f"~{weekly:.0f} operaciones/semana esperadas" if weekly >= 1 else
+                           (f"~1 operación cada {7 / weekly:.0f} días esperada" if weekly > 0 else
+                            "frecuencia esperada: sin validar todavía"))
         lab = "laboratorio analizando…" if self.lab_proc and self.lab_proc.running else ""
         scout = "explorador activo" if self.scout_proc and self.scout_proc.running else ""
         text = f"{running} bot(s) en marcha" if running else ""
@@ -2382,10 +2401,35 @@ class ControlCenter(tk.Tk):
                       f"{accepted} de {len(self.lab_results)} combinaciones superaron la validación.",
                       C_GREEN if accepted else C_ORANGE, 12)
 
+    def _expected_weekly_trades(self) -> float:
+        """
+        Suma de la frecuencia de validación (op./semana) de los símbolos ACTIVOS cuya
+        última evolución fue aceptada. Es una estimación: sale del backtest de validación.
+        """
+        total = 0.0
+        for name in list_profiles():
+            cfg = profile_config(name) or {}
+            if not cfg.get("enabled", True):
+                continue
+            path = profile_paths(config_path_for(name)).evolved
+            stamp = _mtime(path)
+            cached = self._weekly_cache.get(name)
+            if cached is None or cached[0] != stamp:
+                evo = read_json(path) or {}
+                value = float(evo.get("trades_per_week") or 0.0) if evo.get("accepted") else 0.0
+                cached = (stamp, value)
+                self._weekly_cache[name] = cached
+            total += cached[1]
+        return total
+
     def _render_lab_results(self) -> None:
         from lab import score
 
-        self.lab_results.sort(key=score, reverse=True)
+        if getattr(self, "lab_sort", None) is not None and self.lab_sort.get() == "Frecuencia":
+            self.lab_results.sort(key=lambda r: (1 if r.get("accepted") else 0,
+                                                 float(r.get("trades_per_week") or 0.0)), reverse=True)
+        else:
+            self.lab_results.sort(key=score, reverse=True)
         tree = self.lab_tree
         selected = set(tree.selection())
         tree.delete(*tree.get_children())
@@ -2404,8 +2448,10 @@ class ControlCenter(tk.Tk):
         keep = [i for i in selected if tree.exists(i)]
         if keep:
             tree.selection_set(keep)
-        accepted = sum(1 for r in self.lab_results if r.get("accepted"))
-        self.lab_summary.configure(text=f"{len(self.lab_results)} combinaciones · {accepted} aceptadas")
+        ok_rows = [r for r in self.lab_results if r.get("accepted")]
+        freq = sum(float(r.get("trades_per_week") or 0.0) for r in ok_rows)
+        self.lab_summary.configure(text=f"{len(self.lab_results)} combinaciones · {len(ok_rows)} aceptadas"
+                                        + (f" (~{freq:.0f} op./semana entre todas)" if freq >= 1 else ""))
 
     def _load_lab_results(self) -> None:
         data = read_json(LAB_RESULTS_PATH) or {}
@@ -2621,7 +2667,7 @@ class ControlCenter(tk.Tk):
                 self.scout_tree.insert("", "end", iid=key, tags=("ok",), values=(
                     c["symbol"] + (" (acción)" if last.get("asset_class") == "accion" else ""), c["timeframe"], STRATEGY_SHORT.get(c["strategy"], c["strategy"]),
                     fmt(last.get("pf_oos")), fmt(last.get("trades_oos"), "{}"), last.get("windows") or "—",
-                    fmt(last.get("pf_is")), f"{c.get('streak')}x",
+                    fmt(last.get("pf_is")), fmt(last.get("trades_per_week"), "{:.1f}"), f"{c.get('streak')}x",
                     str(c.get("proposed_at", "")).replace("T", " ")[:16]))
             else:
                 self.scout_watch.insert("", "end", iid=key, tags=("info",), values=(

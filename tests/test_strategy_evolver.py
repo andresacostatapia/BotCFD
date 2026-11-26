@@ -398,3 +398,27 @@ def test_ratio_rule_uses_capped_in_sample_pf(synthetic_ohlc: pd.DataFrame, monke
     if out["in_sample"]["profit_factor"] > 2.5 and out["out_of_sample"]["profit_factor"] >= 2.0:
         assert "x PF in-sample" not in out["reason"]
     assert se.IS_PF_REFERENCE_CAP == 2.5
+
+
+# ------------------------------------------------------------ frecuencia
+def test_span_weeks_and_frequency_factor(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    assert se.span_weeks(cache, 0, 169) == pytest.approx(1.0)  # 168 h = 1 semana
+    assert se.span_weeks(se.IndicatorCache(synthetic_ohlc.drop(columns="time")), 0, 100) is None
+    assert se.frequency_factor(10, 2.0, 0.0) == 1.0
+    assert se.frequency_factor(10, 2.0, 5.0) == 1.0
+    assert se.frequency_factor(2, 2.0, 2.0) == pytest.approx(0.25)
+    assert se.frequency_factor(5, None, 3.0) == 1.0
+
+
+def test_fitness_prefers_frequent_combinations(synthetic_ohlc: pd.DataFrame) -> None:
+    cache = se.IndicatorCache(synthetic_ohlc)
+    params = {"lookback": 20, "trend": 50, "sl_mult": 1.5, "tp_mult": 2.0}
+    base = {"strategy": "ruptura", "fitness_folds": 1}
+    plain = se.make_fitness(cache, 0, len(cache), base)(params)
+    m = se.backtest(cache, params, 0, len(cache), base)
+    tpw = m.trades / se.span_weeks(cache, 0, len(cache))
+    easy = se.make_fitness(cache, 0, len(cache), {**base, "min_trades_per_week": tpw / 2})(params)
+    hard = se.make_fitness(cache, 0, len(cache), {**base, "min_trades_per_week": tpw * 2})(params)
+    assert easy == pytest.approx(plain)
+    assert hard == pytest.approx(plain * 0.25)

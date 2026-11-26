@@ -92,3 +92,16 @@ def test_config_validation_for_scout_keys() -> None:
            "scout_confirmations": 0}
     errors = " ".join(bot_common.validate_config(bad))
     assert "scout_timeframes" in errors and "scout_categories" in errors and "scout_confirmations" in errors
+
+
+def test_frequency_rule_marks_slow_combinations() -> None:
+    results = [
+        {"accepted": True, "trades_per_week": 5.0, "reason": "ok"},
+        {"accepted": True, "trades_per_week": 0.8, "reason": "ok"},
+        {"accepted": True, "trades_per_week": None, "reason": "ok"},
+        {"accepted": False, "trades_per_week": 0.1, "reason": "PF bajo"},
+    ]
+    assert scout.apply_frequency_rule(results, 0.0) == 0
+    assert scout.apply_frequency_rule(results, 2.0) == 2
+    assert [r["accepted"] for r in results] == [True, False, False, False]
+    assert "opera poco" in results[1]["reason"] and results[3]["reason"] == "PF bajo"

@@ -35,6 +35,7 @@
     "min_pf_oos": 1.0,
     "regime_filter": true,
     "stability_check": true,
+    "min_trades_per_week": 2.0,
     "trading_hours": "",
     "exit_management": "ninguna",
     "be_atr_mult": 1.0,
@@ -77,5 +78,6 @@
     "scout_max_spread_atr": 0.15,
     "scout_min_pf_oos": 1.2,
     "scout_min_trades_oos": 15,
+    "scout_min_trades_week": 2.0,
     "scout_confirmations": 2
 }

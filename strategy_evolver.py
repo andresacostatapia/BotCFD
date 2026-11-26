@@ -166,6 +166,8 @@ _DEFAULTS: dict[str, Any] = {
     "commission_pct": 0.0,
     # Robustez (desactivada en el evolucionador "suelto"; el bot la activa).
     "stability_check": False,
+    # Preferencia de frecuencia (0 = sin preferencia): ver make_fitness().
+    "min_trades_per_week": 0.0,
 }
 
 
@@ -245,6 +247,7 @@ class IndicatorCache:
             times = pd.to_datetime(self.df["time"])
             self.hours = times.dt.hour.to_numpy()
             secs = ((times - pd.Timestamp("1970-01-01", tz=times.dt.tz)) // pd.Timedelta(seconds=1)).to_numpy()
+            self.epoch: np.ndarray | None = secs.astype(float)
             diffs = np.diff(secs)
             self.bar_seconds = float(np.median(diffs)) if len(diffs) else 0.0
             # Hueco después de la vela j (cierre de sesión / fin de semana)
@@ -253,6 +256,7 @@ class IndicatorCache:
                 gap[:-1] = diffs > 1.5 * self.bar_seconds
         else:
             self.hours = np.full(n, -1)
+            self.epoch = None
             self.bar_seconds = 0.0
             gap = np.zeros(n, dtype=bool)
         self.gap_after = gap
@@ -858,6 +862,24 @@ def fitness_from_metrics(metrics: BacktestMetrics, min_trades: int) -> float:
     return float(metrics.profit_factor) * penalty
 
 
+def span_weeks(cache: IndicatorCache, start: int, end: int) -> float | None:
+    """Semanas de calendario entre la vela ``start`` y la ``end - 1`` (None sin fechas)."""
+    if cache.epoch is None or end - start < 2:
+        return None
+    seconds = float(cache.epoch[min(end, len(cache)) - 1] - cache.epoch[start])
+    return seconds / (7 * 86400) if seconds > 0 else None
+
+
+def frequency_factor(trades: int, weeks: float | None, target: float) -> float:
+    """
+    Penalización por frecuencia: 1 si se alcanzan ``target`` operaciones por semana;
+    si no, (frecuencia / objetivo)^2. Sin objetivo o sin fechas, 1.
+    """
+    if target <= 0 or not weeks:
+        return 1.0
+    return min(1.0, (trades / weeks) / target) ** 2
+
+
 def fold_bounds(start: int, end: int, folds: int) -> list[tuple[int, int]]:
     """Divide [start, end) en ``folds`` tramos consecutivos de tamaño similar."""
     folds = max(1, int(folds))
@@ -877,8 +899,13 @@ def make_fitness(
     ``ceil(min_trades / k)`` operaciones). Así se premian combinaciones estables en
     todo el periodo, no las que tienen un pico de suerte en un solo tramo.
     Nunca se usan datos de validación (out-of-sample).
+
+    Con ``min_trades_per_week`` > 0 el fitness de cada tramo se multiplica por
+    ``frequency_factor``: la búsqueda prefiere combinaciones que operan al menos ese
+    número de veces por semana (es una preferencia, no un requisito de aceptación).
     """
     min_trades = int(config.get("min_trades", _DEFAULTS["min_trades"]))
+    target = float(config.get("min_trades_per_week", 0.0) or 0.0)
     space = build_search_space(config)
     folds = fold_bounds(start, end, int(config.get("fitness_folds", _DEFAULTS["fitness_folds"])))
     # ceil: la suma de mínimos por tramo nunca queda por debajo de min_trades
@@ -889,12 +916,13 @@ def make_fitness(
         p = normalize_params(params, {k: v for k, v in space.items() if k in params})
         if not params_are_valid(p):
             return 0.0  # slow <= fast: inválido
+        def _score(a: int, b: int, needed: int) -> float:
+            m = backtest(cache, p, a, b, config)
+            return fitness_from_metrics(m, needed) * frequency_factor(m.trades, span_weeks(cache, a, b), target)
+
         if len(folds) == 1:
-            return fitness_from_metrics(backtest(cache, p, start, end, config), min_trades)
-        return min(
-            fitness_from_metrics(backtest(cache, p, a, b, config), min_trades_fold)
-            for a, b in folds
-        )
+            return _score(start, end, min_trades)
+        return min(_score(a, b, min_trades_fold) for a, b in folds)
 
     return _fitness
 
@@ -1283,7 +1311,7 @@ def evolve_parameters(
 
 __all__ = [
     "SEARCH_SPACE", "SLTP_SPACE", "STRATEGY_SPACES", "TREND_STRATEGIES", "parameter_stability",
-    "monte_carlo", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
+    "monte_carlo", "span_weeks", "frequency_factor", "STRATEGY_LABELS", "DEFAULT_STRATEGY",
     "strategy_of", "warmup_bars", "describe_state", "walk_forward_windows", "metrics_from_pnls",
     "REGIME_SPACE", "EXIT_SPACES", "EXTRA_SPACE", "adx", "detect_session_hours", "asset_config", "build_search_space", "evolve_parameters", "backtest", "compute_signal", "signal_array",
     "IndicatorCache", "BacktestMetrics", "fitness_from_metrics", "make_fitness",

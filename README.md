@@ -140,6 +140,37 @@ use 4000–8000 velas o M15.
 
 ---
 
+## Más operaciones: cómo acortar la espera
+
+Un bot abre **una posición a la vez** y solo cuando su estrategia da señal al cierre
+de una vela; con H1 y estrategias selectivas eso puede ser 1 operación cada varios
+días. La frecuencia total sale de **sumar** la de todos los símbolos activos. Sin
+inventar señales, se puede acelerar así:
+
+1. **Más combinaciones válidas a la vez.** En el *Laboratorio* marque M5 y M15,
+   todas las estrategias y muchos símbolos; ordene por **Frecuencia** y active (en
+   simulación) varias combinaciones aceptadas. El resumen muestra las op./semana
+   que suman. La tarjeta **Bots** de *Operación* muestra la frecuencia esperada de
+   los símbolos activos (según su validación).
+2. **Preferencia de frecuencia** (`min_trades_per_week`, por defecto 2): la
+   evolución penaliza las combinaciones que operan menos de N veces por semana, así
+   que elige parámetros más activos. No es un requisito para aceptar: si nada opera
+   tan a menudo con ventaja, se aceptará lo que haya o se descartará igual que antes.
+3. **Explorador con frecuencia mínima** (`scout_min_trades_week`, por defecto 2):
+   solo propone combinaciones que operaron al menos N veces por semana en la
+   validación. La columna *Op./sem.* lo muestra.
+4. **Límite global de posiciones** (`max_open_positions_total`, 3 por defecto): con
+   muchos símbolos, las señales se bloquean cuando ya hay 3 abiertas (lo verá como
+   "bloqueadas: límite de posiciones" en el detalle). Súbalo, y si lo hace **baje el
+   riesgo por operación** (p. ej. 6 posiciones con 0,5 % en vez de 3 con 1 %).
+5. **Horario:** forex y oro tienen más movimiento en Londres y Nueva York; acciones e
+   índices de EE. UU. solo operan en su sesión (y no en festivos).
+
+Lo que **no** conviene: bajar el PF mínimo, las operaciones mínimas o la validación
+para que se acepte más. Más operaciones sin ventaja solo producen más costes (spread
+y comisión) y se pierde más rápido. Para comprobar la ejecución sin esperar está
+*Operación de prueba…*.
+
 ## Estrategias
 
 | Estrategia | Para qué plazo | Señal | Parámetros que evoluciona |
@@ -349,7 +380,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (172 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (175 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

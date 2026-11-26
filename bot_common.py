@@ -187,6 +187,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_pf_oos": 1.0,                # PF mínimo absoluto en validación
     "regime_filter": True,            # filtro ADX evolucionado (tendencia vs rango)
     "stability_check": True,          # rechaza parámetros "frágiles" (los vecinos ±10% pierden)
+    "min_trades_per_week": 2.0,       # preferencia: la evolución favorece >= N operaciones/semana (0 = sin preferencia)
     "trading_hours": "",              # "" = 24 h; "10-19" = solo de 10 a 19 h del servidor
     "exit_management": "ninguna",     # ninguna | breakeven | trailing
     "be_atr_mult": 1.0,               # break-even al avanzar N x ATR (si no se evoluciona)
@@ -223,6 +224,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scout_max_spread_atr": 0.15,     # descarta símbolos cuyo spread supera esta fracción del ATR(H1)
     "scout_min_pf_oos": 1.2,          # PF de validación mínimo (más exigente que el bot)
     "scout_min_trades_oos": 15,       # operaciones de validación mínimas
+    "scout_min_trades_week": 2.0,     # frecuencia mínima (op./semana en validación) para proponer (0 = sin mínimo)
     "scout_confirmations": 2,         # exploraciones seguidas aceptada antes de proponer
 }
 
@@ -501,6 +503,10 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         value = _num(key)
         if value is not None and value <= 0:
             errors.append(f"'{key}' debe ser > 0")
+    for key in ("scout_min_trades_week", "min_trades_per_week"):
+        value = _num(key)
+        if value is not None and value < 0:
+            errors.append(f"'{key}' debe ser >= 0")
 
     for key in ("telegram_token", "telegram_chat_id"):
         if not isinstance(config.get(key), str):

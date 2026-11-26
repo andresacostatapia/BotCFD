@@ -11,7 +11,8 @@ Cómo decide:
    relativo (spread / ATR de H1) y limitados a ``scout_max_symbols``; se descartan
    los que superan ``scout_max_spread_atr``.
 2. Evalúa cada combinación con el mismo motor del laboratorio, exigiendo
-   PF de validación >= ``scout_min_pf_oos`` y >= ``scout_min_trades_oos`` operaciones.
+   PF de validación >= ``scout_min_pf_oos``, >= ``scout_min_trades_oos`` operaciones y
+   al menos ``scout_min_trades_week`` operaciones por semana.
 3. Solo propone una combinación aceptada en ``scout_confirmations`` exploraciones
    SEGUIDAS (si una exploración la rechaza, vuelve a cero). Más símbolos revisados
    = más probabilidad de encontrar algo por azar; las confirmaciones lo reducen.
@@ -102,6 +103,25 @@ def select_universe(symbols: list[dict[str, Any]], categories: list[str], max_sy
     return [name for _r, name in ranked[:max_symbols]], skipped
 
 
+def apply_frequency_rule(results: list[dict[str, Any]], min_per_week: float) -> int:
+    """
+    Marca como no aceptadas las combinaciones que operan menos de ``min_per_week``
+    veces por semana en la validación (el explorador busca símbolos que operen a
+    menudo). Devuelve cuántas se han descartado por este motivo.
+    """
+    if min_per_week <= 0:
+        return 0
+    count = 0
+    for r in results:
+        tpw = r.get("trades_per_week")
+        if r.get("accepted") and (tpw is None or float(tpw) < min_per_week):
+            r["accepted"] = False
+            shown = "?" if tpw is None else f"{float(tpw):.1f}"
+            r["reason"] = f"opera poco: {shown} op./semana < {min_per_week:g}"
+            count += 1
+    return count
+
+
 def update_state(state: dict[str, Any], results: list[dict[str, Any]], confirmations: int,
                  exclude: set[str], now: str) -> tuple[dict[str, Any], list[str]]:
     """
@@ -124,7 +144,8 @@ def update_state(state: dict[str, Any], results: list[dict[str, Any]], confirmat
                      streak=int(c.get("streak", 0)) + 1, last_seen=now,
                      last={k: r.get(k) for k in ("pf_oos", "trades_oos", "pf_is", "windows",
                                                  "win_rate_oos", "spread", "params", "reason",
-                                                 "asset_class", "long_only", "session_hours")})
+                                                 "asset_class", "long_only", "session_hours",
+                                                 "trades_per_week")})
             candidates[key] = c
         else:
             candidates.pop(key, None)
@@ -193,7 +214,9 @@ def scan_once(config: dict[str, Any], base_dir: Path = BASE_DIR,
             if combo_key(s, tf, st) not in exclude]
     strict = {**config,
               "min_pf_oos": max(float(config["min_pf_oos"]), float(config["scout_min_pf_oos"])),
-              "min_trades_oos": max(int(config["min_trades_oos"]), int(config["scout_min_trades_oos"]))}
+              "min_trades_oos": max(int(config["min_trades_oos"]), int(config["scout_min_trades_oos"])),
+              "min_trades_per_week": max(float(config.get("min_trades_per_week") or 0.0),
+                                         float(config.get("scout_min_trades_week") or 0.0))}
     total = sum(1 for j in jobs if (j[0], j[1]) in data)
     workers = int(config.get("lab_workers") or 0) or max(1, (os.cpu_count() or 2) - 1)
 
@@ -205,6 +228,7 @@ def scan_once(config: dict[str, Any], base_dir: Path = BASE_DIR,
     _emit("SCOUT_PROGRESS", {"stage": "evaluando", "done": 0, "total": total,
                              "message": f"Evaluando {total} combinaciones…"})
     results = lab.run_lab(jobs, data, strict, spreads, workers, on_result, stop, meta)
+    apply_frequency_rule(results, float(config.get("scout_min_trades_week") or 0.0))
 
     now = now_iso()
     state = read_json(state_path) or {}
