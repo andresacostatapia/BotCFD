@@ -182,7 +182,7 @@ def test_candle_line_and_heartbeat_after_signal(fake: FakeMT5, config_file, capl
     assert "cerrada (hora servidor)" in caplog.text and "[DRY-RUN]" in caplog.text
     assert "1970" not in caplog.text
     caplog.clear()
-    bot.last_heartbeat = 0.0
+    bot.last_heartbeat = None
     bot.step()                       # misma vela -> mensaje de espera
     assert "En espera" in caplog.text and "Vela" not in caplog.text
 
@@ -198,7 +198,7 @@ def test_heartbeat_explains_what_bot_waits_for(fake: FakeMT5, config_file, caplo
     bot.params = dict(PARAMS)
     bot.step()                         # la línea de vela cuenta como latido
     assert "En espera" not in caplog.text
-    bot.last_heartbeat = 0.0
+    bot.last_heartbeat = None
     caplog.clear()
     bot.step()
     text = caplog.text

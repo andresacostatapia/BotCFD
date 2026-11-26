@@ -207,7 +207,7 @@ class TradingBot:
         self.evolution: dict[str, Any] | None = None
         self.last_bar_time: Any = None      # última vela cuya señal ya se procesó
         self.logged_bar_time: Any = None    # última vela ya mostrada en el log
-        self.last_heartbeat: float = 0.0    # time.monotonic() del último mensaje de espera
+        self.last_heartbeat: float | None = None  # time.monotonic() del último mensaje (None = nunca)
         self.halt_logged = False
         self.last_message = "iniciando"
         self.last_sig: dict[str, Any] | None = None
@@ -522,7 +522,7 @@ class TradingBot:
         if every <= 0:
             return
         now = time.monotonic()
-        if now - self.last_heartbeat >= every - 1:
+        if self.last_heartbeat is None or now - self.last_heartbeat >= every - 1:
             self.last_heartbeat = now
             logger.info("En espera | %s", message)
 
