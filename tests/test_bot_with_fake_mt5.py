@@ -583,3 +583,34 @@ def test_scout_matches_subcategory() -> None:
                {"name": "SAN.ES", "category": "Shares", "subcategory": "Shares / Spain"}]
     chosen, _ = scout.select_universe(symbols, ["Shares / US"], 10, 1.0, lambda n: 0.01)
     assert chosen == ["AAPL.US"]
+
+
+def test_signal_stats_and_frequency(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    bot.step()                                     # señal -> operación
+    assert bot.signal_stats["signals"] == 1 and bot.signal_stats["opened"] == 1
+    bot.last_bar_time = None
+    bot.step()                                     # misma señal, ya hay posición
+    assert bot.signal_stats["blocked"] == {"ya había una posición abierta": 1}
+    assert "bloqueada" in bot.signal_stats["last"]
+
+
+def test_spread_pending_not_double_counted(fake: FakeMT5, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    bot.config["max_spread"] = 0.00001
+    bot.risk.update_config(bot.config)
+    bot.step()
+    bot.step()
+    assert bot.signal_stats["blocked"] == {"spread alto (pendiente)": 1}
+    bot.config["max_spread"] = 0.001
+    bot.risk.update_config(bot.config)
+    bot.step()                                     # el spread baja: se opera la misma señal
+    assert bot.signal_stats["signals"] == 1 and bot.signal_stats["opened"] == 1
+    assert bot.signal_stats["blocked"] == {}
+
+
+def test_evolution_reports_trades_per_week(synthetic_ohlc) -> None:
+    import strategy_evolver as se
+    out = se.evolve_parameters(synthetic_ohlc, pop=6, gens=2, seed=1)
+    assert out["oos_days"] == pytest.approx(600 / 24, rel=0.01)
+    assert out["trades_per_week"] == pytest.approx(out["out_of_sample"]["trades"] / (out["oos_days"] / 7), abs=0.01)

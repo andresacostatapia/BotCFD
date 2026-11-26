@@ -233,6 +233,8 @@ class TradingBot:
         self.detected_session = ""
         self.rules: dict[str, Any] = asset_config(config, "otro", False)
         self.flat_done_day: str = ""
+        # Diagnóstico: señales desde que arrancó y por qué no se operaron
+        self.signal_stats: dict[str, Any] = {"signals": 0, "opened": 0, "blocked": {}, "last": ""}
 
     def _notify_prefix(self) -> str:
         sim = " SIM" if self.dry_run else ""
@@ -643,17 +645,23 @@ class TradingBot:
                 self.last_bar_time = bar_time
             elif positions:
                 self.last_bar_time = bar_time
+                self._count_signal(sig, "ya había una posición abierta")
                 logger.info("Señal de %s ignorada: ya hay %d posición(es) con magic %d.",
                             signal_txt, len(positions), magic)
             elif not session_open:
                 self.last_bar_time = bar_time
+                self._count_signal(sig, "fuera de horario / sesión")
                 logger.info("Señal de %s ignorada: %s.", signal_txt,
                             stock_block or f"fuera del horario de operación ({cfg.get('trading_hours')}, hora servidor)")
             elif sig["signal"] == -1 and self.rules.get("long_only"):
                 self.last_bar_time = bar_time
+                self._count_signal(sig, "solo compras")
                 logger.info("Señal de VENTA ignorada: este símbolo solo admite compras.")
             elif not spread_ok:
                 # No se marca la vela: se reintenta en el próximo ciclo si el spread baja.
+                if self.signal_stats.get("_spread_bar") != bar_time:
+                    self.signal_stats["_spread_bar"] = bar_time
+                    self._count_signal(sig, "spread alto (pendiente)")
                 self.heartbeat(f"señal de {signal_txt} pendiente: spread "
                                f"{self.risk.last_spread:.6g} > máximo {self.risk.max_spread:.6g}")
                 return
@@ -676,15 +684,47 @@ class TradingBot:
         self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
                        f"{self._day_text()}")
 
-    def open_trade(self, sig: dict[str, Any]) -> None:
-        """Calcula SL/TP con ATR, dimensiona el lote y envía la orden."""
+    def _count_signal(self, sig: dict[str, Any], outcome: str | None) -> None:
+        """Registra una señal y su resultado (None = operación abierta / simulada)."""
+        stats = self.signal_stats
+        pending = "spread alto (pendiente)"
+        if outcome != pending and stats.get("_spread_bar") is not None \
+                and stats.get("_spread_bar") == sig.get("bar_time"):
+            # la misma señal ya se contó como "pendiente por spread": se sustituye
+            stats["signals"] -= 1
+            stats["blocked"][pending] = stats["blocked"].get(pending, 1) - 1
+            if stats["blocked"][pending] <= 0:
+                stats["blocked"].pop(pending, None)
+            stats["_spread_bar"] = None
+        stats["signals"] += 1
+        side = "COMPRA" if sig.get("signal") == 1 else "VENTA"
+        when = sig.get("bar_time")
+        when_txt = f"{when:%d/%m %H:%M}" if hasattr(when, "strftime") else str(when)
+        if outcome is None:
+            stats["opened"] += 1
+            stats["last"] = f"{side} {when_txt}: {'simulada' if self.dry_run else 'abierta'}"
+        else:
+            stats["blocked"][outcome] = stats["blocked"].get(outcome, 0) + 1
+            stats["last"] = f"{side} {when_txt}: bloqueada ({outcome})"
+
+    def open_trade(self, sig: dict[str, Any]) -> str | None:
+        """
+        Calcula SL/TP con ATR, dimensiona el lote y envía la orden.
+
+        :returns: None si la operación se abrió (o se simuló); si no, el motivo corto.
+        """
+        outcome = self._open_trade(sig)
+        self._count_signal(sig, outcome)
+        return outcome
+
+    def _open_trade(self, sig: dict[str, Any]) -> str | None:
         cfg = self.config
         symbol = cfg["symbol"]
         side = "buy" if sig["signal"] == 1 else "sell"
         atr_value = sig["atr"]
         if not atr_value or atr_value != atr_value or atr_value <= 0:
             logger.warning("SKIP: ATR inválido (%s).", atr_value)
-            return
+            return "ATR inválido"
 
         params = self.params or {}
         sl_dist = float(params.get("sl_mult", cfg["sl_atr_mult"])) * atr_value
@@ -695,20 +735,20 @@ class TradingBot:
                 "SKIP: SL/TP (%.5f/%.5f) por debajo del mínimo del bróker (%.5f).",
                 sl_dist, tp_dist, min_stop,
             )
-            return
+            return "SL menor que el mínimo del bróker"
 
         if not self.portfolio_allows_new_trade():
-            return
+            return "límite global de posiciones"
 
         lot = self.risk.calculate_lot(sl_dist)
         if lot is None:
             logger.warning("SKIP: el RiskManager rechazó la operación: %s", self.risk.last_rejection)
-            return
+            return "lote / riesgo"
 
         tick = mt5c.get_tick(symbol)
         if tick is None:
             logger.warning("SKIP: sin tick para %s.", symbol)
-            return
+            return "sin cotización"
         price = tick.ask if side == "buy" else tick.bid
         sl = price - sl_dist if side == "buy" else price + sl_dist
         tp = price + tp_dist if side == "buy" else price - tp_dist
@@ -719,18 +759,20 @@ class TradingBot:
                 side.upper(), lot, symbol, price, sl, tp,
             )
             self.notifier.send(f"Señal {side.upper()} {lot:.2f} @ {price:.6g} (simulación, no se envía)")
-            return
+            return None
 
         result = mt5c.send_market_order(
             symbol, side, lot, sl, tp, int(cfg["magic"]),
             deviation=int(cfg["deviation"]), comment="MT5Bot evo",
         )
-        if result is not None:
-            ticket = int(getattr(result, "order", 0) or 0)
-            if ticket:
-                self.registry.set(ticket, {"atr": atr_value, "entry": price, "best": price,
-                                           "side": 1 if side == "buy" else -1, "opened": now_iso()})
-            self.notifier.send(f"ORDEN {side.upper()} {lot:.2f} @ {price:.6g} | SL {sl:.6g} | TP {tp:.6g}")
+        if result is None:
+            return "orden rechazada por el bróker"
+        ticket = int(getattr(result, "order", 0) or 0)
+        if ticket:
+            self.registry.set(ticket, {"atr": atr_value, "entry": price, "best": price,
+                                       "side": 1 if side == "buy" else -1, "opened": now_iso()})
+        self.notifier.send(f"ORDEN {side.upper()} {lot:.2f} @ {price:.6g} | SL {sl:.6g} | TP {tp:.6g}")
+        return None
 
     # ------------------------------------------------------------ horario
     def stock_session_block(self, tick: Any, positions: list[Any]) -> str:
@@ -968,6 +1010,8 @@ class TradingBot:
                           if self.bots_pnl else None),
                 halt_reason=st["halt_reason"],
                 paused_reason=self.paused_reason,
+                signal_stats={k: v for k, v in self.signal_stats.items() if not k.startswith("_")},
+                trades_per_week=(self.evolution or {}).get("trades_per_week"),
                 asset_class=self.asset_class,
                 session_hours=self.rules.get("session_hours") or "",
                 long_only=bool(self.rules.get("long_only")),

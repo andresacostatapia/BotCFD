@@ -1220,7 +1220,7 @@ class ControlCenter(tk.Tk):
             ("strategy", "Estrategia", 100, "w"), ("pf_oos", "PF valid.", 70, "e"),
             ("trades_oos", "Op. valid.", 70, "e"), ("windows", "Ventanas +", 75, "center"),
             ("pf_is", "PF entreno", 75, "e"), ("win", "% acierto", 70, "e"),
-            ("reason", "Motivo", 260, "w")], height=18)
+            ("freq", "Op./sem.", 65, "e"), ("reason", "Motivo", 230, "w")], height=18)
         self.lab_tree.configure(selectmode="extended")
         self.lab_tree.frame.pack(fill="both", expand=True)
         rrow = ttk.Frame(right)
@@ -1669,7 +1669,24 @@ class ControlCenter(tk.Tk):
         else:
             self.d_bar.configure(text="")
         evo = read_json(paths.evolved) or {}
-        self.d_strategy.configure(text=("Parámetros: " + describe_params(evo.get("params"))) if evo else "")
+        lines = []
+        if evo:
+            lines.append("Parámetros: " + describe_params(evo.get("params")))
+            tpw = evo.get("trades_per_week")
+            if tpw is not None and evo.get("accepted"):
+                every = (f"~1 cada {7 / tpw:.1f} días" if 0 < tpw < 1 else f"~{tpw:.1f} por semana") if tpw else "casi ninguna"
+                lines.append(f"Frecuencia esperada (según la validación): {every}")
+        stats = (st.get("signal_stats") or {}) if live else {}
+        if stats:
+            blocked = ", ".join(f"{k} {v}" for k, v in (stats.get("blocked") or {}).items())
+            txt = (f"Desde que arrancó: {stats.get('signals', 0)} señal(es), {stats.get('opened', 0)} "
+                   f"{'simulada(s)' if st.get('dry_run') else 'operada(s)'}")
+            if blocked:
+                txt += f"; bloqueadas: {blocked}"
+            if stats.get("last"):
+                txt += f". Última: {stats['last']}"
+            lines.append(txt)
+        self.d_strategy.configure(text="\n".join(lines))
         self._render_evolution(paths)
 
     def _render_evolution(self, paths: Any) -> None:
@@ -2234,7 +2251,7 @@ class ControlCenter(tk.Tk):
                 r["symbol"] + (" (acción)" if r.get("asset_class") == "accion" else ""),
                 r["timeframe"], STRATEGY_SHORT.get(r["strategy"], r["strategy"]),
                 fmt(r.get("pf_oos")), fmt(r.get("trades_oos"), "{}"), r.get("windows") or "—",
-                fmt(r.get("pf_is")), fmt(r.get("win_rate_oos"), "{:.0%}"),
+                fmt(r.get("pf_is")), fmt(r.get("win_rate_oos"), "{:.0%}"), fmt(r.get("trades_per_week"), "{:.1f}"),
                 "" if ok else str(r.get("reason", ""))[:120]))
         keep = [i for i in selected if tree.exists(i)]
         if keep:

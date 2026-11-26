@@ -92,6 +92,7 @@ def evaluate_job(job: Job, df: pd.DataFrame, config: dict[str, Any], spread: flo
         "pf_oos": oos.get("profit_factor"),
         "trades_oos": oos.get("trades"),
         "win_rate_oos": oos.get("win_rate"),
+        "trades_per_week": res.get("trades_per_week"),
         "net_oos": oos.get("net_profit"),
         "dd_oos": oos.get("max_drawdown"),
         "windows": f"{positives}/{len(windows)}" if windows else "",

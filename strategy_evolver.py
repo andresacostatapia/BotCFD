@@ -1019,6 +1019,11 @@ def evolve_parameters(
 
     accepted = not reasons
     reason = "validación walk-forward superada" if accepted else "; ".join(reasons)
+    oos_days = None
+    if "time" in cache.df.columns and n - split > 1:
+        span = pd.to_datetime(cache.df["time"].iloc[n - 1]) - pd.to_datetime(cache.df["time"].iloc[split])
+        oos_days = round(span.total_seconds() / 86400, 2)
+    trades_per_week = (round(oos_m.trades / (oos_days / 7), 2) if oos_days and oos_days > 0 else None)
     result = {
         "accepted": accepted,
         "reason": reason,
@@ -1035,6 +1040,8 @@ def evolve_parameters(
         "strategy": strategy_of(best),
         "train_bars": split if k <= 1 else n,
         "test_bars": n - split,
+        "oos_days": oos_days,
+        "trades_per_week": trades_per_week,
     }
     log = logger.info if accepted else logger.warning
     log(
