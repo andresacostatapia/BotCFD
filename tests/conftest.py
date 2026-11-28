@@ -28,3 +28,14 @@ def synthetic_ohlc() -> pd.DataFrame:
         "time": pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
         "open": open_, "high": high, "low": low, "close": close,
     })
+
+
+@pytest.fixture(autouse=True)
+def _no_network_news(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Las pruebas nunca descargan el calendario de noticias real."""
+    import news_filter
+
+    def _offline(url: str, timeout: float = 15.0) -> list:
+        raise OSError("sin red en las pruebas")
+
+    monkeypatch.setattr(news_filter, "_default_fetch", _offline)

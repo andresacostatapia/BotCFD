@@ -217,6 +217,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retry_evolve_hours": 6,          # si la validación descarta, reintentar cada N horas (0 = el bot se detiene)
     "reuse_evolution": True,          # al arrancar, reutilizar parámetros aceptados recientes (misma configuración)
     "health_check_hours": 24,         # revisar cada N horas los parámetros con las velas nuevas (0 = nunca)
+    # --- Noticias y correlación ---
+    "news_filter": True,              # no abrir operaciones alrededor de noticias de las divisas del símbolo
+    "news_impact": "alto",            # "alto" = solo alto impacto | "medio" = alto y medio
+    "news_minutes_before": 30,        # minutos antes de la noticia sin abrir operaciones
+    "news_minutes_after": 30,         # minutos después de la noticia sin abrir operaciones
+    "news_close_positions": False,    # cerrar las posiciones del bot antes de la noticia
+    "news_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",  # calendario (JSON semanal)
+    "news_refresh_hours": 6,          # cada cuánto se descarga el calendario (compartido por todos los bots)
+    "correlation_filter": True,       # evita posiciones muy correlacionadas en la misma dirección
+    "correlation_threshold": 0.8,     # |correlación| de rendimientos H1 a partir de la cual se consideran ligados
+    "max_correlated_positions": 1,    # posiciones a la vez dentro de un grupo correlacionado (misma dirección)
     "telegram_token": "",             # opcional: avisos por Telegram
     "telegram_chat_id": "",
     "autostart_bots": False,          # el Centro de control inicia los perfiles activos al abrirse
@@ -441,7 +452,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         errors.append("'max_open_positions_total' debe ser un entero >= 0 (0 = sin límite)")
 
     for key in ("enabled", "simulation", "regime_filter", "stability_check", "autostart_bots",
-                "reuse_evolution"):
+                "reuse_evolution", "news_filter", "news_close_positions", "correlation_filter"):
         if not isinstance(config.get(key), bool):
             errors.append(f"'{key}' debe ser true/false")
 
@@ -512,6 +523,20 @@ def validate_config(config: dict[str, Any]) -> list[str]:
         value = _num(key)
         if value is not None and value <= 0:
             errors.append(f"'{key}' debe ser > 0")
+    if config.get("news_impact") not in ("alto", "medio"):
+        errors.append("'news_impact' debe ser 'alto' o 'medio'")
+    for key in ("news_minutes_before", "news_minutes_after", "news_refresh_hours"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1440:
+            errors.append(f"'{key}' debe ser un entero entre 0 y 1440")
+    if not isinstance(config.get("news_url"), str) or not str(config.get("news_url")).startswith("http"):
+        errors.append("'news_url' debe ser una URL http(s)")
+    corr = config.get("correlation_threshold")
+    if isinstance(corr, bool) or not isinstance(corr, (int, float)) or not 0.3 <= float(corr) <= 1.0:
+        errors.append("'correlation_threshold' debe estar entre 0.3 y 1.0")
+    mcp = config.get("max_correlated_positions")
+    if isinstance(mcp, bool) or not isinstance(mcp, int) or mcp < 1:
+        errors.append("'max_correlated_positions' debe ser un entero >= 1")
     for key in ("scout_min_trades_week", "min_trades_per_week"):
         value = _num(key)
         if value is not None and value < 0:

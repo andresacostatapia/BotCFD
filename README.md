@@ -35,6 +35,7 @@ C:\MT5Bot\
 ├── scout.py                 # Explorador: revisa categorías periódicamente y PROPONE símbolos nuevos
 ├── strategy_evolver.py      # Estrategias, backtest, evolución genética y walk-forward (sin MT5)
 ├── risk_manager.py          # Pérdida diaria, spread y tamaño de lote (sin MT5, testeable)
+├── news_filter.py           # Calendario económico (caché compartida) y ventanas de noticias (sin MT5)
 ├── mt5_connector.py         # Conexión MT5, datos, órdenes, gestión de posiciones, historial
 ├── bot_common.py            # Configuración por capas, perfiles, rutas y logging
 ├── config_panel.py          # Panel simple (modo consola)
@@ -68,7 +69,7 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
 | **Laboratorio** | Elija símbolos (buscador o *Mis símbolos*), timeframes y estrategias → **Analizar**. Evalúa cada combinación con la misma evolución y validación que el bot, en paralelo, y las ordena por robustez. **Activar seleccionados** crea los perfiles (en simulación) |
 | **Explorador** | Elija **categorías del bróker** (Forex, Índices, Metales…), timeframes y estrategias. Revisa automáticamente cada N minutos (por defecto 60; botón **Explorar ahora**) y **propone** las combinaciones que superan una validación más exigente en varias exploraciones seguidas. **Activar seleccionadas** crea los perfiles en simulación; **Descartar** las oculta. Muestra también las que están *en observación* |
 | **Estadísticas** | Operaciones **reales** cerradas por los bots (7/30/90/365 días): curva de resultado acumulado y, por símbolo, operaciones, % de acierto, PF real vs. PF de validación, resultado y drawdown, con una valoración |
-| **Configuración general** | Lo común a todos los símbolos: *Riesgo*, *Horario y salidas*, *Cuenta, inicio y avisos* y, plegadas, las opciones **avanzadas** (evolución, validación, ejecución, seguimiento). Probar conexión, **Iniciar con Windows**, **Probar Telegram** |
+| **Configuración general** | Lo común a todos los símbolos: *Riesgo*, *Horario y salidas*, *Cuenta, inicio y avisos*, *Noticias y correlación* y, plegadas, las opciones **avanzadas** (evolución, validación, ejecución, seguimiento). Probar conexión, **Iniciar con Windows**, **Probar Telegram** |
 
 * **Buscador de símbolos:** todos los símbolos del bróker con descripción,
   categoría, spread actual y lote mínimo; búsqueda en inglés o español (`oro`,
@@ -82,6 +83,11 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
   los bots que lanzó.
 * **Iniciar con Windows** crea un acceso en la carpeta *Inicio* que abre el Centro
   de control y arranca los símbolos activos (MT5 también debe abrirse e iniciar sesión).
+* **Valores negativos en rojo:** resultado de hoy y de las posiciones, filas de la
+  tabla y de *Estadísticas* con resultado negativo (las tablas colorean la fila
+  entera), beneficio neto negativo en *Evolución*, tramos de la curva con acumulado
+  negativo y, en el log, cada número negativo (y la línea entera si una operación
+  se cierra con pérdida).
 
 ### Explorador (`scout.py`)
 
@@ -288,9 +294,9 @@ reaccionar sin esperar al siguiente ciclo):
 6. Señal en la última vela cerrada → filtros: horario, spread, una posición por
    símbolo, **señal tardía** (si la vela siguiente ya lleva abierta más de la mitad
    de su duración, p. ej. al arrancar el bot a media vela, no se opera: el backtest
-   entra en su apertura), **límite global** `max_open_positions_total` (entre todos
-   los perfiles) → lote por riesgo (`risk_percent`, SL por ATR) → orden IOC (con
-   fallback FOK/RETURN).
+   entra en su apertura), **noticias** y **correlación** (ver abajo), **límite
+   global** `max_open_positions_total` (entre todos los perfiles) → lote por riesgo
+   (`risk_percent`, SL por ATR) → orden IOC (con fallback FOK/RETURN).
 7. **Pausa por rendimiento**: si el PF **real** de las últimas operaciones con los
    parámetros actuales (mínimo `auto_disable_min_trades`) cae bajo
    `auto_disable_pf`, deja de abrir operaciones y busca parámetros nuevos tras
@@ -300,6 +306,38 @@ reaccionar sin esperar al siguiente ciclo):
 
 En **simulación** (`simulation` = true, por defecto en los perfiles nuevos) calcula
 todo y muestra la orden que *habría* enviado, sin enviarla.
+
+### Noticias económicas
+
+Con `news_filter` (activado) el bot **no abre operaciones** desde
+`news_minutes_before` (30) minutos antes hasta `news_minutes_after` (30) minutos
+después de una noticia de **alto impacto** (`news_impact` = `alto`; con `medio`
+también las de impacto medio) de las **divisas del símbolo**, según el bróker:
+EURUSD → EUR y USD; XAUUSD, US500 y acciones de EE. UU. → USD; GER40 → EUR. Con
+`news_close_positions` además **cierra** sus posiciones al entrar en la ventana
+previa (desactivado por defecto: el SL ya limita la pérdida).
+
+* Calendario: el JSON semanal público de Forex Factory (`news_url`). La API de
+  Python de MT5 no da acceso al calendario de MetaTrader. Se descarga como mucho
+  cada `news_refresh_hours` (6 h) y se guarda en `logs/news_calendar.json`,
+  **compartido** por todos los bots (una descarga para todos).
+* Sin internet se usa la última copia (hasta 8 días). Si no hay ninguna, el filtro
+  **no bloquea** y el detalle del símbolo lo indica ("no se bloquea nada").
+* El detalle del símbolo muestra la próxima noticia relevante o "PAUSA POR NOTICIA";
+  las señales bloqueadas aparecen como "noticia USD", etc.
+* El backtest **no** conoce las noticias pasadas: la validación incluye operaciones
+  que en vivo se habrían evitado.
+
+### Correlación entre símbolos
+
+Con `correlation_filter` (activado) el bot **no abre** si ya hay
+`max_correlated_positions` (1) posiciones de los bots en símbolos cuyos rendimientos
+H1 de las últimas 500 velas tienen |correlación| ≥ `correlation_threshold` (0.8) **y
+van en la misma dirección efectiva**: comprar EURUSD y GBPUSD, o US500 y US30, cuenta
+como la misma apuesta; comprar EURUSD y vender USDCHF (correlación negativa) también.
+Posiciones en sentido contrario (que se cubren) no bloquean. Las correlaciones se
+recalculan cada 6 h. Las señales bloqueadas aparecen como "correlación con otra
+posición" y el log indica con qué símbolos.
 
 **Estrategia automática** (`strategy` = `auto`, en *Editar…*): en cada evolución el
 bot evoluciona y valida **las 5 estrategias** y opera la mejor **aceptada** (PF de
@@ -346,6 +384,12 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `retry_evolve_hours` | 6 | Sin parámetros válidos: nueva búsqueda cada N h (0 = el bot se detiene al descartar) |
 | `health_check_hours` | 24 | Revisión de los parámetros con las velas nuevas; re-evolución anticipada si se degradan (0 = nunca) |
 | `reuse_evolution` | true | Reutilizar al arrancar los parámetros aceptados recientes de la misma configuración |
+| **Noticias y correlación** | | |
+| `news_filter`, `news_impact` | true, alto | Pausa por noticias de las divisas del símbolo; `medio` incluye impacto medio |
+| `news_minutes_before`, `news_minutes_after` | 30, 30 | Ventana sin abrir operaciones alrededor de la noticia |
+| `news_close_positions` | false | Cerrar las posiciones del bot antes de la noticia |
+| `news_url`, `news_refresh_hours` | Forex Factory, 6 | Calendario (JSON semanal) y cada cuánto se descarga |
+| `correlation_filter`, `correlation_threshold`, `max_correlated_positions` | true, 0.8, 1 | Control de posiciones correlacionadas en la misma dirección |
 | `min_trades_per_week`, `stability_check` | 2, true | Preferencia de frecuencia; rechazo de parámetros frágiles |
 | `telegram_token`, `telegram_chat_id` | "" | Avisos por Telegram (opcional) |
 | `autostart_bots`, `lab_workers` | false, 0 | Autoarranque de activos; procesos del laboratorio (0 = auto) |
@@ -414,7 +458,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (187 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (198 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 

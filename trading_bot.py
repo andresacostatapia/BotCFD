@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import mt5_connector as mt5c
+import news_filter as nf
 from bot_common import (
     AUTO_STRATEGY, CONFIG_PATH, PROFILE_KEYS, VALID_STRATEGIES, ProfilePaths, config_path_for, global_config_path, hour_allowed,
     list_profiles, load_config, now_iso, profile_paths, read_json, save_profile, session_clock,
@@ -48,6 +49,10 @@ logger = logging.getLogger("trading_bot")
 
 EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_CONNECTION, EXIT_VALIDATION = 0, 1, 2, 3, 4
 DEALS_REFRESH_SECONDS = 300
+#: Correlaciones entre símbolos: velas H1 usadas y validez de la caché (segundos).
+CORRELATION_TIMEFRAME = "H1"
+CORRELATION_BARS = 500
+CORRELATION_CACHE_SECONDS = 6 * 3600
 #: Una señal solo se opera si la vela en curso (la siguiente a la de la señal) lleva
 #: abierta como mucho esta fracción de su duración (mín. ``SIGNAL_MIN_AGE_SECONDS``).
 #: El backtest entra a la APERTURA de esa vela: entrar mucho más tarde (p. ej. al
@@ -317,6 +322,12 @@ class TradingBot:
         self.detected_session = ""
         self.rules: dict[str, Any] = asset_config(config, "otro", False)
         self.flat_done_day: str = ""
+        # Noticias y correlación
+        self.currencies: list[str] = []
+        self._news: nf.NewsCalendar | None = None
+        self.news_info: dict[str, Any] | None = None
+        self._news_closed_for: float | None = None
+        self._corr_cache: dict[tuple[str, str], tuple[float | None, float]] = {}
         # Diagnóstico: señales desde que arrancó y por qué no se operaron
         self.signal_stats: dict[str, Any] = {"signals": 0, "opened": 0, "blocked": {}, "last": ""}
 
@@ -339,6 +350,10 @@ class TradingBot:
             detected, long_only = "otro", False
         self.asset_class = detected if cfg.get("asset_class", "auto") == "auto" else cfg["asset_class"]
         self.broker_long_only = long_only
+        try:
+            self.currencies = mt5c.symbol_currencies(cfg["symbol"])
+        except Exception:  # noqa: BLE001 - informativo
+            self.currencies = []
 
     def update_rules(self, df: Any = None) -> None:
         """Recalcula las reglas efectivas (horario, comisión, solo compras...) del activo."""
@@ -897,6 +912,8 @@ class TradingBot:
         self.last_tick = tick
         if positions:
             self.manage_positions(positions, sig, tick)
+            self.close_before_news(positions)
+        news = self.news_check()
         signal_txt = {1: "COMPRA", -1: "VENTA"}.get(sig["signal"], "ninguna")
 
         if bar_time != self.logged_bar_time:
@@ -934,6 +951,12 @@ class TradingBot:
                 self._count_signal(sig, "señal tardía (vela ya avanzada)")
                 logger.info("Señal de %s ignorada: llegó con la vela siguiente ya avanzada (p. ej. al "
                             "arrancar el bot); el backtest habría entrado en su apertura.", signal_txt)
+            elif news is not None:
+                self.last_bar_time = bar_time
+                self._count_signal(sig, f"noticia {news.currency}")
+                logger.info("Señal de %s ignorada por noticia: %s (pausa de %s min antes y %s después).",
+                            signal_txt, news.local_text(), cfg.get("news_minutes_before"),
+                            cfg.get("news_minutes_after"))
             elif not session_open:
                 self.last_bar_time = bar_time
                 self._count_signal(sig, "fuera de horario / sesión")
@@ -965,10 +988,105 @@ class TradingBot:
             state = self._positions_text(positions)
         elif not session_open:
             state = stock_block or f"fuera del horario de operación ({cfg.get('trading_hours')} h servidor)"
+        elif news is not None:
+            state = f"pausa por noticia: {news.local_text()}"
         else:
             state = self._waiting_text(sig)
         self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
                        f"{self._day_text()}")
+
+    # ------------------------------------------------------------ noticias
+    def news_calendar(self) -> nf.NewsCalendar:
+        """Calendario compartido (logs/news_calendar.json) con la URL y el refresco actuales."""
+        url = str(self.config.get("news_url") or nf.DEFAULT_NEWS_URL)
+        refresh = float(self.config.get("news_refresh_hours", 6) or 6)
+        if self._news is None or self._news.url != url or self._news.refresh_hours != refresh:
+            self._news = nf.NewsCalendar(self.config_path.parent / "logs" / "news_calendar.json",
+                                         url=url, refresh_hours=refresh)
+        return self._news
+
+    def news_check(self, now: float | None = None) -> nf.NewsEvent | None:
+        """
+        Noticia que bloquea ahora las entradas (None si no hay o el filtro está apagado).
+        Actualiza ``news_info`` (próxima noticia o error) para el estado del bot.
+        """
+        cfg = self.config
+        if not cfg.get("news_filter") or not self.currencies:
+            self.news_info = None
+            return None
+        now = time.time() if now is None else now
+        calendar = self.news_calendar()
+        events = calendar.events(now)
+        impacts = nf.impacts_for(str(cfg.get("news_impact", "alto")))
+        before, after = int(cfg.get("news_minutes_before", 30)), int(cfg.get("news_minutes_after", 30))
+        blocking = nf.find_blocking(events, self.currencies, now, before, after, impacts)
+        upcoming = blocking or nf.next_event(events, self.currencies, now, after, impacts)
+        self.news_info = {"currencies": self.currencies, "error": calendar.last_error,
+                          "event": upcoming.to_dict(now, blocking is not None) if upcoming else None}
+        return blocking
+
+    def close_before_news(self, positions: list[Any], now: float | None = None) -> None:
+        """Con ``news_close_positions``, cierra las posiciones del bot antes de una noticia."""
+        if not positions or not self.config.get("news_close_positions") or not self.config.get("news_filter"):
+            return
+        event = self.news_check(now)
+        now = time.time() if now is None else now
+        if event is None or event.ts < now or self._news_closed_for == event.ts:
+            return  # solo ANTES de la noticia, y una vez por noticia
+        self._news_closed_for = event.ts
+        for pos in positions:
+            if self.dry_run:
+                logger.info("[DRY-RUN] cerraría #%s antes de la noticia %s", pos.ticket, event.local_text())
+            else:
+                logger.warning("Cerrando #%s antes de la noticia %s", pos.ticket, event.local_text())
+                mt5c.close_position(pos, int(self.config["deviation"]))
+        self.notifier.send(f"Posiciones cerradas antes de la noticia {event.local_text()}")
+
+    # ---------------------------------------------------------- correlación
+    def correlation(self, other: str) -> float | None:
+        """Correlación (cacheada unas horas) entre el símbolo del bot y ``other``."""
+        symbol = self.config["symbol"]
+        key = tuple(sorted((symbol, other)))
+        cached = self._corr_cache.get(key)  # type: ignore[arg-type]
+        if cached is not None and time.time() - cached[1] < CORRELATION_CACHE_SECONDS:
+            return cached[0]
+        try:
+            value = mt5c.returns_correlation(symbol, other, CORRELATION_TIMEFRAME, CORRELATION_BARS)
+        except Exception:  # noqa: BLE001 - sin datos: no se bloquea
+            logger.debug("No se pudo calcular la correlación %s/%s", symbol, other, exc_info=True)
+            value = None
+        self._corr_cache[key] = (value, time.time())  # type: ignore[index]
+        return value
+
+    def correlation_block(self, side: int) -> str | None:
+        """
+        Motivo para NO abrir si ya hay ``max_correlated_positions`` posiciones de los bots
+        en símbolos correlacionados (|corr| >= ``correlation_threshold``) que van en la
+        MISMA dirección efectiva (misma dirección con correlación positiva, o contraria
+        con correlación negativa: comprar EURUSD y vender USDCHF es casi la misma apuesta).
+        """
+        cfg = self.config
+        if not cfg.get("correlation_filter"):
+            return None
+        threshold = float(cfg.get("correlation_threshold", 0.8))
+        limit = max(1, int(cfg.get("max_correlated_positions", 1)))
+        try:
+            positions = mt5c.get_positions_by_magics(self.portfolio_magics())
+        except Exception:  # noqa: BLE001
+            return None
+        linked = []
+        for pos in positions:
+            if pos.symbol == cfg["symbol"] and int(pos.magic) == int(cfg["magic"]):
+                continue
+            corr = self.correlation(pos.symbol)
+            if corr is None or abs(corr) < threshold:
+                continue
+            pos_side = 1 if getattr(pos, "type", 0) == 0 else -1
+            if side * pos_side * (1 if corr > 0 else -1) > 0:
+                linked.append(f"{pos.symbol} {'BUY' if pos_side == 1 else 'SELL'} (corr {corr:+.2f})")
+        if len(linked) >= limit:
+            return ", ".join(linked)
+        return None
 
     def signal_is_stale(self, forming_open: Any, tick: Any) -> bool:
         """
@@ -1052,6 +1170,11 @@ class TradingBot:
 
         if not self.portfolio_allows_new_trade():
             return "límite global de posiciones"
+        linked = self.correlation_block(int(sig["signal"]))
+        if linked:
+            logger.warning("SKIP: ya hay posiciones correlacionadas en la misma dirección: %s "
+                           "(máximo %s).", linked, cfg.get("max_correlated_positions"))
+            return "correlación con otra posición"
 
         lot = self.risk.calculate_lot(sl_dist)
         if lot is None:
@@ -1348,6 +1471,7 @@ class TradingBot:
                 next_evolution=(datetime.fromtimestamp(nxt).isoformat(timespec="minutes")
                                 if (nxt := self.next_evolution_ts()) else None),
                 health=self.health,
+                news=self.news_info,
                 strategy=(self.evolution or {}).get("strategy") if self.params else None,
                 auto_strategy=self.config.get("strategy") == AUTO_STRATEGY,
                 dry_run=self.dry_run,

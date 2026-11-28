@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from bot_common import CONFIG_PATH, load_config
@@ -479,6 +480,62 @@ def count_positions_by_magics(magics: set[int]) -> int:
     if positions is None:
         return 0
     return sum(1 for p in positions if p.magic in magics)
+
+
+def get_positions_by_magics(magics: set[int]) -> list[Any]:
+    """Posiciones abiertas (de cualquier símbolo) con alguno de esos magic."""
+    m = _require_mt5()
+    positions = m.positions_get()
+    if positions is None:
+        return []
+    return [p for p in positions if p.magic in magics]
+
+
+#: Divisas con noticias en el calendario económico.
+_NEWS_CURRENCIES = frozenset({"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "CNY"})
+
+
+def symbol_currencies(symbol: str) -> list[str]:
+    """
+    Divisas cuyas noticias afectan al símbolo: base y cotización según el bróker
+    (EURUSD -> EUR, USD; XAUUSD -> USD; US500 -> USD; GER40 -> EUR). Si el bróker no las
+    informa, se deducen de un nombre de 6 letras.
+    """
+    m = _require_mt5()
+    info = m.symbol_info(symbol)
+    found: list[str] = []
+    for attr in ("currency_base", "currency_profit", "currency_margin"):
+        cur = str(getattr(info, attr, "") or "").upper() if info is not None else ""
+        if cur in _NEWS_CURRENCIES and cur not in found:
+            found.append(cur)
+    if not found:
+        letters = re.sub(r"[^A-Z]", "", symbol.upper())
+        for cur in (letters[:3], letters[3:6]):
+            if cur in _NEWS_CURRENCIES and cur not in found:
+                found.append(cur)
+    return found
+
+
+def returns_correlation(symbol_a: str, symbol_b: str, timeframe: str = "H1",
+                        bars: int = 500, min_common: int = 100) -> float | None:
+    """
+    Correlación (Pearson) de los rendimientos logarítmicos de dos símbolos en las
+    últimas ``bars`` velas, alineadas por hora. None si no hay datos suficientes.
+    """
+    if symbol_a == symbol_b:
+        return 1.0
+    a = get_rates(symbol_a, timeframe, bars)
+    b = get_rates(symbol_b, timeframe, bars)
+    if a.empty or b.empty:
+        return None
+    merged = pd.merge(a[["time", "close"]], b[["time", "close"]], on="time", suffixes=("_a", "_b"))
+    if len(merged) < min_common + 1:
+        return None
+    ra = np.log(merged["close_a"].astype(float)).diff().dropna()
+    rb = np.log(merged["close_b"].astype(float)).diff().dropna()
+    if ra.std() == 0 or rb.std() == 0:
+        return None
+    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def get_positions(symbol: str, magic: int) -> list[Any]:

@@ -182,6 +182,26 @@ BASIC_GROUPS: list[tuple[str, list[Field]]] = [
         Field("telegram_chat_id", "Telegram: chat id", "str", "Opcional. Su id de chat (p. ej. con @userinfobot)"),
         Field("terminal_path", "Ruta terminal64.exe", "str", "Opcional, si hay varias instalaciones de MT5"),
     ]),
+    ("Noticias y correlación", [
+        Field("news_filter", "Pausa por noticias económicas", "bool",
+              "No abre operaciones cerca de noticias de las divisas del símbolo (EURUSD: EUR y USD; "
+              "US500 y oro: USD). Calendario de Forex Factory, descargado por internet"),
+        Field("news_impact", "Noticias que cuentan", "choice",
+              "alto: solo alto impacto (empleo, IPC, bancos centrales…). medio: también impacto medio",
+              ("alto", "medio")),
+        Field("news_minutes_before", "Minutos antes", "int", "Sin abrir operaciones desde N minutos antes"),
+        Field("news_minutes_after", "Minutos después", "int", "…hasta N minutos después de la noticia"),
+        Field("news_close_positions", "Cerrar posiciones antes de la noticia", "bool",
+              "Cierra las posiciones del bot al entrar en la ventana previa a la noticia"),
+        Field("correlation_filter", "Control de correlación", "bool",
+              "No abre si ya hay posiciones de los bots en símbolos muy correlacionados en la misma "
+              "dirección (p. ej. comprar EURUSD y GBPUSD, o US500 y US30)"),
+        Field("correlation_threshold", "Correlación desde", "float",
+              "|correlación| de los rendimientos H1 (últimas 500 velas) a partir de la cual dos símbolos "
+              "se consideran ligados. 0.8 = muy parecidos"),
+        Field("max_correlated_positions", "Máx. posiciones correlacionadas", "int",
+              "Posiciones a la vez dentro de un grupo correlacionado en la misma dirección. 1 = solo una"),
+    ]),
 ]
 ADVANCED_GROUPS: list[tuple[str, list[Field]]] = [
     ("Evolución", [
@@ -231,6 +251,9 @@ ADVANCED_GROUPS: list[tuple[str, list[Field]]] = [
         Field("health_check_hours", "Revisar parámetros cada (h)", "int",
               "Comprueba los parámetros con las velas nuevas (operaciones simuladas). Si su PF cae bajo "
               "'Pausar si PF real <', re-evoluciona sin esperar. 0 = nunca"),
+        Field("news_refresh_hours", "Descargar calendario cada (h)", "int",
+              "El calendario se comparte entre todos los bots (una descarga para todos)"),
+        Field("news_url", "URL del calendario", "str", "JSON semanal con el formato de Forex Factory"),
         Field("reuse_evolution", "Reutilizar parámetros al reiniciar", "bool",
               "Al iniciar, usa los parámetros aceptados recientes (misma configuración) en vez de buscar "
               "de nuevo: arranque inmediato y sin 'repetir hasta que salga'"),
@@ -486,6 +509,17 @@ class Card(tk.Frame):
             lbl.configure(text=text, fg=col)
 
 
+#: Números negativos dentro de un texto del log (no fechas como 2026-11-26 ni el "límite -3%").
+NEG_NUMBER_RE = re.compile(r"(?<![\w.:/-])(?<!límite )-\d[\d,]*(?:\.\d+)?%?")
+
+
+def sign_color(value: float | None, neutral: str = C_TEXT) -> str:
+    """Rojo si es negativo, verde si es positivo, ``neutral`` si es cero o desconocido."""
+    if value is None:
+        return neutral
+    return C_RED if value < 0 else (C_GREEN if value > 0 else neutral)
+
+
 def make_tree(master: tk.Widget, columns: list[tuple[str, str, int, str]], height: int = 8) -> ttk.Treeview:
     """Crea un Treeview con scroll. columns = [(id, título, ancho, alineación)]."""
     frame = ttk.Frame(master)
@@ -585,13 +619,18 @@ class EquityChart(tk.Canvas):
 
         for v in (lo, (lo + hi) / 2, hi):
             self.create_line(pad_l, y(v), w - pad_r, y(v), fill="#eef1f5")
-            self.create_text(pad_l - 6, y(v), text=f"{v:+.0f}", anchor="e", fill=C_MUTED, font=F_SMALL)
+            self.create_text(pad_l - 6, y(v), text=f"{v:+.0f}", anchor="e",
+                             fill=C_RED if v < 0 else C_MUTED, font=F_SMALL)
         self.create_line(pad_l, y(0), w - pad_r, y(0), fill="#b8c1cc", dash=(3, 3))
         pts = [(pad_l + i * sx, y(v)) for i, v in enumerate(vals)]
         color = C_GREEN if vals[-1] >= 0 else C_RED
-        self.create_line(*[c for p in pts for c in p], fill=color, width=2, smooth=False)
-        for px, py in pts[1:]:
-            self.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline=color)
+        # Cada tramo en rojo si termina por debajo de cero (acumulado negativo) y en verde si no.
+        for (x0, y0), (x1, y1), v in zip(pts[:-1], pts[1:], vals[1:]):
+            seg = C_RED if v < 0 else C_GREEN
+            self.create_line(x0, y0, x1, y1, fill=seg, width=2)
+        for (px, py), v in zip(pts[1:], vals[1:]):
+            dot = C_RED if v < 0 else C_GREEN
+            self.create_oval(px - 2, py - 2, px + 2, py + 2, fill=dot, outline=dot)
         self.create_text(w - pad_r, pad_t, text=f"Acumulado {vals[-1]:+.2f}", anchor="ne",
                          fill=color, font=F_BOLD)
         if self.labels:
@@ -1241,6 +1280,8 @@ class ControlCenter(tk.Tk):
                            ("accepted", "#69f0ae")):
             self.log_text.tag_configure(tag, foreground=color)
         self.log_text.tag_configure("order", font=(F_MONO[0], F_MONO[1], "bold"))
+        self.log_text.tag_configure("loss", foreground="#ff6b6b", font=(F_MONO[0], F_MONO[1], "bold"))
+        self.log_text.tag_configure("neg", foreground="#ff6b6b")  # configurado el último: tiene prioridad
 
         evo_tab = ttk.Frame(sub, padding=4)
         sub.add(evo_tab, text="Evolución")
@@ -1499,9 +1540,11 @@ class ControlCenter(tk.Tk):
         basic.pack(fill="x")
         for i in range(3):
             basic.columnconfigure(i, weight=1, uniform="cfg")
-        for col, (name, fields) in enumerate(BASIC_GROUPS):
+        for idx, (name, fields) in enumerate(BASIC_GROUPS):
+            row, col = divmod(idx, 3)
             box = ttk.LabelFrame(basic, text=f" {name} ", padding=(10, 6))
-            box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 10, 0))
+            box.grid(row=row, column=col, sticky="nsew", padx=(0 if col == 0 else 10, 0),
+                     pady=(0 if row == 0 else 10, 0))
             box.columnconfigure(1, weight=1)
             for r, fld in enumerate(fields):
                 self._build_field(box, r, fld, float_vcmd, int_vcmd)
@@ -1648,6 +1691,8 @@ class ControlCenter(tk.Tk):
                       "Simulación" if cfg.get("simulation", True) else "REAL", label, pos_txt,
                       fmt(pnl, "{:+.2f}") if positions else "—", val)
             tag = {C_GREEN: "ok", C_RED: "bad", C_ORANGE: "warn", C_BLUE: "info"}.get(color, "idle")
+            if positions and pnl < 0:
+                tag = "bad"  # resultado abierto negativo: fila en rojo
             if tree.exists(name):
                 tree.item(name, values=values, tags=(tag,))
             else:
@@ -1770,10 +1815,11 @@ class ControlCenter(tk.Tk):
         else:
             self.d_situation.configure(text="Detenido. Pulse 'Iniciar' para arrancarlo.")
         positions = (st.get("positions") or []) if live else []
+        open_profit = sum((p.get("profit") or 0) for p in positions)
         self.d_position.configure(text=("Posición: " + " | ".join(
             f"{p['side']} {fmt(p.get('volume'), '{:g}')} @ {fmt_price(p.get('price_open'))} · SL "
             f"{fmt_price(p.get('sl'))} · TP {fmt_price(p.get('tp'))} · {fmt(p.get('profit'), '{:+.2f}')}"
-            for p in positions)) if positions else "")
+            for p in positions)) if positions else "", fg=sign_color(open_profit, C_BLUE))
         bar = (st.get("last_bar") or {}) if live else {}
         if bar:
             sig = {1: "COMPRA", -1: "VENTA"}.get(bar.get("signal"), "ninguna")
@@ -1799,6 +1845,19 @@ class ControlCenter(tk.Tk):
         if health:
             lines.append(f"Con las velas nuevas (desde {str(health.get('since', ''))[:16]}): PF "
                          f"{fmt(health.get('pf'))} en {health.get('trades', 0)} operaciones simuladas")
+        news = (st.get("news") or {}) if live else {}
+        if news:
+            ev_n = news.get("event") or {}
+            curs = ", ".join(news.get("currencies") or [])
+            if ev_n:
+                when = str(ev_n.get("time", "")).replace("T", " ")
+                txt = (f"{when} {ev_n.get('currency')} {ev_n.get('title')} ({ev_n.get('impact')})")
+                lines.append(("PAUSA POR NOTICIA: " if ev_n.get("blocking") else f"Próxima noticia ({curs}): ")
+                             + txt)
+            elif news.get("error"):
+                lines.append(f"Noticias ({curs}): {news['error']} - no se bloquea nada")
+            else:
+                lines.append(f"Noticias ({curs}): ninguna relevante esta semana")
         if live and st.get("next_evolution"):
             lines.append("Próxima búsqueda de parámetros: " + str(st["next_evolution"]).replace("T", " "))
         stats = (st.get("signal_stats") or {}) if live else {}
@@ -1839,6 +1898,8 @@ class ControlCenter(tk.Tk):
                 tag = ()
                 if key == "profit_factor" and oos_m.get(key) is not None:
                     tag = ("ok",) if oos_m[key] >= 1 else ("bad",)
+                if key == "net_profit" and any((m.get(key) or 0) < 0 for m in (is_m, oos_m)):
+                    tag = ("bad",)
                 self.metrics_tree.insert("", "end", tags=tag, values=(title, fmt(is_m.get(key), spec),
                                                                       fmt(oos_m.get(key), spec)))
             stab = evo.get("stability") or {}
@@ -1899,7 +1960,9 @@ class ControlCenter(tk.Tk):
                               f"{scope} · límite −{fmt(st.get('max_daily_loss_percent'), '{:g}')}%",
                               ("DETENIDO por pérdida diaria", C_RED) if halted else
                               (f"cerrado {fmt(bots.get('realized'), '{:+.2f}')} · abierto "
-                               f"{fmt(bots.get('floating'), '{:+.2f}')}" if bots else ""))
+                               f"{fmt(bots.get('floating'), '{:+.2f}')}",
+                               sign_color((bots.get("realized") or 0) + (bots.get("floating") or 0), C_MUTED))
+                              if bots else "")
         else:
             self.card_day.set("—", C_MUTED, f"límite −{g.get('max_daily_loss_percent')}% "
                                             f"({g.get('daily_loss_scope')})")
@@ -2152,7 +2215,7 @@ class ControlCenter(tk.Tk):
                 txt = f"resultado {result:+.2f}" if result is not None else "cerrada"
                 note(f"Operación de PRUEBA #{ticket} cerrada: {txt}")
                 Toast(self, "Operación de prueba cerrada", f"{cfg['symbol']} #{ticket}: {txt}",
-                      C_GREEN if (result or 0) >= 0 else C_ORANGE, 12)
+                      C_GREEN if (result or 0) >= 0 else C_RED, 12)
             else:
                 note(f"Operación de PRUEBA #{ticket}: ya estaba cerrada (SL/TP o manual)")
 
@@ -2225,7 +2288,16 @@ class ControlCenter(tk.Tk):
         if clear:
             text.delete("1.0", "end")
         for line in lines:
-            text.insert("end", line + "\n", self._line_tag(line) or ())
+            base = self._line_tag(line)
+            if base == "order" and NEG_NUMBER_RE.search(line):
+                base = "loss"  # operación cerrada con pérdida: línea en rojo
+            tags: tuple[str, ...] = (base,) if base else ()
+            pos = 0
+            for match in NEG_NUMBER_RE.finditer(line):  # cada número negativo, en rojo
+                text.insert("end", line[pos:match.start()], tags)
+                text.insert("end", match.group(), tags + ("neg",))
+                pos = match.end()
+            text.insert("end", line[pos:] + "\n", tags)
         excess = int(text.index("end-1c").split(".")[0]) - MAX_LOG_LINES
         if excess > 0:
             text.delete("1.0", f"{excess + 1}.0")
@@ -2817,7 +2889,9 @@ class ControlCenter(tk.Tk):
             elif pf >= 1:
                 verdict, tag = "en línea o mejor de lo esperado", "ok"
             else:
-                verdict, tag = "en pérdidas", "warn"
+                verdict, tag = "en pérdidas", "bad"
+            if n and net < 0:
+                tag = "bad"  # resultado negativo: fila en rojo
             tree.insert("", "end", tags=(tag,), values=(
                 name, cfg["symbol"], n, fmt(win if n else None, "{:.0%}"),
                 "∞" if pf == float("inf") else fmt(pf if n else None), fmt(pf_val),
@@ -2825,7 +2899,8 @@ class ControlCenter(tk.Tk):
         n, win, pf, net, dd = stats(deals)
         pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
         self.stats_status.configure(text=f"Últimos {days} días: {n} operaciones · {win:.0%} acierto · "
-                                         f"PF {pf_txt} · resultado {net:+.2f} · drawdown {dd:.2f}")
+                                         f"PF {pf_txt} · resultado {net:+.2f} · drawdown {dd:.2f}",
+                                    foreground=sign_color(net if n else None, C_MUTED))
 
     # =================================================== configuración general
     def _load_global_form(self) -> None:
