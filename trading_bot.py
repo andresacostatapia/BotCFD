@@ -78,6 +78,27 @@ EVOLUTION_KEYS: tuple[str, ...] = (
 )
 
 
+def correlated_positions(symbol: str, magic: int, side: int, positions: list[Any],
+                         corr_fn: Any, threshold: float) -> list[str]:
+    """
+    Posiciones (de otros bots/perfiles) "ligadas" a abrir ``side`` (1 compra, -1 venta)
+    en ``symbol``: |correlación| >= ``threshold`` y misma dirección efectiva (misma
+    dirección con correlación positiva, o contraria con correlación negativa).
+    ``corr_fn(otro_símbolo)`` devuelve la correlación o None.
+    """
+    linked = []
+    for pos in positions:
+        if pos.symbol == symbol and int(pos.magic) == int(magic):
+            continue
+        corr = corr_fn(pos.symbol)
+        if corr is None or abs(corr) < threshold:
+            continue
+        pos_side = 1 if getattr(pos, "type", 0) == 0 else -1
+        if side * pos_side * (1 if corr > 0 else -1) > 0:
+            linked.append(f"{pos.symbol} {'BUY' if pos_side == 1 else 'SELL'} (corr {corr:+.2f})")
+    return linked
+
+
 def config_fingerprint(config: dict[str, Any]) -> str:
     """Huella corta de las claves de ``EVOLUTION_KEYS`` (para saber si se puede reutilizar)."""
     data = {k: config.get(k) for k in EVOLUTION_KEYS}
@@ -315,6 +336,7 @@ class TradingBot:
         self.last_evolution_iso: str = ""
         self.last_health_ts: float = time.time()
         self.health: dict[str, Any] | None = None
+        self.params_source = ""  # cómo se obtuvieron: búsqueda nueva / reutilizados / conservados
         self.halt_notified = False
         # Modo acciones: tipo de activo, sesión detectada y reglas efectivas
         self.asset_class = "otro"
@@ -461,6 +483,7 @@ class TradingBot:
                         "challenger": {"strategy": result.get("strategy"), "reason": result.get("reason"),
                                        "out_of_sample": result.get("out_of_sample")}}
                 self.evolution = kept
+                self.params_source = f"conservados ({reason}): la nueva búsqueda se descartó"
                 self._save_evolution(kept)
                 self.last_evolution_ts = time.time()
                 self.last_evolution_iso = now_iso()
@@ -484,6 +507,7 @@ class TradingBot:
             return False
 
         self.params = result["params"]
+        self.params_source = f"búsqueda nueva ({reason})"
         logger.info(
             "Parámetros ACEPTADOS (%s%s): %s | PF IS=%.3f | PF OOS=%.3f",
             result.get("backend"), f", estrategia {result['strategy']}" if result.get("auto") else "",
@@ -617,6 +641,7 @@ class TradingBot:
         self.params_since_ts = int(saved.get("params_since_ts") or 0)
         self.params_adopted_at = float(saved.get("adopted_at_epoch") or evolved_at)
         self.last_health_ts = 0.0  # revisar la salud en el primer ciclo
+        self.params_source = f"reutilizados (aceptados el {saved.get('timestamp', '?')})"
         logger.info("Se REUTILIZAN los parámetros aceptados el %s (hace %.1f h): %s. Próxima re-evolución "
                     "en %.0f h.", saved.get("timestamp", "?"), age_h, self.params, hours - age_h)
         return True
@@ -1074,16 +1099,8 @@ class TradingBot:
             positions = mt5c.get_positions_by_magics(self.portfolio_magics())
         except Exception:  # noqa: BLE001
             return None
-        linked = []
-        for pos in positions:
-            if pos.symbol == cfg["symbol"] and int(pos.magic) == int(cfg["magic"]):
-                continue
-            corr = self.correlation(pos.symbol)
-            if corr is None or abs(corr) < threshold:
-                continue
-            pos_side = 1 if getattr(pos, "type", 0) == 0 else -1
-            if side * pos_side * (1 if corr > 0 else -1) > 0:
-                linked.append(f"{pos.symbol} {'BUY' if pos_side == 1 else 'SELL'} (corr {corr:+.2f})")
+        linked = correlated_positions(cfg["symbol"], int(cfg["magic"]), side, positions,
+                                      self.correlation, threshold)
         if len(linked) >= limit:
             return ", ".join(linked)
         return None
@@ -1472,6 +1489,9 @@ class TradingBot:
                                 if (nxt := self.next_evolution_ts()) else None),
                 health=self.health,
                 news=self.news_info,
+                params_source=self.params_source,
+                filters={"news": bool(self.config.get("news_filter")),
+                         "correlation": bool(self.config.get("correlation_filter"))},
                 strategy=(self.evolution or {}).get("strategy") if self.params else None,
                 auto_strategy=self.config.get("strategy") == AUTO_STRATEGY,
                 dry_run=self.dry_run,

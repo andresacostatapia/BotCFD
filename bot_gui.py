@@ -786,6 +786,68 @@ class SymbolBrowser(tk.Toplevel):
         self.destroy()
 
 
+class DiagnosticsDialog(tk.Toplevel):
+    """Ventana con el informe de diagnóstico (coloreado) y botones para copiarlo o repetirlo."""
+
+    COLORS = {"ok": C_GREEN, "warn": C_ORANGE, "bad": C_RED, "info": C_TEXT}
+
+    def __init__(self, master: tk.Tk, rerun: Callable[[], None]) -> None:
+        super().__init__(master)
+        self.title("Diagnóstico de funciones")
+        self.configure(bg=C_BG)
+        self.geometry("980x640")
+        self.transient(master)
+        self._text_report = ""
+        top = ttk.Frame(self, padding=(12, 10, 12, 4))
+        top.pack(fill="x")
+        ttk.Label(top, text="Comprueba lo que no se ve en pantalla: noticias, correlación y el estado interno "
+                            "de los bots activos. Los bots deben estar en marcha para ver su parte.",
+                  style="Muted.TLabel", wraplength=940).pack(anchor="w")
+        body = ttk.Frame(self, padding=(12, 4))
+        body.pack(fill="both", expand=True)
+        self.text = tk.Text(body, wrap="word", font=F_MONO, bg=C_CARD, relief="flat", padx=10, pady=8)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        for level, color in self.COLORS.items():
+            self.text.tag_configure(level, foreground=color)
+        self.text.tag_configure("title", font=F_BOLD, spacing1=10, spacing3=4)
+        bottom = ttk.Frame(self, padding=(12, 6, 12, 12))
+        bottom.pack(fill="x")
+        ttk.Button(bottom, text="Copiar informe", style="Accent.TButton", command=self.copy).pack(side="left")
+        ttk.Button(bottom, text="Repetir", command=rerun).pack(side="left", padx=8)
+        ttk.Button(bottom, text="Cerrar", command=self.destroy).pack(side="right")
+        self.status = ttk.Label(bottom, text="", style="Muted.TLabel")
+        self.status.pack(side="left", padx=10)
+        self.show_message("Comprobando… (conecta con MT5, descarga el calendario y calcula correlaciones)")
+
+    def show_message(self, message: str, level: str = "info") -> None:
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", message + "\n", level)
+        self.text.configure(state="disabled")
+
+    def show_report(self, report: list[dict[str, Any]], text_report: str) -> None:
+        self._text_report = text_report
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        marks = {"ok": "OK  ", "warn": " !  ", "bad": " X  ", "info": "    "}
+        for sec in report:
+            self.text.insert("end", sec["title"] + "\n", "title")
+            for level, line in sec["lines"]:
+                self.text.insert("end", marks.get(level, "    ") + line + "\n", level)
+        self.text.configure(state="disabled")
+        self.status.configure(text=f"Actualizado {datetime.now():%H:%M:%S}")
+
+    def copy(self) -> None:
+        if not self._text_report:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self._text_report)
+        self.status.configure(text="Informe copiado: puede pegarlo en un mensaje")
+
+
 class TestTradeDialog(tk.Toplevel):
     """Opciones de la operación de prueba: lado, SL/TP en ATR y cierre automático."""
 
@@ -1212,6 +1274,10 @@ class ControlCenter(tk.Tk):
         ttk.Button(actions, text="Detener todos", command=self.stop_all).pack(side="left", padx=2)
         ttk.Button(actions, text="Cerrar posiciones de los bots…", style="Danger.TButton",
                    command=self.emergency_close).pack(side="right")
+        diag = ttk.Button(actions, text="Diagnóstico…", command=self.open_diagnostics)
+        diag.pack(side="right", padx=8)
+        Tooltip(diag, "Comprueba el calendario de noticias, la correlación entre sus símbolos y el estado "
+                      "interno de cada bot. Puede copiar el informe")
 
         paned = ttk.PanedWindow(tab, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -2164,6 +2230,43 @@ class ControlCenter(tk.Tk):
             if bp.running and not bp.stop_requested_at:
                 bp.request_stop()
                 self._append(bp, f"### {datetime.now():%H:%M:%S} Deteniendo…")
+
+    def open_diagnostics(self) -> None:
+        """Abre (o reutiliza) la ventana de diagnóstico y lanza la comprobación."""
+        dlg = getattr(self, "_diag", None)
+        if dlg is None or not dlg.winfo_exists():
+            dlg = DiagnosticsDialog(self, self.open_diagnostics)
+            self._diag = dlg
+        else:
+            dlg.lift()
+            dlg.show_message("Comprobando…")
+        g = self._gcfg()
+        profiles = []
+        for name in list_profiles():
+            cfg = profile_config(name)
+            if not cfg or not cfg.get("enabled", True):
+                continue
+            paths = profile_paths(config_path_for(name))
+            st = read_json(paths.status) or {}
+            _label, _color, live = self._state_of(name, st)
+            profiles.append({"name": name, "cfg": cfg, "status": st if live else {},
+                             "evolved": read_json(paths.evolved) or {}, "live": live})
+
+        def task(mt5c: Any) -> dict[str, Any]:
+            import diagnostics
+
+            report = diagnostics.build_report(mt5c, g, profiles, LOG_DIR / "news_calendar.json")
+            return {"report": report, "text": diagnostics.report_text(report)}
+
+        def done(res: dict[str, Any]) -> None:
+            if not dlg.winfo_exists():
+                return
+            if not res.get("ok"):
+                dlg.show_message(f"No se pudo hacer el diagnóstico: {res.get('error')}", "bad")
+                return
+            dlg.show_report(res["report"], res["text"])
+
+        self.run_mt5(bool(g.get("require_demo")), g.get("terminal_path") or None, task, done)
 
     def test_trade(self) -> None:
         """Abre una operación de PRUEBA (lote mínimo, solo DEMO) en el símbolo seleccionado."""

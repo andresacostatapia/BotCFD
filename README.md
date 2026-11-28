@@ -36,6 +36,7 @@ C:\MT5Bot\
 ├── strategy_evolver.py      # Estrategias, backtest, evolución genética y walk-forward (sin MT5)
 ├── risk_manager.py          # Pérdida diaria, spread y tamaño de lote (sin MT5, testeable)
 ├── news_filter.py           # Calendario económico (caché compartida) y ventanas de noticias (sin MT5)
+├── diagnostics.py           # Informe de diagnóstico (noticias, correlación, estado de los bots)
 ├── mt5_connector.py         # Conexión MT5, datos, órdenes, gestión de posiciones, historial
 ├── bot_common.py            # Configuración por capas, perfiles, rutas y logging
 ├── config_panel.py          # Panel simple (modo consola)
@@ -83,6 +84,13 @@ y cada perfil se queda solo con lo suyo. Antes se copia todo a
   los bots que lanzó.
 * **Iniciar con Windows** crea un acceso en la carpeta *Inicio* que abre el Centro
   de control y arranca los símbolos activos (MT5 también debe abrirse e iniciar sesión).
+* **Diagnóstico…** (pestaña Operación): comprueba lo que no se ve en pantalla y
+  muestra un informe coloreado que se puede **copiar**: conexión y tipo de cuenta;
+  **calendario de noticias** (si se descargó, próximas noticias de sus divisas y qué
+  símbolos están ahora en pausa); **correlación** entre sus símbolos activos (pares
+  ligados y qué compras/ventas bloquearía ahora con las posiciones abiertas); y el
+  **estado interno de cada bot en marcha** (origen de los parámetros, próxima
+  búsqueda, revisión con velas nuevas, noticias y señales bloqueadas con su motivo).
 * **Valores negativos en rojo:** resultado de hoy y de las posiciones, filas de la
   tabla y de *Estadísticas* con resultado negativo (las tablas colorean la fila
   entera), beneficio neto negativo en *Evolución*, tramos de la curva con acumulado
@@ -458,7 +466,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (198 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (201 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 
