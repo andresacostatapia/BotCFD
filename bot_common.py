@@ -40,6 +40,10 @@ LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 VALID_TIMEFRAMES: tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
 VALID_STRATEGIES: tuple[str, ...] = ("cruce_medias", "reversion_media", "ruptura", "retroceso", "compresion")
+#: Valor de ``strategy`` que hace que el bot pruebe todas y opere la mejor validada.
+AUTO_STRATEGY: str = "auto"
+#: Estrategias que admite un perfil (las concretas + automática).
+PROFILE_STRATEGIES: tuple[str, ...] = VALID_STRATEGIES + (AUTO_STRATEGY,)
 VALID_EXIT_MODES: tuple[str, ...] = ("ninguna", "breakeven", "trailing")
 VALID_ASSET_CLASSES: tuple[str, ...] = ("auto", "forex", "indice", "materia", "cripto", "accion", "otro")
 
@@ -198,7 +202,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 2.0,
     "evolve_sl_tp": True,             # evolucionar también los multiplicadores SL/TP
-    "strategy": "cruce_medias",       # cruce_medias | reversion_media | ruptura | retroceso | compresion
+    "strategy": "cruce_medias",       # cruce_medias | reversion_media | ruptura | retroceso | compresion | auto
     "loop_seconds": 60,
     "heartbeat_seconds": 60,          # mensaje "En espera" cada N segundos (0 = desactivado)
     "deviation": 20,                  # desviación máxima en puntos
@@ -210,6 +214,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_disable_min_trades": 10,    # operaciones reales mínimas para evaluar rendimiento
     "auto_disable_pf": 0.7,           # pausa el símbolo si su PF real < este valor (0 = nunca)
     "reevolve_hours": 168,            # re-evolucionar cada N horas sin posición abierta (0 = nunca)
+    "retry_evolve_hours": 6,          # si la validación descarta, reintentar cada N horas (0 = el bot se detiene)
+    "reuse_evolution": True,          # al arrancar, reutilizar parámetros aceptados recientes (misma configuración)
+    "health_check_hours": 24,         # revisar cada N horas los parámetros con las velas nuevas (0 = nunca)
     "telegram_token": "",             # opcional: avisos por Telegram
     "telegram_chat_id": "",
     "autostart_bots": False,          # el Centro de control inicia los perfiles activos al abrirse
@@ -403,8 +410,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if config.get("timeframe") not in VALID_TIMEFRAMES:
         errors.append(f"'timeframe' debe ser uno de {VALID_TIMEFRAMES}")
 
-    if config.get("strategy") not in VALID_STRATEGIES:
-        errors.append(f"'strategy' debe ser una de {VALID_STRATEGIES}")
+    if config.get("strategy") not in PROFILE_STRATEGIES:
+        errors.append(f"'strategy' debe ser una de {PROFILE_STRATEGIES}")
 
     if not isinstance(config.get("evolve_sl_tp"), bool):
         errors.append("'evolve_sl_tp' debe ser true/false")
@@ -433,7 +440,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if isinstance(mot, bool) or not isinstance(mot, int) or mot < 0:
         errors.append("'max_open_positions_total' debe ser un entero >= 0 (0 = sin límite)")
 
-    for key in ("enabled", "simulation", "regime_filter", "stability_check", "autostart_bots"):
+    for key in ("enabled", "simulation", "regime_filter", "stability_check", "autostart_bots",
+                "reuse_evolution"):
         if not isinstance(config.get(key), bool):
             errors.append(f"'{key}' debe ser true/false")
 
@@ -448,7 +456,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if not isinstance(hours, str) or (hours.strip() and parse_hours(hours) is None):
         errors.append("'trading_hours' debe estar vacío (24 h) o tener la forma 'HH-HH', p. ej. '10-19'")
 
-    for key in ("max_bars_in_trade", "auto_disable_min_trades", "reevolve_hours", "lab_workers"):
+    for key in ("max_bars_in_trade", "auto_disable_min_trades", "reevolve_hours", "lab_workers",
+                "retry_evolve_hours", "health_check_hours"):
         value = config.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             errors.append(f"'{key}' debe ser un entero >= 0")

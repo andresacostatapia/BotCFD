@@ -7,10 +7,12 @@ valida parámetros (walk-forward) -> bucle de trading con gestión de riesgo.
 Uso:
     python trading_bot.py              # opera (en DEMO, si require_demo=true)
     python trading_bot.py --dry-run    # calcula todo pero NO envía órdenes
+    python trading_bot.py --force-evolve  # no reutiliza los parámetros guardados
 
 Códigos de salida:
     0 = parada limpia (Ctrl+C)   1 = error inesperado   2 = configuración
-    3 = conexión MT5             4 = validación de parámetros fallida
+    3 = conexión MT5             4 = validación fallida (solo con retry_evolve_hours = 0;
+                                     si no, el bot sigue en marcha y reintenta)
 
 AVISO: framework educativo. No garantiza rentabilidad. Pruebe siempre en DEMO.
 """
@@ -18,6 +20,7 @@ AVISO: framework educativo. No garantiza rentabilidad. Pruebe siempre en DEMO.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -32,17 +35,94 @@ from typing import Any
 
 import mt5_connector as mt5c
 from bot_common import (
-    CONFIG_PATH, PROFILE_KEYS, ProfilePaths, config_path_for, global_config_path, hour_allowed,
+    AUTO_STRATEGY, CONFIG_PATH, PROFILE_KEYS, VALID_STRATEGIES, ProfilePaths, config_path_for, global_config_path, hour_allowed,
     list_profiles, load_config, now_iso, profile_paths, read_json, save_profile, session_clock,
     setup_logging, write_json_atomic,
 )
 from risk_manager import RiskManager
-from strategy_evolver import asset_config, compute_signal, evolve_parameters, warmup_bars
+from strategy_evolver import (
+    IndicatorCache, asset_config, backtest, compute_signal, evolve_parameters, warmup_bars,
+)
 
 logger = logging.getLogger("trading_bot")
 
 EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_CONNECTION, EXIT_VALIDATION = 0, 1, 2, 3, 4
 DEALS_REFRESH_SECONDS = 300
+#: Una señal solo se opera si la vela en curso (la siguiente a la de la señal) lleva
+#: abierta como mucho esta fracción de su duración (mín. ``SIGNAL_MIN_AGE_SECONDS``).
+#: El backtest entra a la APERTURA de esa vela: entrar mucho más tarde (p. ej. al
+#: arrancar el bot a mitad de vela) ya no es la operación que se validó.
+SIGNAL_MAX_AGE_FRACTION = 0.5
+SIGNAL_MIN_AGE_SECONDS = 90
+#: Segundos tras el cierre de vela a los que se despierta el bucle (margen para MT5).
+BAR_CLOSE_MARGIN_SECONDS = 3
+#: Los parámetros actuales se conservan (si la nueva búsqueda falla) como mucho
+#: durante este múltiplo de ``reevolve_hours``.
+CHAMPION_MAX_AGE_FACTOR = 4
+#: Claves de configuración que influyen en la evolución: si cambia alguna, no se
+#: reutilizan los parámetros guardados al arrancar.
+EVOLUTION_KEYS: tuple[str, ...] = (
+    "symbol", "timeframe", "strategy", "history_bars", "population", "generations",
+    "commission_per_trade", "min_trades", "min_trades_oos", "fitness_folds", "train_ratio",
+    "oos_pf_ratio_min", "min_pf_in_sample", "pf_cap", "validation_windows", "min_pf_oos",
+    "regime_filter", "trading_hours", "exit_management", "be_atr_mult", "trail_atr_mult",
+    "max_bars_in_trade", "atr_period", "sl_atr_mult", "tp_atr_mult", "evolve_sl_tp",
+    "stability_check", "min_trades_per_week", "asset_class", "session_hours",
+    "avoid_open_minutes", "flat_before_close_minutes", "long_only", "commission_override",
+    "stock_commission_pct",
+)
+
+
+def config_fingerprint(config: dict[str, Any]) -> str:
+    """Huella corta de las claves de ``EVOLUTION_KEYS`` (para saber si se puede reutilizar)."""
+    data = {k: config.get(k) for k in EVOLUTION_KEYS}
+    return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def result_score(result: dict[str, Any]) -> float:
+    """Puntuación de una evolución: PF de validación (tope 5) x raíz de sus operaciones (tope 60)."""
+    oos = result.get("out_of_sample") or {}
+    return min(float(oos.get("profit_factor") or 0.0), 5.0) * min(int(oos.get("trades") or 0), 60) ** 0.5
+
+
+def evolve_auto(df: Any, pop: int, gens: int, config: dict[str, Any],
+                strategies: tuple[str, ...] = VALID_STRATEGIES) -> dict[str, Any]:
+    """
+    Estrategia automática: evoluciona y valida CADA estrategia y devuelve el resultado
+    de la mejor ACEPTADA (por ``result_score``). Si ninguna se acepta, devuelve la de
+    mejor puntuación marcada como descartada. Añade ``candidates`` con el resumen de todas.
+
+    Elegir la mejor de varias aumenta el riesgo de quedarse con una "afortunada"; por eso
+    solo compiten las que superan la validación completa (walk-forward y estabilidad).
+    """
+    results = []
+    for name in strategies:
+        res = evolve_parameters(df, pop=pop, gens=gens, config={**config, "strategy": name})
+        res["strategy"] = res.get("strategy") or name
+        results.append(res)
+    candidates = [{
+        "strategy": r["strategy"], "accepted": bool(r.get("accepted")),
+        "pf_oos": (r.get("out_of_sample") or {}).get("profit_factor"),
+        "trades_oos": (r.get("out_of_sample") or {}).get("trades"),
+        "trades_per_week": r.get("trades_per_week"), "score": round(result_score(r), 3),
+        "reason": r.get("reason", ""),
+    } for r in results]
+    accepted = [r for r in results if r.get("accepted")]
+    pool = accepted or results
+    best = dict(max(pool, key=result_score))
+    best["candidates"] = candidates
+    best["auto"] = True
+    if accepted:
+        best["reason"] = (f"estrategia automática: elegida {best['strategy']} entre "
+                          f"{len(accepted)} aceptada(s) de {len(results)}")
+    else:
+        best["accepted"] = False
+        best["reason"] = "estrategia automática: ninguna superó la validación (" + "; ".join(
+            f"{c['strategy']}: {c['reason']}" for c in candidates) + ")"
+    logger.info("Estrategia automática: %s", " | ".join(
+        f"{c['strategy']} {'OK' if c['accepted'] else 'no'} PF {float(c['pf_oos'] or 0):.2f}/"
+        f"{c['trades_oos'] or 0} op" for c in candidates))
+    return best
 
 
 class StatusFile:
@@ -224,8 +304,12 @@ class TradingBot:
         self.known_tickets: set[int] | None = None
         self.paused_reason = ""
         self.params_since_ts: int = 0          # hora servidor desde la que rigen los parámetros
-        self.last_evolution_mono: float = time.monotonic()
+        self.params_adopted_at: float = time.time()  # reloj del PC al adoptar los parámetros
+        self.last_evolution_ts: float = time.time()  # última evolución (o conservación) válida
+        self.last_attempt_ts: float = time.time()    # último intento de evolución (aceptado o no)
         self.last_evolution_iso: str = ""
+        self.last_health_ts: float = time.time()
+        self.health: dict[str, Any] | None = None
         self.halt_notified = False
         # Modo acciones: tipo de activo, sesión detectada y reglas efectivas
         self.asset_class = "otro"
@@ -297,16 +381,12 @@ class TradingBot:
                            "casi nunca abrirá operaciones. Súbalo a ~%.6g en Editar….",
                            current, self.config["symbol"], typical, suggested)
 
-    def evolve(self) -> bool:
-        """Descarga histórico, evoluciona parámetros y valida walk-forward."""
-        df = mt5c.get_rates(self.config["symbol"], self.config["timeframe"], int(self.config["history_bars"]) + 1)
-        if df.empty:
-            logger.error("Sin datos históricos para %s %s.", self.config["symbol"], self.config["timeframe"])
-            self.params = None
-            return False
-        df = df.iloc[:-1]  # descartar la vela en formación
-        self.resolve_asset()
-        self.update_rules(df)
+    def _history(self, bars: int) -> Any:
+        """Velas CERRADAS del símbolo (DataFrame vacío si no hay datos)."""
+        df = mt5c.get_rates(self.config["symbol"], self.config["timeframe"], int(bars) + 1)
+        return df if df.empty else df.iloc[:-1]  # descartar la vela en formación
+
+    def _log_asset_rules(self) -> None:
         cfg = self.rules
         if self.asset_class == "accion":
             logger.info(
@@ -319,17 +399,70 @@ class TradingBot:
         elif cfg.get("long_only"):
             logger.info("Este símbolo solo admite compras: se ignorarán las señales de venta.")
 
-        logger.info("Datos para evolución: %s %s | %d velas cerradas desde %s hasta %s (hora servidor)",
-                    cfg["symbol"], cfg["timeframe"], len(df), df["time"].iloc[0], df["time"].iloc[-1])
-        result = evolve_parameters(
-            df, pop=int(cfg["population"]), gens=int(cfg["generations"]), config=cfg
-        )
+    def _run_evolution(self, df: Any) -> dict[str, Any]:
+        """Evoluciona con la estrategia del perfil, o con todas si es ``auto``."""
+        cfg = self.rules
+        pop, gens = int(cfg["population"]), int(cfg["generations"])
+        if self.config.get("strategy") == AUTO_STRATEGY:
+            return evolve_auto(df, pop, gens, cfg)
+        return evolve_parameters(df, pop=pop, gens=gens, config=cfg)
+
+    def evolve(self, reason: str = "inicio") -> bool:
+        """
+        Descarga histórico, evoluciona parámetros y valida walk-forward.
+
+        Campeón / retador: si ya hay parámetros en uso y la nueva búsqueda NO supera la
+        validación, se conservan los actuales mientras sigan sanos con las velas
+        posteriores a su adopción (ver ``champion_status``). Devuelve True si el bot
+        queda con parámetros válidos.
+        """
+        self.last_attempt_ts = time.time()
+        try:
+            self.status.write("evolucionando", f"buscando y validando parámetros ({reason})",
+                              symbol=self.config["symbol"], timeframe=self.config["timeframe"])
+        except Exception:  # noqa: BLE001 - el estado es informativo
+            logger.debug("No se pudo escribir el estado", exc_info=True)
+        df = self._history(int(self.config["history_bars"]))
+        if df.empty:
+            logger.error("Sin datos históricos para %s %s.", self.config["symbol"], self.config["timeframe"])
+            if self.params is not None:
+                self.last_evolution_ts += 3600  # se conservan los actuales; nuevo intento en 1 h
+            return self.params is not None and not self.paused_reason
+        self.resolve_asset()
+        self.update_rules(df)
+        self._log_asset_rules()
+        cfg = self.rules
+        logger.info("Datos para evolución (%s): %s %s | %d velas cerradas desde %s hasta %s (hora servidor)",
+                    reason, cfg["symbol"], cfg["timeframe"], len(df), df["time"].iloc[0], df["time"].iloc[-1])
+        result = self._run_evolution(df)
+
+        if not result["accepted"] and self.params is not None:
+            keep, why = self.champion_status(df)
+            if keep:
+                previous = dict(self.evolution or {})
+                kept = {**previous, "accepted": True, "kept_previous": True,
+                        "reason": f"se mantienen los parámetros actuales ({why}); la nueva búsqueda "
+                                  f"se descartó: {result['reason']}",
+                        "challenger": {"strategy": result.get("strategy"), "reason": result.get("reason"),
+                                       "out_of_sample": result.get("out_of_sample")}}
+                self.evolution = kept
+                self._save_evolution(kept)
+                self.last_evolution_ts = time.time()
+                self.last_evolution_iso = now_iso()
+                logger.warning("Nueva búsqueda DESCARTADA (%s); se MANTIENEN los parámetros actuales: %s",
+                               result["reason"], why)
+                return True
+            logger.warning("Los parámetros actuales ya no se conservan: %s", why)
+
         self.evolution = result
-        self._save_evolution(result)
-        self.last_evolution_mono = time.monotonic()
+        self.last_evolution_ts = time.time()
         self.last_evolution_iso = now_iso()
         self.params_since_ts = mt5c.get_server_time(cfg["symbol"]) or int(time.time())
+        self.params_adopted_at = time.time()
         self.paused_reason = ""  # parámetros nuevos: se vuelve a evaluar el rendimiento desde cero
+        self.health = None
+        self.last_health_ts = time.time()
+        self._save_evolution(result)
         if not result["accepted"]:
             logger.error("Parámetros DESCARTADOS por la validación: %s", result["reason"])
             self.params = None
@@ -337,11 +470,150 @@ class TradingBot:
 
         self.params = result["params"]
         logger.info(
-            "Parámetros ACEPTADOS (%s): %s | PF IS=%.3f | PF OOS=%.3f",
-            result["backend"], self.params,
-            result["in_sample"]["profit_factor"], result["out_of_sample"]["profit_factor"],
+            "Parámetros ACEPTADOS (%s%s): %s | PF IS=%.3f | PF OOS=%.3f",
+            result.get("backend"), f", estrategia {result['strategy']}" if result.get("auto") else "",
+            self.params, result["in_sample"]["profit_factor"], result["out_of_sample"]["profit_factor"],
         )
         return True
+
+    def champion_status(self, df: Any = None) -> tuple[bool, str]:
+        """
+        ¿Se pueden conservar los parámetros actuales? No si el símbolo está pausado por
+        rendimiento, si son demasiado antiguos (``CHAMPION_MAX_AGE_FACTOR`` x
+        ``reevolve_hours``) o si con las velas posteriores a su adopción ya tienen
+        suficientes operaciones simuladas y pierden (PF < 1).
+        """
+        if self.params is None:
+            return False, "no hay parámetros"
+        if self.paused_reason:
+            return False, f"pausado ({self.paused_reason})"
+        hours = int(self.config.get("reevolve_hours", 0) or 0)
+        age_h = (time.time() - self.params_adopted_at) / 3600
+        if hours > 0 and age_h > CHAMPION_MAX_AGE_FACTOR * hours:
+            return False, f"tienen {age_h:.0f} h (máximo {CHAMPION_MAX_AGE_FACTOR * hours} h)"
+        health = self.compute_health(df)
+        if health is None:
+            return True, f"adoptados hace {age_h:.0f} h, sin velas nuevas suficientes para evaluarlos"
+        needed = max(5, int(self.config.get("min_trades_oos", 5)))
+        if health["trades"] >= needed and health["pf"] < 1.0:
+            return False, (f"desde su adopción pierden: PF {health['pf']:.2f} en {health['trades']} "
+                           f"operaciones simuladas")
+        return True, (f"desde su adopción: PF {health['pf']:.2f} en {health['trades']} operaciones "
+                      f"simuladas")
+
+    def compute_health(self, df: Any = None) -> dict[str, Any] | None:
+        """
+        Backtest de los parámetros ACTUALES solo con las velas posteriores a su adopción
+        (datos que la evolución no vio): es la mejor medida de si siguen funcionando,
+        con más operaciones que las reales (cuenta también las señales bloqueadas).
+        """
+        if self.params is None or not self.params_since_ts:
+            return None
+        try:
+            import pandas as pd
+
+            tf_sec = mt5c.timeframe_seconds(self.config["timeframe"])
+            warm = warmup_bars(self.params) + int(self.config["atr_period"]) + 60
+            if df is None:
+                server_now = mt5c.get_server_time(self.config["symbol"]) or int(time.time())
+                new_bars = max(0, int((server_now - self.params_since_ts) // tf_sec)) + 1
+                df = self._history(min(int(self.config["history_bars"]), new_bars + warm))
+            if df is None or df.empty:
+                return None
+            since = pd.Timestamp(int(self.params_since_ts), unit="s")
+            times = pd.to_datetime(df["time"])
+            if getattr(times.dt, "tz", None) is not None:
+                times = times.dt.tz_localize(None)
+            start = int((times < since).sum())
+            if start >= len(df) - 1:
+                return None  # aún no hay velas cerradas posteriores a la adopción
+            return self._health_from(df, start)
+        except Exception:  # noqa: BLE001 - diagnóstico: nunca debe tumbar el bot
+            logger.debug("No se pudo calcular la salud de los parámetros", exc_info=True)
+            return None
+
+    def _health_from(self, df: Any, start: int) -> dict[str, Any]:
+        cache = IndicatorCache(df, int(self.config["atr_period"]))
+        m = backtest(cache, self.params or {}, start, len(cache), self.rules)
+        return {"since": str(df["time"].iloc[start]), "bars": len(cache) - start, "trades": m.trades,
+                "pf": round(float(m.profit_factor), 3), "win_rate": round(float(m.win_rate), 3),
+                "checked": now_iso()}
+
+    def maybe_check_health(self, positions: list[Any]) -> None:
+        """
+        Vigilancia periódica (``health_check_hours``): si con las velas nuevas los
+        parámetros actuales tienen ``auto_disable_min_trades`` operaciones simuladas o
+        más y su PF cae por debajo de ``auto_disable_pf``, re-evoluciona YA en vez de
+        esperar a la re-evolución periódica.
+        """
+        hours = int(self.config.get("health_check_hours", 0) or 0)
+        if hours <= 0 or self.params is None or positions:
+            return
+        if time.time() - self.last_health_ts < hours * 3600:
+            return
+        self.last_health_ts = time.time()
+        health = self.compute_health()
+        if health is None:
+            return
+        self.health = health
+        logger.info("Revisión de los parámetros con las velas nuevas (desde %s): PF %.2f en %d operaciones "
+                    "simuladas, %.0f%% de acierto", health["since"], health["pf"], health["trades"],
+                    100 * health["win_rate"])
+        threshold = float(self.config.get("auto_disable_pf", 0) or 0)
+        needed = int(self.config.get("auto_disable_min_trades", 0) or 0)
+        if threshold > 0 and needed > 0 and health["trades"] >= needed and health["pf"] < threshold:
+            logger.warning("Los parámetros se han degradado (PF %.2f < %g con %d operaciones): "
+                           "re-evolución anticipada.", health["pf"], threshold, health["trades"])
+            ok = self.evolve("degradación")
+            self.notifier.send(f"Parámetros degradados (PF {health['pf']:.2f}); re-evolución: "
+                               + ("ACEPTADOS" if ok else "sin parámetros válidos"))
+
+    def try_reuse_evolution(self) -> bool:
+        """
+        Al arrancar, reutiliza los parámetros ACEPTADOS guardados si son de la misma
+        configuración (``config_fingerprint``) y más recientes que ``reevolve_hours``.
+        Evita repetir la búsqueda en cada reinicio (repetirla hasta que "salga" aceptada
+        sería otra forma de sobreajuste) y arranca al instante.
+        """
+        if not self.config.get("reuse_evolution", True):
+            return False
+        saved = read_json(self.paths.evolved) or {}
+        if not saved.get("accepted") or not saved.get("params"):
+            return False
+        if saved.get("fingerprint") != config_fingerprint(self.config):
+            logger.info("La configuración cambió desde la última evolución: se busca de nuevo.")
+            return False
+        evolved_at = float(saved.get("evolved_at_epoch") or 0.0)
+        hours = int(self.config.get("reevolve_hours", 0) or 0) or 168
+        age_h = (time.time() - evolved_at) / 3600
+        if evolved_at <= 0 or age_h < 0 or age_h >= hours:
+            return False
+        df = self._history(min(int(self.config["history_bars"]), 2000))
+        if df.empty:
+            return False
+        self.resolve_asset()
+        self.update_rules(df)
+        self._log_asset_rules()
+        self.evolution = saved
+        self.params = saved["params"]
+        self.last_evolution_ts = evolved_at
+        self.last_attempt_ts = evolved_at
+        self.last_evolution_iso = str(saved.get("timestamp", ""))
+        self.params_since_ts = int(saved.get("params_since_ts") or 0)
+        self.params_adopted_at = float(saved.get("adopted_at_epoch") or evolved_at)
+        self.last_health_ts = 0.0  # revisar la salud en el primer ciclo
+        logger.info("Se REUTILIZAN los parámetros aceptados el %s (hace %.1f h): %s. Próxima re-evolución "
+                    "en %.0f h.", saved.get("timestamp", "?"), age_h, self.params, hours - age_h)
+        return True
+
+    def next_evolution_ts(self) -> float | None:
+        """Hora (reloj del PC) de la próxima evolución prevista, o None si no hay."""
+        if self.params is None or self.paused_reason:
+            retry = int(self.config.get("retry_evolve_hours", 0) or 0) \
+                or int(self.config.get("reevolve_hours", 0) or 0)
+            return self.last_attempt_ts + retry * 3600 if retry else None
+        hours = int(self.config.get("reevolve_hours", 0) or 0)
+        return self.last_evolution_ts + hours * 3600 if hours else None
 
     def _save_evolution(self, result: dict[str, Any]) -> None:
         """Guarda la evolución en evolved_params*.json y la añade al historial del perfil."""
@@ -352,6 +624,11 @@ class TradingBot:
             "timeframe": self.config["timeframe"],
             "history_bars": self.config["history_bars"],
             **result,
+            "configured_strategy": self.config.get("strategy"),
+            "fingerprint": config_fingerprint(self.config),
+            "evolved_at_epoch": time.time(),
+            "params_since_ts": self.params_since_ts,
+            "adopted_at_epoch": self.params_adopted_at,
         }
         if not write_json_atomic(self.paths.evolved, payload):
             logger.error("No se pudo guardar %s", self.paths.evolved)
@@ -429,7 +706,8 @@ class TradingBot:
             self.risk.symbol = new_cfg["symbol"]
             self.risk.magic = int(new_cfg["magic"])
             self.last_bar_time = None
-            if not self.evolve():
+            self.params = None  # otra estrategia/símbolo: los parámetros actuales no sirven
+            if not self.evolve("cambio de configuración"):
                 logger.error("La nueva configuración no superó la validación: trading en pausa.")
 
     # ------------------------------------------------------------------- bucle
@@ -594,9 +872,11 @@ class TradingBot:
             self.notifier.send(f"TRADING DETENIDO por pérdida diaria: {self.risk.halt_reason}")
 
         self.maybe_reevolve(positions)
+        self.maybe_check_health(positions)
         if self.params is None:
-            hours = int(cfg.get("reevolve_hours", 0) or 0)
-            retry = f"; se reintentará en la re-evolución periódica ({hours} h)" if hours else ""
+            due = self.next_evolution_ts()
+            retry = (f"; nueva búsqueda a las {datetime.fromtimestamp(due):%H:%M} del "
+                     f"{datetime.fromtimestamp(due):%d/%m}" if due else "")
             self.heartbeat(f"sin parámetros válidos: el bot no abre operaciones{retry}")
             return
 
@@ -607,6 +887,7 @@ class TradingBot:
         if df.empty or len(df) < bars_needed:
             logger.warning("Velas insuficientes para calcular señal (%d).", len(df))
             return
+        forming_open = df["time"].iloc[-1]  # apertura de la vela en curso
         df = df.iloc[:-1]  # sólo velas cerradas
 
         sig = compute_signal(df, self.params, int(cfg["atr_period"]))
@@ -648,6 +929,11 @@ class TradingBot:
                 self._count_signal(sig, "ya había una posición abierta")
                 logger.info("Señal de %s ignorada: ya hay %d posición(es) con magic %d.",
                             signal_txt, len(positions), magic)
+            elif self.signal_is_stale(forming_open, tick):
+                self.last_bar_time = bar_time
+                self._count_signal(sig, "señal tardía (vela ya avanzada)")
+                logger.info("Señal de %s ignorada: llegó con la vela siguiente ya avanzada (p. ej. al "
+                            "arrancar el bot); el backtest habría entrado en su apertura.", signal_txt)
             elif not session_open:
                 self.last_bar_time = bar_time
                 self._count_signal(sig, "fuera de horario / sesión")
@@ -683,6 +969,33 @@ class TradingBot:
             state = self._waiting_text(sig)
         self.heartbeat(f"{price_txt} | {self._next_bar_text(bar_time, tick)} | {state} | "
                        f"{self._day_text()}")
+
+    def signal_is_stale(self, forming_open: Any, tick: Any) -> bool:
+        """
+        True si la vela en curso (la siguiente a la de la señal) lleva abierta más de
+        ``SIGNAL_MAX_AGE_FRACTION`` de su duración: ya no es la entrada que se validó.
+        """
+        if tick is None or not getattr(tick, "time", 0) or not hasattr(forming_open, "to_pydatetime"):
+            return False
+        tf_sec = mt5c.timeframe_seconds(self.config["timeframe"])
+        server_now = datetime.fromtimestamp(int(tick.time), tz=timezone.utc).replace(tzinfo=None)
+        opened = forming_open.to_pydatetime()
+        if opened.tzinfo is not None:
+            opened = opened.replace(tzinfo=None)
+        elapsed = (server_now - opened).total_seconds()
+        return elapsed > max(SIGNAL_MIN_AGE_SECONDS, SIGNAL_MAX_AGE_FRACTION * tf_sec)
+
+    def seconds_to_bar_close(self) -> float | None:
+        """Segundos hasta el cierre de la vela en curso (hora del servidor), o None."""
+        sig, tick = self.last_sig or {}, self.last_tick
+        bar_time = sig.get("bar_time")
+        if tick is None or not getattr(tick, "time", 0) or not hasattr(bar_time, "to_pydatetime"):
+            return None
+        tf = mt5c.timeframe_seconds(self.config["timeframe"])
+        next_close = bar_time.to_pydatetime().replace(tzinfo=None) + timedelta(seconds=2 * tf)
+        server_now = datetime.fromtimestamp(int(tick.time), tz=timezone.utc).replace(tzinfo=None)
+        remaining = (next_close - server_now).total_seconds()
+        return remaining if 0 <= remaining <= 2 * tf else None
 
     def _count_signal(self, sig: dict[str, Any], outcome: str | None) -> None:
         """Registra una señal y su resultado (None = operación abierta / simulada)."""
@@ -912,15 +1225,26 @@ class TradingBot:
             self.notifier.send(f"PAUSADO por rendimiento: {self.paused_reason}")
 
     def maybe_reevolve(self, positions: list[Any]) -> None:
-        """Re-evolución periódica (cada ``reevolve_hours``) cuando no hay posición abierta."""
-        hours = int(self.config.get("reevolve_hours", 0) or 0)
-        if hours <= 0 or positions:
+        """
+        Re-evolución sin posición abierta: periódica cada ``reevolve_hours`` y, si no hay
+        parámetros válidos o el símbolo está pausado por rendimiento, reintento cada
+        ``retry_evolve_hours`` (o ``reevolve_hours`` si es 0).
+        """
+        if positions:
             return
-        if time.monotonic() - self.last_evolution_mono < hours * 3600:
+        due = self.next_evolution_ts()
+        if due is None or time.time() < due:
             return
-        logger.info("Re-evolución periódica (cada %d h)…", hours)
-        ok = self.evolve()
-        self.notifier.send("Re-evolución: parámetros " + ("ACEPTADOS" if ok else
+        if self.params is None or self.paused_reason:
+            reason = "reintento" if self.params is None else "pausado por rendimiento"
+            if self.paused_reason:
+                self.params = None  # el campeón pausado no se conserva
+            logger.info("Nueva búsqueda de parámetros (%s)…", reason)
+        else:
+            reason = "periódica"
+            logger.info("Re-evolución periódica (cada %s h)…", self.config.get("reevolve_hours"))
+        ok = self.evolve(reason)
+        self.notifier.send(f"Re-evolución ({reason}): parámetros " + ("ACEPTADOS" if ok else
                            f"DESCARTADOS ({(self.evolution or {}).get('reason', '')})"))
 
     def portfolio_magics(self) -> set[int]:
@@ -959,7 +1283,12 @@ class TradingBot:
             self.step()
             self.publish_status()
             # Espera en tramos de 1 s para reaccionar rápido a una parada solicitada.
-            deadline = started + max(1.0, float(self.config["loop_seconds"]))
+            # Si la vela cierra antes, se despierta justo después del cierre (menos retraso).
+            wait = max(1.0, float(self.config["loop_seconds"]))
+            to_close = self.seconds_to_bar_close()
+            if to_close is not None:
+                wait = max(1.0, min(wait, to_close + BAR_CLOSE_MARGIN_SECONDS))
+            deadline = started + wait
             while time.monotonic() < deadline:
                 if self.stop_requested():
                     logger.info("Parada solicitada desde el Centro de control.")
@@ -1016,6 +1345,11 @@ class TradingBot:
                 session_hours=self.rules.get("session_hours") or "",
                 long_only=bool(self.rules.get("long_only")),
                 last_evolution=self.last_evolution_iso,
+                next_evolution=(datetime.fromtimestamp(nxt).isoformat(timespec="minutes")
+                                if (nxt := self.next_evolution_ts()) else None),
+                health=self.health,
+                strategy=(self.evolution or {}).get("strategy") if self.params else None,
+                auto_strategy=self.config.get("strategy") == AUTO_STRATEGY,
                 dry_run=self.dry_run,
                 price={"bid": tick.bid, "ask": tick.ask} if tick is not None else None,
                 spread=st["last_spread"],
@@ -1045,6 +1379,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bot de trading CFD para MT5 (educativo)")
     parser.add_argument("--dry-run", action="store_true", help="no envía órdenes reales")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="ruta a risk_config.json")
+    parser.add_argument("--force-evolve", action="store_true",
+                        help="buscar parámetros nuevos aunque haya unos aceptados recientes")
     return parser.parse_args(argv)
 
 
@@ -1106,18 +1442,23 @@ def main(argv: list[str] | None = None) -> int:
 
         # 4-5) Evolución + validación walk-forward
         status.write("evolucionando", "buscando y validando parámetros")
-        if not bot.evolve():
+        if not ((not args.force_evolve and bot.try_reuse_evolution()) or bot.evolve()):
             reason = (bot.evolution or {}).get("reason", "sin datos")
-            bot.notifier.send(f"Parámetros DESCARTADOS, el bot no opera: {reason}")
-            logger.error("Abortando: la validación walk-forward no fue superada. Ver %s",
-                         paths.evolved.name)
-            exit_code, final_message = EXIT_VALIDATION, f"parámetros descartados: {reason}"
-            return exit_code
-
-        ev = bot.evolution or {}
-        bot.notifier.send(
-            f"Bot iniciado ({'simulación' if bot.dry_run else 'ÓRDENES REALES'}). Parámetros aceptados: "
-            f"PF validación {(ev.get('out_of_sample') or {}).get('profit_factor', 0):.2f}")
+            retry = int(bot.config.get("retry_evolve_hours", 0) or 0)
+            if retry <= 0:
+                bot.notifier.send(f"Parámetros DESCARTADOS, el bot no opera: {reason}")
+                logger.error("Abortando: la validación walk-forward no fue superada. Ver %s",
+                             paths.evolved.name)
+                exit_code, final_message = EXIT_VALIDATION, f"parámetros descartados: {reason}"
+                return exit_code
+            bot.notifier.send(f"Parámetros DESCARTADOS ({reason}); reintentará cada {retry} h")
+            logger.warning("Validación no superada: el bot sigue en marcha SIN operar y buscará "
+                           "parámetros de nuevo cada %d h (retry_evolve_hours).", retry)
+        else:
+            ev = bot.evolution or {}
+            bot.notifier.send(
+                f"Bot iniciado ({'simulación' if bot.dry_run else 'ÓRDENES REALES'}). Parámetros aceptados: "
+                f"PF validación {(ev.get('out_of_sample') or {}).get('profit_factor', 0):.2f}")
         # 6) Bucle principal (termina con Ctrl+C o con la parada del Centro de control)
         bot.run()
         exit_code, final_message = EXIT_OK, "detenido por el usuario"

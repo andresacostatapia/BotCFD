@@ -499,16 +499,17 @@ def test_periodic_reevolution(fake: FakeMT5, config_file, monkeypatch) -> None:
     mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
     bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=True)
     calls = []
-    monkeypatch.setattr(bot, "evolve", lambda: calls.append(1) or True)
+    monkeypatch.setattr(bot, "evolve", lambda reason="": calls.append(reason) or True)
+    bot.params = dict(PARAMS)
     bot.config["reevolve_hours"] = 1
-    bot.last_evolution_mono -= 3000
+    bot.last_evolution_ts -= 3000
     bot.maybe_reevolve([])
     assert calls == []                      # aún no pasó 1 hora
-    bot.last_evolution_mono -= 1000
+    bot.last_evolution_ts -= 1000
     bot.maybe_reevolve([_position()])
     assert calls == []                      # espera a no tener posición
     bot.maybe_reevolve([])
-    assert calls == [1]
+    assert calls == ["periódica"]
 
 
 def test_telegram_notifier(monkeypatch) -> None:
@@ -629,3 +630,188 @@ def test_test_order_demo_only_and_close(fake: FakeMT5) -> None:
     fake.trade_mode = ACCOUNT_TRADE_MODE_REAL
     assert "DEMO" in mt5_connector.place_test_order("EURUSD", "sell")["error"]
     assert "no existe" in (fake.__setattr__("trade_mode", 0) or mt5_connector.place_test_order("XXX", "buy"))["error"]
+
+
+# ------------------------------------------------- bot adaptativo
+def _accepted_result(params: dict, pf: float = 1.5, trades: int = 30, strategy: str = "cruce_medias") -> dict:
+    return {"accepted": True, "reason": "validación walk-forward superada", "params": dict(params),
+            "strategy": strategy, "backend": "test", "in_sample": {"profit_factor": 1.6, "trades": 60},
+            "out_of_sample": {"profit_factor": pf, "trades": trades}, "trades_per_week": 3.0}
+
+
+def _rejected_result(strategy: str = "cruce_medias") -> dict:
+    return {"accepted": False, "reason": "PF out-of-sample 0.800 < mínimo 1.00", "params": dict(PARAMS),
+            "strategy": strategy, "backend": "test", "in_sample": {"profit_factor": 1.2, "trades": 40},
+            "out_of_sample": {"profit_factor": 0.8, "trades": 12}}
+
+
+def _fresh_bot(config_file) -> trading_bot.TradingBot:
+    mt5_connector.connect_mt5_with_retry(max_retries=1, require_demo=True)
+    bot = trading_bot.TradingBot(bot_common.load_config(config_file), config_file, dry_run=True)
+    bot.risk.reset_daily()
+    return bot
+
+
+def test_config_fingerprint_only_tracks_evolution_keys() -> None:
+    base = dict(bot_common.DEFAULT_CONFIG)
+    fp = trading_bot.config_fingerprint(base)
+    assert trading_bot.config_fingerprint({**base, "risk_percent": 0.5}) == fp
+    assert trading_bot.config_fingerprint({**base, "strategy": "ruptura"}) != fp
+    assert trading_bot.config_fingerprint({**base, "timeframe": "M5"}) != fp
+
+
+def test_evolve_auto_picks_best_accepted(monkeypatch, synthetic_ohlc) -> None:
+    table = {"cruce_medias": _accepted_result(PARAMS, 1.3, 40), "ruptura": _accepted_result(
+        {"lookback": 20, "trend": 50}, 1.8, 30, "ruptura"), "retroceso": _rejected_result("retroceso")}
+    monkeypatch.setattr(trading_bot, "evolve_parameters",
+                        lambda df, pop, gens, config: dict(table[config["strategy"]]))
+    best = trading_bot.evolve_auto(synthetic_ohlc, 4, 2, {}, strategies=tuple(table))
+    assert best["accepted"] and best["strategy"] == "ruptura" and best["auto"]
+    assert {c["strategy"] for c in best["candidates"]} == set(table)
+    none = trading_bot.evolve_auto(synthetic_ohlc, 4, 2, {}, strategies=("retroceso",))
+    assert not none["accepted"] and "ninguna" in none["reason"]
+
+
+def test_profile_accepts_auto_strategy(tmp_path) -> None:
+    path = tmp_path / "risk_config.json"
+    bot_common.save_config({"strategy": "auto"}, path)
+    assert bot_common.load_config(path)["strategy"] == "auto"
+    assert bot_common.validate_config({**bot_common.DEFAULT_CONFIG, "strategy": "magia"})
+
+
+def test_discarded_bot_keeps_running_and_retries(fake, config_file, monkeypatch) -> None:
+    monkeypatch.setattr(trading_bot.TradingBot, "evolve", lambda self, reason="": False)
+    monkeypatch.setattr(trading_bot.TradingBot, "run",
+                        lambda self: (_ for _ in ()).throw(KeyboardInterrupt))
+    assert trading_bot.main(["--config", str(config_file), "--dry-run"]) == trading_bot.EXIT_OK
+    bot_common.save_config({"max_spread": 0.0005, "retry_evolve_hours": 0}, config_file)
+    assert trading_bot.main(["--config", str(config_file), "--dry-run"]) == trading_bot.EXIT_VALIDATION
+
+
+def test_retry_schedule_without_params(fake, config_file, monkeypatch) -> None:
+    bot = _fresh_bot(config_file)
+    calls = []
+    monkeypatch.setattr(bot, "evolve", lambda reason="": calls.append(reason) or False)
+    bot.params = None
+    bot.config.update(retry_evolve_hours=2, reevolve_hours=168)
+    bot.last_attempt_ts = __import__("time").time() - 3600
+    bot.maybe_reevolve([])
+    assert calls == []
+    bot.last_attempt_ts -= 3700
+    bot.maybe_reevolve([])
+    assert calls == ["reintento"]
+
+
+def test_champion_kept_when_challenger_fails(fake, config_file, monkeypatch) -> None:
+    bot = _fresh_bot(config_file)
+    bot.params = dict(PARAMS)
+    bot.evolution = _accepted_result(PARAMS)
+    bot.params_since_ts = 1
+    monkeypatch.setattr(bot, "_run_evolution", lambda df: _rejected_result())
+    monkeypatch.setattr(bot, "compute_health", lambda df=None: {"pf": 1.4, "trades": 12})
+    assert bot.evolve("periódica") is True
+    assert bot.params == PARAMS and bot.evolution["kept_previous"]
+    assert "se mantienen" in bot.evolution["reason"]
+    saved = bot_common.read_json(bot.paths.evolved)
+    assert saved["accepted"] and saved["params"] == PARAMS
+    # si desde su adopción pierden, se abandonan
+    monkeypatch.setattr(bot, "compute_health", lambda df=None: {"pf": 0.6, "trades": 12})
+    assert bot.evolve("periódica") is False and bot.params is None
+    # y un símbolo pausado tampoco conserva sus parámetros
+    bot.params, bot.paused_reason = dict(PARAMS), "rendimiento real bajo"
+    assert bot.champion_status()[0] is False
+
+
+def test_reuse_saved_evolution(fake, config_file, monkeypatch) -> None:
+    bot = _fresh_bot(config_file)
+    bot.params_since_ts = 1234
+    bot._save_evolution(_accepted_result(PARAMS))
+    fresh = _fresh_bot(config_file)
+    assert fresh.try_reuse_evolution() is True
+    assert fresh.params == PARAMS and fresh.params_since_ts == 1234
+    # sin reutilización configurada
+    fresh2 = _fresh_bot(config_file)
+    fresh2.config["reuse_evolution"] = False
+    assert fresh2.try_reuse_evolution() is False
+    # configuración de evolución distinta
+    fresh3 = _fresh_bot(config_file)
+    fresh3.config["timeframe"] = "M5"
+    assert fresh3.try_reuse_evolution() is False
+    # demasiado antigua
+    saved = bot_common.read_json(bot.paths.evolved)
+    saved["evolved_at_epoch"] -= 200 * 3600
+    bot_common.write_json_atomic(bot.paths.evolved, saved)
+    assert _fresh_bot(config_file).try_reuse_evolution() is False
+
+
+def test_health_uses_only_new_bars(fake, config_file) -> None:
+    bot = _fresh_bot(config_file)
+    bot.params = {"lookback": 20, "trend": 50}
+    times = fake.df["time"]
+    cut = times.iloc[len(times) // 2]
+    bot.params_since_ts = int(pd.Timestamp(cut).tz_localize(None).timestamp())
+    health = bot.compute_health()
+    assert health is not None and health["trades"] > 0
+    assert pd.Timestamp(health["since"]) >= pd.Timestamp(cut).tz_localize(None)
+    bot.params_since_ts = int(pd.Timestamp(times.iloc[-1]).tz_localize(None).timestamp()) + 3600
+    assert bot.compute_health() is None  # aún no hay velas nuevas
+
+
+def test_degraded_parameters_trigger_early_evolution(fake, config_file, monkeypatch) -> None:
+    import time as _t
+    bot = _fresh_bot(config_file)
+    bot.params = dict(PARAMS)
+    calls = []
+    monkeypatch.setattr(bot, "evolve", lambda reason="": calls.append(reason) or True)
+    monkeypatch.setattr(bot, "compute_health", lambda df=None: {"pf": 0.5, "trades": 15, "since": "x",
+                                                                "win_rate": 0.3})
+    bot.config.update(health_check_hours=24, auto_disable_pf=0.7, auto_disable_min_trades=10)
+    bot.maybe_check_health([])
+    assert calls == []                       # aún no tocaba
+    bot.last_health_ts = _t.time() - 25 * 3600
+    bot.maybe_check_health([_position()])
+    assert calls == []                       # con posición abierta, espera
+    bot.maybe_check_health([])
+    assert calls == ["degradación"] and bot.health["pf"] == 0.5
+
+
+def test_stale_signal_and_bar_close_wait(fake, config_file) -> None:
+    from types import SimpleNamespace
+
+    bot = _fresh_bot(config_file)  # H1
+    opened = pd.Timestamp("2024-03-01 10:00")
+    tick = SimpleNamespace(time=int(opened.timestamp()) + 600, bid=1.1, ask=1.1001)
+    assert bot.signal_is_stale(opened, tick) is False        # 10 min de 60
+    tick.time = int(opened.timestamp()) + 40 * 60
+    assert bot.signal_is_stale(opened, tick) is True         # 40 min: ya no es la entrada validada
+    assert bot.signal_is_stale(opened, None) is False
+    bot.last_sig = {"bar_time": pd.Timestamp("2024-03-01 09:00")}
+    bot.last_tick = SimpleNamespace(time=int(opened.timestamp()) + 50 * 60)
+    assert bot.seconds_to_bar_close() == pytest.approx(600)
+
+
+def test_stale_signal_is_not_traded(fake, config_file) -> None:
+    bot = _bot_at_signal(fake, config_file, dry_run=False)
+    original = fake.symbol_info_tick
+
+    def late_tick(symbol):
+        t = original(symbol)
+        t.time += 45 * 60  # la vela en curso lleva 46 minutos abierta
+        return t
+
+    fake.symbol_info_tick = late_tick
+    bot.step()
+    assert fake.orders == []
+    assert "señal tardía (vela ya avanzada)" in bot.signal_stats["blocked"]
+
+
+def test_force_evolve_flag_skips_reuse(fake, config_file, monkeypatch) -> None:
+    bot = _fresh_bot(config_file)
+    bot._save_evolution(_accepted_result(PARAMS))
+    calls = []
+    monkeypatch.setattr(trading_bot.TradingBot, "evolve", lambda self, reason="": calls.append(reason) or False)
+    monkeypatch.setattr(trading_bot.TradingBot, "run", lambda self: (_ for _ in ()).throw(KeyboardInterrupt))
+    trading_bot.main(["--config", str(config_file), "--dry-run"])
+    assert calls == []                      # reutilizó los parámetros guardados
+    trading_bot.main(["--config", str(config_file), "--dry-run", "--force-evolve"])
+    assert len(calls) == 1

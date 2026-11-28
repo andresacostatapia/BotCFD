@@ -43,7 +43,7 @@ from typing import Any, Callable
 
 from bot_common import (
     BASE_DIR, DEFAULT_CONFIG, LOG_DIR, MAIN_PROFILE, PROFILE_KEYS, PROFILE_NAME_RE,
-    VALID_ASSET_CLASSES, VALID_EXIT_MODES, VALID_STRATEGIES, VALID_TIMEFRAMES, config_path_for, list_profiles,
+    PROFILE_STRATEGIES, VALID_ASSET_CLASSES, VALID_EXIT_MODES, VALID_STRATEGIES, VALID_TIMEFRAMES, config_path_for, list_profiles,
     load_config, load_global_config, migrate_to_global, profile_paths, read_json,
     save_global_config, save_profile, setup_logging, validate_config, write_json_atomic,
 )
@@ -87,7 +87,7 @@ PHASES: dict[str, tuple[str, str]] = {
     "conectando": ("Conectando…", C_BLUE),
     "evolucionando": ("Evolucionando…", C_BLUE),
     "operando": ("Operando", C_GREEN),
-    "sin_parametros": ("Sin parámetros válidos", C_ORANGE),
+    "sin_parametros": ("Sin parámetros (reintentará)", C_ORANGE),
     "pausado_rendimiento": ("Pausado por rendimiento", C_ORANGE),
     "detenido_perdida": ("Detenido por pérdida diaria", C_RED),
     "descartado": ("Descartado por validación", C_ORANGE),
@@ -101,9 +101,10 @@ STRATEGY_NAMES = {
     "ruptura": "Ruptura de rango",
     "retroceso": "Retroceso en tendencia",
     "compresion": "Compresión y ruptura",
+    "auto": "Automática (la mejor validada)",
 }
 STRATEGY_SHORT = {"cruce_medias": "Cruce", "reversion_media": "Reversión", "ruptura": "Ruptura",
-                  "retroceso": "Retroceso", "compresion": "Compresión"}
+                  "retroceso": "Retroceso", "compresion": "Compresión", "auto": "Auto"}
 ASSET_NAMES = {"auto": "Automático", "forex": "Forex", "indice": "Índice", "materia": "Materia prima",
                "cripto": "Cripto", "accion": "Acción", "otro": "Otro"}
 
@@ -223,7 +224,16 @@ ADVANCED_GROUPS: list[tuple[str, list[Field]]] = [
     ("Seguimiento", [
         Field("auto_disable_pf", "Pausar si PF real <", "float", "Pausa un símbolo cuyo PF real con los parámetros actuales cae por debajo. 0 = nunca"),
         Field("auto_disable_min_trades", "…tras N operaciones", "int", "Operaciones reales mínimas antes de evaluar"),
-        Field("reevolve_hours", "Re-evolucionar cada (h)", "int", "Busca parámetros nuevos periódicamente (sin posición abierta). 0 = nunca"),
+        Field("reevolve_hours", "Re-evolucionar cada (h)", "int", "Busca parámetros nuevos periódicamente (sin posición abierta). 0 = nunca. Si la nueva búsqueda falla, se conservan los actuales mientras sigan funcionando"),
+        Field("retry_evolve_hours", "Reintentar si se descarta (h)", "int",
+              "Si la validación descarta los parámetros (al iniciar o después), el bot sigue en marcha sin "
+              "operar y vuelve a buscar cada N horas. 0 = el bot se detiene"),
+        Field("health_check_hours", "Revisar parámetros cada (h)", "int",
+              "Comprueba los parámetros con las velas nuevas (operaciones simuladas). Si su PF cae bajo "
+              "'Pausar si PF real <', re-evoluciona sin esperar. 0 = nunca"),
+        Field("reuse_evolution", "Reutilizar parámetros al reiniciar", "bool",
+              "Al iniciar, usa los parámetros aceptados recientes (misma configuración) en vez de buscar "
+              "de nuevo: arranque inmediato y sin 'repetir hasta que salga'"),
     ]),
 ]
 ALL_FIELDS: list[Field] = [f for _, g in BASIC_GROUPS + ADVANCED_GROUPS for f in g]
@@ -662,7 +672,7 @@ class SymbolBrowser(tk.Toplevel):
                          width=6).pack(side="left", padx=(4, 10))
             ttk.Label(bottom, text="Estrategia:").pack(side="left")
             self.strategy = tk.StringVar(value=strategy)
-            ttk.Combobox(bottom, textvariable=self.strategy, values=list(VALID_STRATEGIES),
+            ttk.Combobox(bottom, textvariable=self.strategy, values=list(PROFILE_STRATEGIES),
                          state="readonly", width=16).pack(side="left", padx=(4, 10))
             self.simulation = tk.BooleanVar(value=True)
             ttk.Checkbutton(bottom, text="Simulación", variable=self.simulation).pack(side="left")
@@ -834,7 +844,7 @@ class ProfileDialog(tk.Toplevel):
                 w: tk.Widget = ttk.Combobox(grid, textvariable=self.vars[key], values=list(VALID_TIMEFRAMES),
                                             state="readonly", width=18)
             elif key == "strategy":
-                w = ttk.Combobox(grid, textvariable=self.vars[key], values=list(VALID_STRATEGIES),
+                w = ttk.Combobox(grid, textvariable=self.vars[key], values=list(PROFILE_STRATEGIES),
                                  state="readonly", width=18)
             else:
                 w = ttk.Entry(grid, textvariable=self.vars[key], width=20)
@@ -992,6 +1002,7 @@ class BotProcess:
     stop_requested_at: float | None = None
     reported: bool = False
     restart: bool = False
+    force_evolve: bool = False  # --force-evolve: no reutilizar los parámetros guardados
 
     def start(self) -> None:
         """Lanza el proceso sin ventana de consola y empieza a leer su salida."""
@@ -999,6 +1010,8 @@ class BotProcess:
                            "--config", str(self.config_path)]
         if self.dry_run and self.cmd is None:
             cmd = cmd + ["--dry-run"]
+        if self.force_evolve and self.cmd is None:
+            cmd = cmd + ["--force-evolve"]
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0  # type: ignore[attr-defined]
         self.proc = subprocess.Popen(
@@ -1631,7 +1644,7 @@ class ControlCenter(tk.Tk):
             asset = asset or (cfg.get("asset_class") if cfg.get("asset_class") != "auto" else None)
             values = ("Sí" if cfg.get("enabled", True) else "No", cfg.get("symbol", "?"),
                       ASSET_NAMES.get(asset, "—") if asset else "—", cfg.get("timeframe", "?"),
-                      STRATEGY_SHORT.get(cfg.get("strategy", ""), "?"),
+                      self._strategy_text(name, cfg),
                       "Simulación" if cfg.get("simulation", True) else "REAL", label, pos_txt,
                       fmt(pnl, "{:+.2f}") if positions else "—", val)
             tag = {C_GREEN: "ok", C_RED: "bad", C_ORANGE: "warn", C_BLUE: "info"}.get(color, "idle")
@@ -1641,6 +1654,15 @@ class ControlCenter(tk.Tk):
                 tree.insert("", "end", iid=name, values=values, tags=(tag,))
         if not names:
             self.detail_title.configure(text="Pulse '+ Añadir símbolos…' para empezar")
+
+    def _strategy_text(self, name: str, cfg: dict[str, Any]) -> str:
+        """Estrategia del perfil; con 'auto', la elegida en la última evolución aceptada."""
+        strategy = cfg.get("strategy", "")
+        if strategy != "auto":
+            return STRATEGY_SHORT.get(strategy, "?")
+        ev = read_json(profile_paths(config_path_for(name)).evolved) or {}
+        chosen = ev.get("strategy") if ev.get("accepted") else None
+        return f"Auto: {STRATEGY_SHORT.get(chosen, chosen)}" if chosen else "Auto"
 
     def _state_of(self, name: str, st: dict[str, Any]) -> tuple[str, str, bool]:
         """(texto, color, en ejecución) de un perfil."""
@@ -1768,6 +1790,17 @@ class ControlCenter(tk.Tk):
             if tpw is not None and evo.get("accepted"):
                 every = (f"~1 cada {7 / tpw:.1f} días" if 0 < tpw < 1 else f"~{tpw:.1f} por semana") if tpw else "casi ninguna"
                 lines.append(f"Frecuencia esperada (según la validación): {every}")
+        if evo.get("auto") and evo.get("candidates"):
+            lines.append("Estrategia automática: " + " · ".join(
+                f"{STRATEGY_SHORT.get(c.get('strategy'), c.get('strategy'))} "
+                f"{'OK' if c.get('accepted') else 'no'} (PF {fmt(c.get('pf_oos'))}/{c.get('trades_oos') or 0} op)"
+                for c in evo["candidates"]))
+        health = (st.get("health") or {}) if live else {}
+        if health:
+            lines.append(f"Con las velas nuevas (desde {str(health.get('since', ''))[:16]}): PF "
+                         f"{fmt(health.get('pf'))} en {health.get('trades', 0)} operaciones simuladas")
+        if live and st.get("next_evolution"):
+            lines.append("Próxima búsqueda de parámetros: " + str(st["next_evolution"]).replace("T", " "))
         stats = (st.get("signal_stats") or {}) if live else {}
         if stats:
             blocked = ", ".join(f"{k} {v}" for k, v in (stats.get("blocked") or {}).items())
@@ -1997,15 +2030,16 @@ class ControlCenter(tk.Tk):
             self.select_profile(names[0])
 
     # ------------------------------------------------------------ arrancar
-    def _launch(self, name: str) -> bool:
+    def _launch(self, name: str, force_evolve: bool = False) -> bool:
         cfg = profile_config(name)
         if cfg is None:
             messagebox.showerror("Configuración inválida", f"Revise '{name}' con Editar…", parent=self)
             return False
-        bp = BotProcess(name, config_path_for(name))
+        bp = BotProcess(name, config_path_for(name), force_evolve=force_evolve)
         mode = "SIMULACIÓN" if cfg.get("simulation", True) else "ÓRDENES REALES"
         bp.buffer.append(f"### {datetime.now():%H:%M:%S} Iniciando · {cfg['symbol']} {cfg['timeframe']} · "
-                         f"{STRATEGY_NAMES.get(cfg['strategy'], '')} · {mode}")
+                         f"{STRATEGY_NAMES.get(cfg['strategy'], '')} · {mode}"
+                         + (" · búsqueda nueva de parámetros" if force_evolve else ""))
         try:
             bp.start()
         except OSError as exc:
@@ -2059,8 +2093,8 @@ class ControlCenter(tk.Tk):
             bp.restart = True
             bp.request_stop()
             self._append(bp, f"### {datetime.now():%H:%M:%S} Reiniciando para re-evolucionar…")
-        else:
-            self.start_selected()
+        elif name and self._confirm_real([name]) and self._launch(name, force_evolve=True):
+            self._render_log_buffer()
 
     def stop_all(self) -> None:
         for bp in self.procs.values():
@@ -2265,7 +2299,7 @@ class ControlCenter(tk.Tk):
                           EXIT_MEANING.get(code, "terminado"), C_ORANGE if code == 4 else C_RED, 10)
                 if bp.restart and not self._closing:
                     bp.restart = False
-                    self._launch(bp.profile)
+                    self._launch(bp.profile, force_evolve=True)
                     if bp.profile == self.selected.get():
                         self._render_log_buffer()
                 changed = True

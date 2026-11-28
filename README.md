@@ -249,9 +249,19 @@ walk-forward que el resto.
 ## El bot en vivo (`trading_bot.py`)
 
 Cada perfil es un proceso. Al arrancar: carga la configuración → conecta (aborta si
-la cuenta no es DEMO con `require_demo`) → inicia el día → evoluciona y valida (si no
-supera la validación, termina con código 4 y **no opera**). Después, cada
-`loop_seconds`:
+la cuenta no es DEMO con `require_demo`) → inicia el día → obtiene parámetros:
+
+* **Reutiliza** los aceptados recientes (`reuse_evolution`) si son de la misma
+  configuración (símbolo, timeframe, estrategia, validación…) y tienen menos de
+  `reevolve_hours`. Arranca al instante y evita "reiniciar hasta que salga
+  aceptado", que sería otra forma de sobreajuste. *Reiniciar (re-evoluciona)* en el
+  Centro de control fuerza una búsqueda nueva (`--force-evolve`).
+* Si no, **evoluciona y valida**. Si la validación descarta, el bot **sigue en
+  marcha sin operar** y vuelve a buscar cada `retry_evolve_hours` (6 h). Con
+  `retry_evolve_hours` = 0 termina con código 4, como antes.
+
+Después, cada `loop_seconds` (y además justo **después de cada cierre de vela**, para
+reaccionar sin esperar al siguiente ciclo):
 
 1. Recarga en caliente la configuración (general o del perfil). Si cambian símbolo,
    timeframe, magic o estrategia, vuelve a evolucionar. Cambiar *Simulación/REAL*
@@ -262,21 +272,41 @@ supera la validación, termina con código 4 y **no opera**). Después, cada
    toda la cuenta. El inicio del día se guarda en `logs/day_state.json` (por cuenta):
    reiniciar no lo pone a cero, y si un bot llega al límite **todos** se detienen
    hasta el día siguiente.
-4. **Re-evolución periódica** cada `reevolve_hours` (sin posición abierta). Si se
-   descarta, el símbolo no opera hasta la siguiente.
+4. **Adaptación de la estrategia** (siempre sin posición abierta):
+   * **Re-evolución periódica** cada `reevolve_hours` (168 h). Funciona como
+     *campeón / retador*: si la nueva búsqueda no supera la validación, se
+     **conservan los parámetros actuales** mientras sigan sanos (no pierden con las
+     velas posteriores a su adopción) y no tengan más de 4 × `reevolve_hours`.
+   * **Vigilancia** cada `health_check_hours` (24 h): repite el backtest de los
+     parámetros actuales **solo con las velas nuevas** (que la evolución no vio). Si
+     con al menos `auto_disable_min_trades` operaciones simuladas el PF cae bajo
+     `auto_disable_pf`, re-evoluciona **ya**, sin esperar a la periódica. El detalle
+     del símbolo muestra el resultado y la hora de la próxima búsqueda.
+   * Sin parámetros válidos o pausado por rendimiento: nueva búsqueda cada
+     `retry_evolve_hours`.
 5. **Gestiona las posiciones abiertas**: break-even, trailing y cierre por tiempo.
 6. Señal en la última vela cerrada → filtros: horario, spread, una posición por
-   símbolo, **límite global** `max_open_positions_total` (entre todos los
-   perfiles) → lote por riesgo (`risk_percent`, SL por ATR) → orden IOC (con
+   símbolo, **señal tardía** (si la vela siguiente ya lleva abierta más de la mitad
+   de su duración, p. ej. al arrancar el bot a media vela, no se opera: el backtest
+   entra en su apertura), **límite global** `max_open_positions_total` (entre todos
+   los perfiles) → lote por riesgo (`risk_percent`, SL por ATR) → orden IOC (con
    fallback FOK/RETURN).
 7. **Pausa por rendimiento**: si el PF **real** de las últimas operaciones con los
    parámetros actuales (mínimo `auto_disable_min_trades`) cae bajo
-   `auto_disable_pf`, deja de abrir operaciones hasta la próxima re-evolución.
+   `auto_disable_pf`, deja de abrir operaciones y busca parámetros nuevos tras
+   `retry_evolve_hours`.
 8. Escribe `logs/status_<perfil>.json` para el Centro de control y, si está
    configurado, envía **avisos por Telegram** (`telegram_token`, `telegram_chat_id`).
 
 En **simulación** (`simulation` = true, por defecto en los perfiles nuevos) calcula
 todo y muestra la orden que *habría* enviado, sin enviarla.
+
+**Estrategia automática** (`strategy` = `auto`, en *Editar…*): en cada evolución el
+bot evoluciona y valida **las 5 estrategias** y opera la mejor **aceptada** (PF de
+validación × raíz de sus operaciones, para no premiar 3 operaciones con suerte). La
+tabla muestra "Auto: Ruptura", por ejemplo, y el detalle el resultado de cada una.
+Tarda unas 5 veces más en evolucionar y, al elegir entre varias, sube algo el riesgo
+de quedarse con una afortunada: solo compiten las que superan toda la validación.
 
 ---
 
@@ -312,7 +342,11 @@ Todas las claves y sus valores por defecto: `risk_config.example.json`.
 | `stock_commission_pct` | 0.001 | Comisión de las acciones (fracción del precio, ida y vuelta) |
 | **Seguimiento y avisos** | | |
 | `auto_disable_pf`, `auto_disable_min_trades` | 0.7, 10 | Pausa por rendimiento real (0 = nunca) |
-| `reevolve_hours` | 168 | Re-evolución periódica (0 = nunca) |
+| `reevolve_hours` | 168 | Re-evolución periódica (0 = nunca); conserva los parámetros actuales si la nueva búsqueda falla y siguen sanos |
+| `retry_evolve_hours` | 6 | Sin parámetros válidos: nueva búsqueda cada N h (0 = el bot se detiene al descartar) |
+| `health_check_hours` | 24 | Revisión de los parámetros con las velas nuevas; re-evolución anticipada si se degradan (0 = nunca) |
+| `reuse_evolution` | true | Reutilizar al arrancar los parámetros aceptados recientes de la misma configuración |
+| `min_trades_per_week`, `stability_check` | 2, true | Preferencia de frecuencia; rechazo de parámetros frágiles |
 | `telegram_token`, `telegram_chat_id` | "" | Avisos por Telegram (opcional) |
 | `autostart_bots`, `lab_workers` | false, 0 | Autoarranque de activos; procesos del laboratorio (0 = auto) |
 | **Explorador** | | |
@@ -380,7 +414,7 @@ configuración / símbolo / cuenta no DEMO · `3` conexión MT5 · `4` validaci�
    (para eso está *Cerrar posiciones de los bots…*).
 7. **Con `daily_loss_scope = bots`, el riesgo de sus operaciones manuales no lo
    controla el bot** (use `cuenta` si quiere que cuenten).
-8. **Probado en Linux con un MetaTrader5 simulado** (175 tests y la ventana
+8. **Probado en Linux con un MetaTrader5 simulado** (187 tests y la ventana
    recorrida en Xvfb). En Windows con MT5 real falta la prueba del usuario; los
    lanzadores `.bat`/`.ps1` solo se han revisado de forma estática.
 
